@@ -1,0 +1,11 @@
+# H.Huddair's Nexus-Pulse (Level 1) Requirements
+fastapi>=0.110.0
+uvicorn>=0.28.0
+pydantic>=2.6.0
+dnspython>=2.6.0
+httpx>=0.27.0
+pandas>=2.2.0
+colorama>=0.4.6
+pyyaml>=6.0
+openpyxl>=3.1.2
+cryptography>=42.0.0

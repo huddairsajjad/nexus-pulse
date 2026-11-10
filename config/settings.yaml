@@ -1,0 +1,65 @@
+# H.Huddair's Nexus-Pulse Dynamic Configuration
+
+target_country: "Germany"
+target_city: "Berlin"
+industry_niche: "Commercial Construction"
+ready_to_send: false
+
+system:
+  app_name: "H.Huddair's Nexus-Pulse"
+  version: "1.0.0"
+  tier: "Level-1-Enterprise"
+  log_level: "INFO"
+
+crawler:
+  search_depth: 15
+  request_timeout_seconds: 12
+  user_agent_rotation: true
+  max_concurrent_tasks: 5
+  extract_tech_stack: true
+
+prioritization:
+  tier_1_keywords:
+    - "estimating@"
+    - "estimator@"
+    - "bids@"
+    - "bid@"
+    - "tenders@"
+    - "tender@"
+    - "qs@"
+    - "procurement@"
+    - "rfp@"
+  tier_2_keywords:
+    - "director@"
+    - "commercial@"
+    - "projects@"
+    - "contracts@"
+    - "management@"
+    - "operations@"
+    - "sales@"
+  tier_3_keywords:
+    - "admin@"
+    - "accounts@"
+    - "office@"
+    - "contact@"
+  tier_generic_keywords:
+    - "info@"
+    - "hello@"
+    - "support@"
+
+hygiene_shield:
+  enable_syntax_filter: true
+  enable_disposable_domain_filter: true
+  enable_dns_mx_check: true
+  enable_silent_smtp_ping: true
+  smtp_timeout_seconds: 5.0
+  helo_hostname: "nexus-pulse.huddair.io"
+
+vault:
+  partition_by_country: true
+  partition_by_niche: true
+  partition_by_tier: true
+  auto_export_json: true
+  auto_export_csv: true
+  auto_export_excel: true
+

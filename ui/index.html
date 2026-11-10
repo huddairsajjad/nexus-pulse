@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>H.Huddair’s Nexus-Pulse [Level 2 Enterprise]</title>
+
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: ['class', '[data-theme="github-dark"]'],
+      theme: {
+        extend: {
+          colors: {
+            'np-base': 'var(--bg-base)',
+            'np-surface': 'var(--bg-surface)',
+            'np-elevated': 'var(--bg-elevated)',
+            'np-overlay': 'var(--bg-overlay)',
+            'np-hover': 'var(--bg-hover)',
+            'np-border': 'var(--border)',
+            'np-border-muted': 'var(--border-muted)',
+            'np-primary': 'var(--text-primary)',
+            'np-secondary': 'var(--text-secondary)',
+            'np-muted': 'var(--text-muted)',
+            'np-accent': 'var(--accent)',
+            'np-success': 'var(--success)',
+            'np-warning': 'var(--warning)',
+            'np-danger': 'var(--danger)',
+            'np-gold': 'var(--gold)',
+            'np-purple': 'var(--purple)',
+          }
+        }
+      }
+    };
+  </script>
+
+  <!-- Nexus-Pulse Enterprise Theme System & Global Stylesheet -->
+  <link rel="stylesheet" href="/ui/css/cyberpunk.css">
+
+  <!-- React 18 & Babel CDN -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <link rel="icon" type="image/x-icon" href="/ui/assets/favicon.ico">
+
+  <script>
+    // Apply saved theme before first paint to prevent Flash of Unstyled Content (FOUC)
+    (function() {
+      var saved = localStorage.getItem('nexus_theme') || 'github-dark';
+      document.documentElement.setAttribute('data-theme', saved);
+    })();
+  </script>
+</head>
+<body class="bg-base text-theme-primary antialiased m-0 p-0">
+  <div id="root"></div>
+
+  <!-- Main React App Script (Transpiled via Babel in browser) -->
+  <script type="text/babel" src="/ui/js/app.js"></script>
+</body>
+</html>
