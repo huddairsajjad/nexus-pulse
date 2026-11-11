@@ -1,8 +1,10 @@
 """
-H.Huddair's Nexus-Pulse - Level 2
-Outreach Engine: Human Approval Gate
+Nexus-Pulse Enterprise Build
+Outreach Engine: Human Approval Gate & Multi-Tenant Queue
 Enforces the mandatory authorization hold: no email or contact form is dispatched
-without manual Review & Approve authorization from H.Huddair.
+without manual human confirmation.
+Integrates with Multi-Service Template Pool, Inbox Rotator with auto-switching,
+and Timezone Smart Scheduler.
 """
 
 import uuid
@@ -11,6 +13,8 @@ from typing import Dict, Any, List, Optional
 from database.db_engine import get_db_engine
 from .scheduler import get_scheduler
 from .inbox_rotator import get_inbox_rotator
+from .template_manager import get_template_manager
+from .blacklist_manager import get_blacklist_manager
 
 
 def generate_personalized_copy(
@@ -18,63 +22,36 @@ def generate_personalized_copy(
     recipient_email: str,
     niche: str,
     country: str,
-    tech_stack: Optional[List[str]] = None
+    tech_stack: Optional[List[str]] = None,
+    operator_id: Optional[str] = None
 ) -> Dict[str, str]:
     """
-    Generates high-conversion, professional B2B outreach tailored
-    specifically for estimating, tenders, and commercial contracting.
+    Generates dynamic personalized proposal copy using the Multi-Service Template Pool.
+    Interpolates variables without hardcoded sender text.
     """
-    clean_niche = niche or "Commercial Contracting"
-    stack_mention = f" We noted your current digital infrastructure ({', '.join(tech_stack[:2])})." if tech_stack else ""
-
-    # Check recipient prefix to customize hook
-    prefix = recipient_email.split("@")[0].lower() if "@" in recipient_email else ""
-    if any(k in prefix for k in ["estimating", "kalkulation", "chiffrage"]):
-        subject = f"Tender Estimation & Subcontractor Prequalification // {company_name}"
-        body = (
-            f"Dear Estimating Team at {company_name},\n\n"
-            f"We are reaching out to submit our pre-qualification credentials and commercial capacity for upcoming "
-            f"{clean_niche} tender packages in {country}.{stack_mention}\n\n"
-            f"Our team handles detailed bill-of-quantities takeoff, competitive subcontractor package pricing, and rapid estimating turnaround.\n\n"
-            f"Could you please confirm the current email address or portal for receiving your open tender documentation?\n\n"
-            f"Best regards,\n"
-            f"H.Huddair\n"
-            f"Commercial Director | Nexus-Pulse Enterprise Solutions"
-        )
-    elif any(k in prefix for k in ["bids", "tender", "qs"]):
-        subject = f"Commercial Bidding & Quantity Surveying Partner // {company_name}"
-        body = (
-            f"Dear Commercial & QS Department,\n\n"
-            f"In reviewing major commercial projects across {country}, we would like to present our subcontracting and estimating capabilities to {company_name}.\n\n"
-            f"We specialize in rapid tender pricing, value engineering, and high-precision commercial takeoffs for {clean_niche}.\n\n"
-            f"Would you be available for a brief introductory call this week, or should we send through our capability profile directly?\n\n"
-            f"Warm regards,\n"
-            f"H.Huddair\n"
-            f"Nexus-Pulse Lead Engine"
-        )
-    else:
-        subject = f"Strategic Commercial Partnership // {company_name}"
-        body = (
-            f"Hello {company_name} Leadership,\n\n"
-            f"We have been following your commercial project footprint across {country}.{stack_mention}\n\n"
-            f"Nexus-Pulse provides enterprise-grade estimating support, direct subcontractor pricing, and tender capacity for leading {clean_niche} enterprises.\n\n"
-            f"Please let us know the right contact in your estimating/procurement department to forward our credentials.\n\n"
-            f"Sincerely,\n"
-            f"H.Huddair"
-        )
-
-    return {"subject": subject, "body": body}
+    tm = get_template_manager()
+    return tm.match_and_render_template(
+        operator_id=operator_id,
+        niche=niche,
+        company_name=company_name,
+        recipient_email=recipient_email,
+        country=country,
+        tech_stack=tech_stack
+    )
 
 
 class HumanApprovalGate:
     """
-    Authoritative hold mechanism governing all outbound outreach channels.
+    Mandatory human-in-the-loop authorization gate governing all outbound outreach channels.
+    Holds leads in PENDING_APPROVAL until approved by operator or admin.
     """
 
     def __init__(self):
         self.db = get_db_engine()
         self.scheduler = get_scheduler()
         self.rotator = get_inbox_rotator()
+        self.template_manager = get_template_manager()
+        self.blacklist_manager = get_blacklist_manager()
 
     def queue_outreach(
         self,
@@ -86,29 +63,75 @@ class HumanApprovalGate:
         channel: str = "EMAIL",
         tech_stack: Optional[List[str]] = None,
         custom_subject: Optional[str] = None,
-        custom_body: Optional[str] = None
+        custom_body: Optional[str] = None,
+        operator_id: Optional[str] = None,
+        city: str = ""
     ) -> Dict[str, Any]:
         """
         Places a lead into the mandatory Human Approval Gate (status: PENDING_APPROVAL).
-        Computes the target country's local office hours.
+        Computes regional working hours and renders custom or matched template copy.
         """
-        tz_info = self.scheduler.get_target_local_time(country)
-        copy = generate_personalized_copy(company_name, recipient, niche, country, tech_stack)
-        subject = custom_subject or copy["subject"]
-        body = custom_body or copy["body"]
+        # 1. Compliance: Check Blacklist & Suppression
+        is_bl, bl_reason = self.blacklist_manager.is_domain_blacklisted(recipient)
+        if is_bl:
+            return {
+                "queue_id": None,
+                "status": "SUPPRESSED",
+                "reason": bl_reason,
+                "message": f"Recipient '{recipient}' is blocked by blacklist rule."
+            }
+
+        with self.db.get_connection() as conn:
+            suppressed = conn.execute("""
+                SELECT reason FROM suppressed_entities
+                WHERE lower(entity) = lower(?) OR lower(entity) = lower(?)
+            """, (recipient.lower(), recipient.split("@")[-1].lower() if "@" in recipient else recipient.lower())).fetchone()
+            if suppressed:
+                return {
+                    "queue_id": None,
+                    "status": "SUPPRESSED",
+                    "reason": suppressed["reason"],
+                    "message": f"Recipient '{recipient}' is on global suppression list ({suppressed['reason']})."
+                }
+
+        # 2. Regional timezone calculations
+        domain = recipient.split("@")[-1] if "@" in recipient else None
+        tz_info = self.scheduler.get_target_local_time(country=country, domain=domain)
+        scheduled_for = self.scheduler.calculate_next_send_slot(country=country, domain=domain).isoformat()
 
         queue_id = str(uuid.uuid4())
-        scheduled_for = self.scheduler.calculate_next_send_slot(country).isoformat()
+        tracking_id = str(uuid.uuid4())
+        unsub_link = f"/api/unsubscribe?token={tracking_id}&email={recipient}"
+
+        # 3. Dynamic Template Matching (User-defined or parameters)
+        if custom_subject and custom_body:
+            subject = custom_subject.replace("{{unsubscribe_link}}", unsub_link)
+            body = custom_body.replace("{{unsubscribe_link}}", unsub_link)
+        else:
+            rendered = self.template_manager.match_and_render_template(
+                operator_id=operator_id,
+                niche=niche,
+                company_name=company_name,
+                recipient_email=recipient,
+                country=country,
+                city=city,
+                tech_stack=tech_stack,
+                unsubscribe_url=unsub_link
+            )
+            subject = rendered["subject"]
+            body = rendered["body"]
 
         with self.db.get_connection() as conn:
             conn.execute("""
                 INSERT INTO outreach_queue (
                     id, lead_id, channel, recipient, company_name, subject, message_body,
-                    status, target_country, target_timezone, scheduled_for
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?, ?)
+                    status, target_country, target_timezone, scheduled_for, operator_id,
+                    tracking_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?, ?, ?, ?)
             """, (
                 queue_id, lead_id, channel, recipient, company_name, subject, body,
-                country, tz_info["timezone_code"], scheduled_for
+                country, tz_info["timezone_code"], scheduled_for, operator_id,
+                tracking_id
             ))
             conn.commit()
 
@@ -122,24 +145,30 @@ class HumanApprovalGate:
             "target_country": country,
             "target_local_time": tz_info["current_local_time"],
             "scheduled_for": scheduled_for,
-            "hold_message": "Item held in Human Approval Gate. Requires manual authorization from H.Huddair."
+            "operator_id": operator_id,
+            "hold_message": "Item held in Human Approval Gate. Requires manual human authorization before dispatch."
         }
 
     def approve_outreach_item(
         self,
         queue_id: str,
-        approver: str = "h.huddair",
+        approver: str = "operator",
         edited_subject: Optional[str] = None,
-        edited_body: Optional[str] = None
+        edited_body: Optional[str] = None,
+        operator_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Manually approves an outreach item. Updates copy if edited.
-        Status moves from PENDING_APPROVAL to APPROVED.
+        Manually authorizes an outreach item.
+        Transitions status from PENDING_APPROVAL to APPROVED.
         """
         with self.db.get_connection() as conn:
             row = conn.execute("SELECT * FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
             if not row:
                 raise ValueError(f"Outreach queue item '{queue_id}' not found.")
+
+            # Tenant check
+            if operator_id and row["operator_id"] and row["operator_id"] != operator_id:
+                raise PermissionError("Access denied: You cannot approve outreach for another tenant.")
 
             if row["status"] not in ("PENDING_APPROVAL", "REJECTED"):
                 return {"success": False, "message": f"Item is already in status: {row['status']}"}
@@ -166,21 +195,34 @@ class HumanApprovalGate:
                 "recipient": row["recipient"]
             }
 
-    def batch_approve_all(self, approver: str = "h.huddair") -> Dict[str, Any]:
-        """Approves all currently pending items in the gate."""
+    def batch_approve_all(self, approver: str = "operator", operator_id: Optional[str] = None) -> Dict[str, Any]:
+        """Approves all currently pending items in the gate for this tenant or globally for admin."""
         with self.db.get_connection() as conn:
-            cur = conn.execute("""
-                UPDATE outreach_queue
-                SET status = 'APPROVED', approved_by = ?, approved_at = CURRENT_TIMESTAMP
-                WHERE status = 'PENDING_APPROVAL'
-            """, (approver,))
-            conn.commit()
-            count = cur.rowcount
-            return {"success": True, "items_approved": count, "approved_by": approver}
+            if operator_id:
+                cur = conn.execute("""
+                    UPDATE outreach_queue
+                    SET status = 'APPROVED', approved_by = ?, approved_at = CURRENT_TIMESTAMP
+                    WHERE status = 'PENDING_APPROVAL' AND (operator_id = ? OR operator_id IS NULL)
+                """, (approver, operator_id))
+            else:
+                cur = conn.execute("""
+                    UPDATE outreach_queue
+                    SET status = 'APPROVED', approved_by = ?, approved_at = CURRENT_TIMESTAMP
+                    WHERE status = 'PENDING_APPROVAL'
+                """, (approver,))
 
-    def reject_outreach_item(self, queue_id: str, approver: str = "h.huddair") -> Dict[str, Any]:
+            conn.commit()
+            return {"success": True, "items_approved": cur.rowcount, "approved_by": approver}
+
+    def reject_outreach_item(self, queue_id: str, approver: str = "operator", operator_id: Optional[str] = None) -> Dict[str, Any]:
         """Rejects outreach item, preventing dispatch."""
         with self.db.get_connection() as conn:
+            row = conn.execute("SELECT operator_id FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
+            if not row:
+                raise ValueError(f"Item '{queue_id}' not found.")
+            if operator_id and row["operator_id"] and row["operator_id"] != operator_id:
+                raise PermissionError("Access denied: You cannot reject outreach for another tenant.")
+
             conn.execute("""
                 UPDATE outreach_queue
                 SET status = 'REJECTED', approved_by = ?, approved_at = CURRENT_TIMESTAMP
@@ -189,29 +231,33 @@ class HumanApprovalGate:
             conn.commit()
             return {"success": True, "queue_id": queue_id, "status": "REJECTED"}
 
-    def dispatch_approved_outreach(self, queue_id: str) -> Dict[str, Any]:
+    def dispatch_approved_outreach(self, queue_id: str, operator_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Dispatches an approved outreach item through the Inbox Rotator.
-        Enforces daily domain caps and schedules follow-up tracker.
+        Enforces daily domain caps and auto-switching across active profiles.
         """
         with self.db.get_connection() as conn:
             row = conn.execute("SELECT * FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
             if not row:
                 raise ValueError(f"Queue item '{queue_id}' not found.")
 
-            if row["status"] not in ("APPROVED", "SCHEDULED"):
-                raise PermissionError(f"CANNOT DISPATCH: Item is in '{row['status']}' state. Manual approval by H.Huddair required.")
+            target_op = operator_id or row["operator_id"]
+            if operator_id and row["operator_id"] and row["operator_id"] != operator_id:
+                raise PermissionError("Access denied: You cannot dispatch outreach for another tenant.")
 
-            # Select available sending mailbox
-            mb = self.rotator.get_next_available_mailbox()
+            if row["status"] not in ("APPROVED", "SCHEDULED"):
+                raise PermissionError(f"CANNOT DISPATCH: Item is in '{row['status']}' state. Manual approval required.")
+
+            # Select available sending mailbox with auto-switching
+            mb = self.rotator.get_next_available_mailbox(operator_id=target_op)
             if not mb:
                 return {
                     "success": False,
                     "reason": "ALL_MAILBOXES_AT_CAPACITY",
-                    "message": "All sending inboxes have reached their daily limit (40-50). Queued for next reset."
+                    "message": "All sending inboxes have reached their daily limit (40-50). Queued for next quota reset."
                 }
 
-            # Increment mailbox count
+            # Increment mailbox quota count
             self.rotator.record_email_dispatched(mb["id"])
 
             now_iso = datetime.now(timezone.utc).isoformat()
@@ -243,29 +289,51 @@ class HumanApprovalGate:
                 "followup_scheduled_for_days": 7
             }
 
-    def get_pending_approvals(self) -> List[Dict[str, Any]]:
-        """Lists all items currently held in the approval gate."""
+    def get_pending_approvals(self, operator_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Lists items held in the approval gate, filtered by tenant."""
         with self.db.get_connection() as conn:
-            rows = conn.execute("""
-                SELECT id, lead_id, channel, recipient, company_name, subject,
-                       message_body, status, target_country, target_timezone,
-                       scheduled_for, created_at
-                FROM outreach_queue
-                WHERE status = 'PENDING_APPROVAL'
-                ORDER BY created_at DESC
-            """).fetchall()
+            if operator_id:
+                rows = conn.execute("""
+                    SELECT id, lead_id, channel, recipient, company_name, subject,
+                           message_body, status, target_country, target_timezone,
+                           scheduled_for, operator_id, created_at
+                    FROM outreach_queue
+                    WHERE status = 'PENDING_APPROVAL' AND (operator_id = ? OR operator_id IS NULL)
+                    ORDER BY created_at DESC
+                """, (operator_id,)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT id, lead_id, channel, recipient, company_name, subject,
+                           message_body, status, target_country, target_timezone,
+                           scheduled_for, operator_id, created_at
+                    FROM outreach_queue
+                    WHERE status = 'PENDING_APPROVAL'
+                    ORDER BY created_at DESC
+                """).fetchall()
             return [dict(r) for r in rows]
 
-    def get_all_queue_items(self) -> List[Dict[str, Any]]:
-        """Returns full queue including Approved, Sent, and Rejected items."""
+    def get_all_queue_items(self, operator_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Returns full queue items, filtered by tenant."""
         with self.db.get_connection() as conn:
-            rows = conn.execute("""
-                SELECT id, lead_id, channel, recipient, company_name, subject,
-                       message_body, status, target_country, scheduled_for,
-                       approved_by, sent_at, mailbox_used, created_at
-                FROM outreach_queue
-                ORDER BY created_at DESC
-            """).fetchall()
+            if operator_id:
+                rows = conn.execute("""
+                    SELECT id, lead_id, channel, recipient, company_name, subject,
+                           message_body, status, target_country, scheduled_for,
+                           approved_by, sent_at, mailbox_used, operator_id,
+                           opened_at, bounced_at, bounce_reason, created_at
+                    FROM outreach_queue
+                    WHERE operator_id = ? OR operator_id IS NULL
+                    ORDER BY created_at DESC
+                """, (operator_id,)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT id, lead_id, channel, recipient, company_name, subject,
+                           message_body, status, target_country, scheduled_for,
+                           approved_by, sent_at, mailbox_used, operator_id,
+                           opened_at, bounced_at, bounce_reason, created_at
+                    FROM outreach_queue
+                    ORDER BY created_at DESC
+                """).fetchall()
             return [dict(r) for r in rows]
 
 

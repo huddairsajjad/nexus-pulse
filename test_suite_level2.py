@@ -43,6 +43,7 @@ class TestNexusPulseLevel2(unittest.TestCase):
         self.gate = get_approval_gate()
         self.scheduler = get_scheduler()
         self.rotator = get_inbox_rotator()
+        self.rotator.seed_test_mailboxes_for_tests()  # Ensure test fixtures exist for Level 2 verification tests
         self.reply_listener = get_reply_listener()
         self.followup_engine = get_followup_engine()
 

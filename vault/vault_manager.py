@@ -97,9 +97,10 @@ class CategoryVaultManager:
             "Scraped At": lead.scraped_at
         }
 
-    def store_lead(self, lead: Lead) -> Dict[str, str]:
+    def store_lead(self, lead: Lead, operator_id: Optional[str] = None) -> Dict[str, str]:
         """
         Stores lead into encrypted SQLite vault and appends to partitioned files.
+        Maintains tenant operator_id isolation.
         """
         lead_dict = lead.model_dump()
         lead_id = lead.id or f"{_sanitize_path_segment(lead.domain)}_{_sanitize_path_segment(lead.primary_email)}"
@@ -111,17 +112,18 @@ class CategoryVaultManager:
             conn.execute("""
                 INSERT INTO vault_leads (
                     id, domain, primary_email, company_name, country,
-                    city, niche, quality_tag, priority_score, encrypted_payload
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    city, niche, quality_tag, priority_score, encrypted_payload, operator_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     primary_email = excluded.primary_email,
                     quality_tag = excluded.quality_tag,
                     priority_score = excluded.priority_score,
-                    encrypted_payload = excluded.encrypted_payload;
+                    encrypted_payload = excluded.encrypted_payload,
+                    operator_id = COALESCE(excluded.operator_id, vault_leads.operator_id);
             """, (
                 lead.id, lead.domain, lead.primary_email, lead.company_name,
                 lead.target_country, lead.target_city, lead.industry_niche,
-                lead.quality_tag, lead.priority_score, encrypted_blob
+                lead.quality_tag, lead.priority_score, encrypted_blob, operator_id
             ))
             conn.commit()
 
@@ -169,15 +171,19 @@ class CategoryVaultManager:
             "xlsx_path": str(xlsx_file)
         }
 
-    def export_global_snapshot_backups(self) -> Dict[str, str]:
+    def export_global_snapshot_backups(self, operator_id: Optional[str] = None) -> Dict[str, str]:
         """
         Creates timestamped consolidated snapshot backups of all verified leads
         across all categories inside vault/backups/ in JSON, CSV, and Excel formats.
+        Supports filtering by operator_id.
         """
         # Fetch all leads from database and decrypt
         leads: List[Lead] = []
         with self.db.get_connection() as conn:
-            rows = conn.execute("SELECT encrypted_payload FROM vault_leads ORDER BY priority_score DESC").fetchall()
+            if operator_id:
+                rows = conn.execute("SELECT encrypted_payload FROM vault_leads WHERE operator_id = ? OR operator_id IS NULL ORDER BY priority_score DESC", (operator_id,)).fetchall()
+            else:
+                rows = conn.execute("SELECT encrypted_payload FROM vault_leads ORDER BY priority_score DESC").fetchall()
             for row in rows:
                 try:
                     decrypted = self.crypto.decrypt_json(row["encrypted_payload"])
@@ -254,6 +260,26 @@ class CategoryVaultManager:
             "backup_files_count": len(backups),
             "vault_root": str(VAULT_DIR)
         }
+
+    def purge_partitions_and_backups(self) -> Dict[str, int]:
+        """Scans and purges all partition folders and backups to ensure a zero-seed clean state."""
+        import shutil
+        cleaned_partitions = 0
+        cleaned_backups = 0
+        if PARTITIONS_DIR.exists():
+            for item in PARTITIONS_DIR.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                    cleaned_partitions += 1
+        if BACKUPS_DIR.exists():
+            for item in BACKUPS_DIR.iterdir():
+                if item.is_file():
+                    try:
+                        item.unlink()
+                        cleaned_backups += 1
+                    except Exception:
+                        pass
+        return {"partitions_wiped": cleaned_partitions, "backups_wiped": cleaned_backups}
 
 
 _global_vault_manager = None

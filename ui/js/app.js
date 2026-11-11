@@ -296,10 +296,14 @@ function NexusPulseApp() {
   const [newOpPassword, setNewOpPassword] = useState("");
   const [newOpFullName, setNewOpFullName] = useState("");
   const [newOpEmail, setNewOpEmail] = useState("");
-  const [newOpDeviceLock, setNewOpDeviceLock] = useState("NEXUS-E727-BB0B-765E-4021");
+  const [newOpDeviceLock, setNewOpDeviceLock] = useState("");
   const [newOpExpiryDays, setNewOpExpiryDays] = useState("90");
   const [newOpScrapeQuota, setNewOpScrapeQuota] = useState("200");
   const [newOpSendQuota, setNewOpSendQuota] = useState("50");
+  const [isCreatingOperator, setIsCreatingOperator] = useState(false);
+  const [isResettingPassword, setIsResettingPassword] = useState(false);
+  const [updatingOperatorId, setUpdatingOperatorId] = useState(null);
+  const [sessionAuditLogs, setSessionAuditLogs] = useState([]);
 
   // ---------------------------------------------------------------------------
   // MULTI-FORMAT DATA BACKUP MODAL
@@ -372,6 +376,46 @@ function NexusPulseApp() {
   const [editMbDailyLimit, setEditMbDailyLimit] = useState("45");
 
   // ---------------------------------------------------------------------------
+  // SAAS EXPANSION STATE: TEMPLATES, BILLING, BLACKLIST & ANALYTICS
+  // ---------------------------------------------------------------------------
+  const [huntTargetUrls, setHuntTargetUrls] = useState("");
+
+  const [templatesList, setTemplatesList] = useState([]);
+  const [isTemplateModalOpen, setIsTemplateModalOpen] = useState(false);
+  const [editingTemplate, setEditingTemplate] = useState(null);
+  const [tplTitle, setTplTitle] = useState("");
+  const [tplNiche, setTplNiche] = useState("Commercial Construction");
+  const [tplSubject, setTplSubject] = useState("");
+  const [tplBody, setTplBody] = useState("");
+  const [tplIsDefault, setTplIsDefault] = useState(false);
+
+  const [deliverabilityStats, setDeliverabilityStats] = useState({
+    total_sent: 0,
+    total_delivered: 0,
+    total_opened: 0,
+    total_bounced: 0,
+    total_replied: 0,
+    total_hot_leads: 0,
+    total_queued: 0,
+    total_suppressed: 0,
+    open_rate_percent: 0.0,
+    bounce_rate_percent: 0.0,
+    conversion_rate_percent: 0.0
+  });
+  const [isPollingImap, setIsPollingImap] = useState(false);
+
+  const [blacklistRules, setBlacklistRules] = useState([]);
+  const [newRulePattern, setNewRulePattern] = useState("");
+  const [newRuleReason, setNewRuleReason] = useState("");
+
+  const [billingHistory, setBillingHistory] = useState([]);
+  const [billingTargetOpId, setBillingTargetOpId] = useState("");
+  const [billingBasePrice, setBillingBasePrice] = useState("199.00");
+  const [billingDurationDays, setBillingDurationDays] = useState(90);
+  const [billingNotes, setBillingNotes] = useState("");
+  const [isApplyingBilling, setIsApplyingBilling] = useState(false);
+
+  // ---------------------------------------------------------------------------
   // FETCH CORE DATA (4-Second Periodic Polling)
   // ---------------------------------------------------------------------------
   const fetchData = async () => {
@@ -401,6 +445,15 @@ function NexusPulseApp() {
       if (Array.isArray(mailboxesRes)) setMailboxes(mailboxesRes);
       if (tzRes) setTimezones(tzRes);
 
+      // Fetch templates & deliverability analytics for all roles
+      fetch(`${API_BASE}/api/templates`, { headers }).then(r => r.json()).then(data => {
+        if (Array.isArray(data)) setTemplatesList(data);
+      }).catch(() => {});
+
+      fetch(`${API_BASE}/api/analytics/deliverability`, { headers }).then(r => r.json()).then(data => {
+        if (data && typeof data.total_sent === "number") setDeliverabilityStats(data);
+      }).catch(() => {});
+
       if (user && user.role === "admin") {
         fetch(`${API_BASE}/api/operators`, { headers }).then(r => r.json()).then(data => {
           if (Array.isArray(data)) setOperatorsList(data);
@@ -421,11 +474,33 @@ function NexusPulseApp() {
         fetch(`${API_BASE}/api/licenses/telemetry`, { headers }).then(r => r.json()).then(data => {
           if (data) setLicenseTelemetry(data);
         }).catch(() => {});
+
+        fetch(`${API_BASE}/api/blacklist`, { headers }).then(r => r.json()).then(data => {
+          if (Array.isArray(data)) setBlacklistRules(data);
+        }).catch(() => {});
+
+        fetch(`${API_BASE}/api/billing/all-history`, { headers }).then(r => r.json()).then(data => {
+          if (Array.isArray(data)) setBillingHistory(data);
+        }).catch(() => {});
+
+        fetch(`${API_BASE}/api/operators/activity-log/all`, { headers }).then(r => r.json()).then(data => {
+          if (Array.isArray(data)) setSessionAuditLogs(data);
+        }).catch(() => {});
       }
     } catch (e) {
       console.error("Data sync error:", e);
     }
   };
+
+  // Restrict Operator access away from Admin tabs
+  useEffect(() => {
+    if (user && user.role === "operator") {
+      const adminOnlyTabs = ["security_settings", "operator_mgmt", "license_mgmt", "billing_mgmt", "blacklist_mgmt"];
+      if (adminOnlyTabs.includes(activeTab)) {
+        setActiveTab("kanban");
+      }
+    }
+  }, [user, activeTab]);
 
   useEffect(() => {
     if (user && token) {
@@ -654,7 +729,8 @@ function NexusPulseApp() {
           country: huntCountry,
           city: effectiveCity,
           niche: huntNiche,
-          max_results: parseInt(huntMaxResults, 10) || 20
+          max_results: parseInt(huntMaxResults, 10) || 20,
+          target_urls: huntTargetUrls.trim() ? huntTargetUrls.split("\n").map(u => u.trim()).filter(Boolean) : undefined
         })
       });
 
@@ -926,6 +1002,13 @@ function NexusPulseApp() {
   // OPERATOR MANAGEMENT HANDLERS
   // ---------------------------------------------------------------------------
   const handleToggleOperatorStatus = async (operatorId) => {
+    // Instant optimistic update for smooth UI response
+    setOperatorsList(prev => prev.map(op => {
+      if (op.id === operatorId) {
+        return { ...op, is_active: op.is_active === 1 ? 0 : 1 };
+      }
+      return op;
+    }));
     try {
       const resp = await fetch(`${API_BASE}/api/operators/${operatorId}/toggle-status`, {
         method: "POST",
@@ -936,10 +1019,12 @@ function NexusPulseApp() {
         setAlertBanner({ type: "info", message: `Operator status updated to: ${data.status_label}` });
         fetchData();
       } else {
-        alert(data.detail || "Status toggle failed.");
+        fetchData();
+        setAlertBanner({ type: "danger", message: data.detail || "Status toggle failed." });
       }
     } catch (err) {
-      alert("Error toggling operator status.");
+      fetchData();
+      setAlertBanner({ type: "danger", message: "Error toggling operator status." });
     }
   };
 
@@ -951,9 +1036,10 @@ function NexusPulseApp() {
   const handleResetOperatorPassword = async (e) => {
     if (e) e.preventDefault();
     if (!resetPasswordInput || resetPasswordInput.length < 6) {
-      alert("Password must be at least 6 characters.");
+      setAlertBanner({ type: "warning", message: "Passphrase must be at least 6 characters." });
       return;
     }
+    setIsResettingPassword(true);
     try {
       const resp = await fetch(`${API_BASE}/api/operators/${selectedUserForReset.id}/reset-password`, {
         method: "POST",
@@ -963,28 +1049,40 @@ function NexusPulseApp() {
       const data = await resp.json();
       if (resp.ok) {
         setSelectedUserForReset(null);
+        setResetPasswordInput("");
         setAlertBanner({ type: "success", message: `Password reset successfully for ${data.username} using Bcrypt encryption.` });
         fetchData();
       } else {
-        alert(data.detail || "Password reset failed.");
+        setAlertBanner({ type: "danger", message: data.detail || "Password reset failed." });
       }
     } catch (err) {
-      alert("Error resetting password.");
+      setAlertBanner({ type: "danger", message: "Error resetting password." });
+    } finally {
+      setIsResettingPassword(false);
     }
   };
 
   const handleCreateOperator = async (e) => {
     if (e) e.preventDefault();
+    if (!newOpUsername || newOpUsername.trim().length < 3) {
+      setAlertBanner({ type: "warning", message: "Username must be at least 3 characters." });
+      return;
+    }
+    if (!newOpPassword || newOpPassword.length < 6) {
+      setAlertBanner({ type: "warning", message: "Passphrase must be at least 6 characters." });
+      return;
+    }
+    setIsCreatingOperator(true);
     try {
       const resp = await fetch(`${API_BASE}/api/operators`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({
-          username: newOpUsername,
+          username: newOpUsername.trim(),
           password: newOpPassword,
-          full_name: newOpFullName,
-          email: newOpEmail,
-          device_lock_id: newOpDeviceLock,
+          full_name: newOpFullName.trim() || newOpUsername.trim(),
+          email: newOpEmail.trim(),
+          device_lock_id: newOpDeviceLock.trim() || undefined,
           device_lock_enabled: true,
           expiry_days: parseInt(newOpExpiryDays, 10) || 90,
           daily_scrape_quota: parseInt(newOpScrapeQuota, 10) || 200,
@@ -998,16 +1096,19 @@ function NexusPulseApp() {
         setNewOpPassword("");
         setNewOpFullName("");
         setNewOpEmail("");
+        setNewOpDeviceLock("");
         setNewOpExpiryDays("90");
         setNewOpScrapeQuota("200");
         setNewOpSendQuota("50");
         setAlertBanner({ type: "success", message: `Operator account '${data.username}' created with signed license token!` });
         fetchData();
       } else {
-        alert(data.detail || "Operator creation failed.");
+        setAlertBanner({ type: "danger", message: data.detail || "Operator creation failed." });
       }
     } catch (err) {
-      alert("Error creating operator.");
+      setAlertBanner({ type: "danger", message: "Error creating operator." });
+    } finally {
+      setIsCreatingOperator(false);
     }
   };
 
@@ -1022,6 +1123,18 @@ function NexusPulseApp() {
   };
 
   const handleApplyInlineQuotas = async (operatorId, extendDays = null) => {
+    setUpdatingOperatorId(operatorId);
+    // Instant optimistic update
+    setOperatorsList(prev => prev.map(op => {
+      if (op.id === operatorId) {
+        return {
+          ...op,
+          daily_scrape_quota: parseInt(inlineScrapeQuota, 10) || op.daily_scrape_quota,
+          daily_send_quota: parseInt(inlineSendQuota, 10) || op.daily_send_quota
+        };
+      }
+      return op;
+    }));
     try {
       const resp = await fetch(`${API_BASE}/api/operators/${operatorId}/quotas`, {
         method: "PUT",
@@ -1041,10 +1154,245 @@ function NexusPulseApp() {
         setExpandedOperatorId(null);
         fetchData();
       } else {
-        alert(data.detail || "Quota modification failed.");
+        fetchData();
+        setAlertBanner({ type: "danger", message: data.detail || "Quota modification failed." });
       }
     } catch (err) {
-      alert("Error modifying quotas.");
+      fetchData();
+      setAlertBanner({ type: "danger", message: "Error modifying quotas." });
+    } finally {
+      setUpdatingOperatorId(null);
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // TEMPLATE MANAGEMENT HANDLERS
+  // ---------------------------------------------------------------------------
+  const handleOpenTemplateModal = (tpl = null) => {
+    if (tpl) {
+      setEditingTemplate(tpl);
+      setTplTitle(tpl.title || "");
+      setTplNiche(tpl.niche || "Commercial Construction");
+      setTplSubject(tpl.subject_template || "");
+      setTplBody(tpl.body_template || "");
+      setTplIsDefault(Boolean(tpl.is_default));
+    } else {
+      setEditingTemplate(null);
+      setTplTitle("");
+      setTplNiche("Commercial Construction");
+      setTplSubject("Commercial Estimation & Tenders // {{company_name}}");
+      setTplBody(
+        "Dear Estimating Team at {{company_name}},\n\n" +
+        "We are reaching out regarding commercial capacity and tender packages for {{niche}} in {{country}}.\n\n" +
+        "Our team handles detailed bill-of-quantities takeoffs, rapid estimating, and competitive pricing.\n\n" +
+        "Please confirm the right contact or portal to receive tender specifications.\n\n" +
+        "Best regards,\n" +
+        "Commercial Estimating Team\n\n" +
+        "---\n" +
+        "To opt-out from future notices: {{unsubscribe_link}}"
+      );
+      setTplIsDefault(false);
+    }
+    setIsTemplateModalOpen(true);
+  };
+
+  const handleSaveTemplate = async (e) => {
+    if (e) e.preventDefault();
+    if (!tplTitle.trim() || !tplSubject.trim() || !tplBody.trim()) {
+      alert("Please provide title, subject, and body for the template.");
+      return;
+    }
+    try {
+      const headers = {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {})
+      };
+      if (editingTemplate) {
+        const resp = await fetch(`${API_BASE}/api/templates/${editingTemplate.id}`, {
+          method: "PUT",
+          headers,
+          body: JSON.stringify({
+            title: tplTitle,
+            niche: tplNiche,
+            subject_template: tplSubject,
+            body_template: tplBody,
+            is_default: tplIsDefault
+          })
+        });
+        if (resp.ok) {
+          setAlertBanner({ type: "success", message: `Template '${tplTitle}' updated successfully.` });
+          setIsTemplateModalOpen(false);
+          fetchData();
+        } else {
+          const err = await resp.json();
+          alert(err.detail || "Failed to update template.");
+        }
+      } else {
+        const resp = await fetch(`${API_BASE}/api/templates`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            title: tplTitle,
+            niche: tplNiche,
+            subject_template: tplSubject,
+            body_template: tplBody,
+            is_default: tplIsDefault
+          })
+        });
+        if (resp.ok) {
+          setAlertBanner({ type: "success", message: `Template '${tplTitle}' created successfully.` });
+          setIsTemplateModalOpen(false);
+          fetchData();
+        } else {
+          const err = await resp.json();
+          alert(err.detail || "Failed to create template.");
+        }
+      }
+    } catch (e) {
+      console.error(e);
+      alert("Template save error.");
+    }
+  };
+
+  const handleDeleteTemplate = async (tplId) => {
+    if (!confirm("Are you sure you want to delete this proposal template?")) return;
+    try {
+      const resp = await fetch(`${API_BASE}/api/templates/${tplId}`, {
+        method: "DELETE",
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      });
+      if (resp.ok) {
+        setAlertBanner({ type: "info", message: "Template removed." });
+        fetchData();
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleInsertTag = (tag) => {
+    setTplBody(prev => prev + " " + tag);
+  };
+
+  // ---------------------------------------------------------------------------
+  // MANUAL BILLING CONTROLS HANDLERS
+  // ---------------------------------------------------------------------------
+  const handleApplyBilling = async (e) => {
+    if (e) e.preventDefault();
+    if (!billingTargetOpId) {
+      alert("Please select a target operator.");
+      return;
+    }
+    const price = parseFloat(billingBasePrice) || 0;
+    if (price <= 0) {
+      alert("Please enter a valid Base Price.");
+      return;
+    }
+    setIsApplyingBilling(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/operators/${billingTargetOpId}/billing`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {})
+        },
+        body: JSON.stringify({
+          base_price: price,
+          duration_days: billingDurationDays,
+          notes: billingNotes.trim() || undefined
+        })
+      });
+      const data = await resp.json();
+      if (resp.ok) {
+        setAlertBanner({
+          type: "success",
+          message: `Billing applied! +${data.duration_days}d extension for $${data.final_price} (Expiry: ${data.new_expiry_date}).`
+        });
+        fetchData();
+        setBillingNotes("");
+      } else {
+        alert(data.detail || "Billing application failed.");
+      }
+    } catch (err) {
+      console.error(err);
+      alert("Billing error.");
+    } finally {
+      setIsApplyingBilling(false);
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // GLOBAL DOMAIN BLACKLIST HANDLERS
+  // ---------------------------------------------------------------------------
+  const handleAddBlacklistRule = async (e) => {
+    if (e) e.preventDefault();
+    if (!newRulePattern.trim()) {
+      alert("Please enter a domain or pattern.");
+      return;
+    }
+    try {
+      const resp = await fetch(`${API_BASE}/api/blacklist`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(token ? { Authorization: `Bearer ${token}` } : {})
+        },
+        body: JSON.stringify({
+          pattern: newRulePattern.trim(),
+          reason: newRuleReason.trim() || "Excluded Domain"
+        })
+      });
+      const data = await resp.json();
+      if (resp.ok) {
+        setAlertBanner({ type: "success", message: `Blacklist rule '${data.pattern}' added.` });
+        setNewRulePattern("");
+        setNewRuleReason("");
+        fetchData();
+      } else {
+        alert(data.detail || "Failed to add blacklist rule.");
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleDeleteBlacklistRule = async (ruleId) => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/blacklist/${ruleId}`, {
+        method: "DELETE",
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      });
+      if (resp.ok) {
+        setAlertBanner({ type: "info", message: "Blacklist rule removed." });
+        fetchData();
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  // ---------------------------------------------------------------------------
+  // IMAP BOUNCE & REPLY POLL HANDLER
+  // ---------------------------------------------------------------------------
+  const handlePollImap = async () => {
+    setIsPollingImap(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/inbox/poll`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      });
+      const data = await resp.json();
+      if (resp.ok) {
+        setAlertBanner({
+          type: "info",
+          message: `IMAP Poll finished: ${data.processed_count} messages inspected. Bounces & replies synchronized.`
+        });
+        fetchData();
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setIsPollingImap(false);
     }
   };
 
@@ -1494,11 +1842,36 @@ function NexusPulseApp() {
         </button>
 
         <button
-          onClick={() => setActiveTab("security_settings")}
-          className={`np-nav-tab ${activeTab === "security_settings" ? "active" : ""}`}
+          onClick={() => setActiveTab("templates")}
+          className={`np-nav-tab ${activeTab === "templates" ? "active" : ""}`}
         >
-          <span>⚙️ Security Profile</span>
+          <span>📝 Proposals ({templatesList.length})</span>
         </button>
+
+        <button
+          onClick={() => setActiveTab("analytics")}
+          className={`np-nav-tab ${activeTab === "analytics" ? "active" : ""}`}
+        >
+          <span>📈 Deliverability</span>
+        </button>
+
+        {user.role === "admin" && (
+          <button
+            onClick={() => setActiveTab("billing_mgmt")}
+            className={`np-nav-tab ${activeTab === "billing_mgmt" ? "active" : ""}`}
+          >
+            <span>💳 Manual Billing</span>
+          </button>
+        )}
+
+        {user.role === "admin" && (
+          <button
+            onClick={() => setActiveTab("blacklist_mgmt")}
+            className={`np-nav-tab ${activeTab === "blacklist_mgmt" ? "active" : ""}`}
+          >
+            <span>🚫 Blacklist</span>
+          </button>
+        )}
 
         {user.role === "admin" && (
           <button
@@ -1506,6 +1879,15 @@ function NexusPulseApp() {
             className={`np-nav-tab ${activeTab === "operator_mgmt" ? "active" : ""}`}
           >
             <span>👥 Operators ({operatorsList.length})</span>
+          </button>
+        )}
+
+        {user.role === "admin" && (
+          <button
+            onClick={() => setActiveTab("security_settings")}
+            className={`np-nav-tab ${activeTab === "security_settings" ? "active" : ""}`}
+          >
+            <span>⚙️ Security Profile</span>
           </button>
         )}
 
@@ -1782,71 +2164,326 @@ function NexusPulseApp() {
               </button>
             </div>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              {mailboxes.map((mb) => {
-                const percent = Math.min(100, Math.round((mb.sent_today / mb.daily_limit) * 100));
-                return (
-                  <div key={mb.id} className="np-card p-4 space-y-3">
-                    <div className="flex items-start justify-between">
+            {mailboxes.length === 0 ? (
+              <div className="np-card p-12 text-center">
+                <span className="text-3xl mb-2 block">📬</span>
+                <h3 className="font-semibold text-sm text-theme-primary">No Data Available: Zero Mailboxes Enrolled</h3>
+                <p className="text-xs text-theme-secondary mt-1">Enroll an active SMTP inbox into the rotation pool to enable automated outreach.</p>
+                <button
+                  onClick={() => setIsAddMailboxOpen(true)}
+                  className="btn btn-primary btn-sm mt-4"
+                >
+                  + Enroll Mailbox
+                </button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {mailboxes.map((mb) => {
+                  const percent = Math.min(100, Math.round((mb.sent_today / mb.daily_limit) * 100));
+                  return (
+                    <div key={mb.id} className="np-card p-4 space-y-3">
+                      <div className="flex items-start justify-between">
+                        <div>
+                          <h3 className="font-semibold text-sm text-theme-primary">{mb.display_name}</h3>
+                          <p className="text-xs font-mono text-theme-accent">{mb.email_address}</p>
+                          <p className="text-[10px] text-theme-muted font-mono mt-0.5">Domain: {mb.domain}</p>
+                        </div>
+                        <span className="badge badge-success">HEALTHY</span>
+                      </div>
+
                       <div>
-                        <h3 className="font-semibold text-sm text-theme-primary">{mb.display_name}</h3>
-                        <p className="text-xs font-mono text-theme-accent">{mb.email_address}</p>
-                        <p className="text-[10px] text-theme-muted font-mono mt-0.5">Domain: {mb.domain}</p>
+                        <div className="flex items-center justify-between text-xs font-mono mb-1">
+                          <span className="text-theme-secondary">Daily Send Progress</span>
+                          <span className="font-semibold text-theme-primary">{mb.sent_today} / {mb.daily_limit} ({mb.remaining_quota} left)</span>
+                        </div>
+                        <div className="np-progress-bar">
+                          <div
+                            className={`np-progress-fill ${percent > 80 ? 'danger' : 'success'}`}
+                            style={{ width: `${percent}%` }}
+                          />
+                        </div>
                       </div>
-                      <span className="badge badge-success">HEALTHY</span>
+
+                      <div className="text-[11px] font-mono bg-elevated p-2.5 rounded border-theme space-y-1">
+                        <div className="flex justify-between text-theme-secondary">
+                          <span>Host:</span>
+                          <span className="text-theme-primary">{mb.smtp_host || `smtp.${mb.domain}`}</span>
+                        </div>
+                        <div className="flex justify-between text-theme-secondary">
+                          <span>Port / TLS:</span>
+                          <span className="text-theme-primary">{mb.smtp_port || 587}</span>
+                        </div>
+                        <div className="flex justify-between text-theme-secondary">
+                          <span>Username:</span>
+                          <span className="text-theme-primary truncate max-w-[160px]">{mb.smtp_username || mb.email_address}</span>
+                        </div>
+                      </div>
+
+                      <div className="pt-2 border-t-theme flex items-center justify-end gap-2">
+                        <button
+                          onClick={() => handleOpenEditMailbox(mb)}
+                          className="btn btn-secondary btn-sm"
+                        >
+                          ⚙️ Configure
+                        </button>
+                        <button
+                          onClick={() => handleDeleteMailbox(mb)}
+                          className="btn btn-danger btn-sm"
+                        >
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* TAB: PROPOSAL TEMPLATES */}
+        {activeTab === "templates" && (
+          <div className="w-full max-w-6xl mx-auto space-y-5">
+            <div className="flex items-center justify-between pb-3 border-b-theme">
+              <div>
+                <h2 className="font-semibold text-base text-theme-primary flex items-center gap-2">
+                  <span>📝 Multi-Service Proposal Template Pool</span>
+                  <span className="badge badge-accent">ZERO SEED</span>
+                </h2>
+                <p className="text-xs text-theme-secondary mt-0.5">
+                  Compose custom service proposals dynamically matched to target niches with automatic variable interpolation.
+                </p>
+              </div>
+
+              <button
+                onClick={() => handleOpenTemplateModal(null)}
+                className="btn btn-primary btn-sm flex items-center gap-1.5"
+              >
+                <span>+ Create Template</span>
+              </button>
+            </div>
+
+            {/* Variable Interpolation Legend */}
+            <div className="p-3 bg-elevated rounded-md border-theme flex flex-wrap items-center gap-2 text-xs">
+              <span className="text-theme-secondary font-medium">Available Dynamic Variables:</span>
+              {[
+                "{{company_name}}",
+                "{{niche}}",
+                "{{country}}",
+                "{{city}}",
+                "{{tech_stack}}",
+                "{{unsubscribe_link}}"
+              ].map(tag => (
+                <span key={tag} className="font-mono text-[11px] px-2 py-0.5 rounded bg-overlay text-theme-accent border-theme">
+                  {tag}
+                </span>
+              ))}
+            </div>
+
+            {templatesList.length === 0 ? (
+              <div className="np-card p-12 text-center">
+                <span className="text-3xl mb-2 block">📝</span>
+                <h3 className="font-semibold text-sm text-theme-primary">No Data Available: Zero Proposal Templates</h3>
+                <p className="text-xs text-theme-secondary mt-1">
+                  The system starts 100% clean with zero seed templates. Create custom service templates to match target industries.
+                </p>
+                <button
+                  onClick={() => handleOpenTemplateModal(null)}
+                  className="btn btn-primary btn-sm mt-4"
+                >
+                  + Create First Proposal Template
+                </button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {templatesList.map((tpl) => (
+                  <div key={tpl.id} className="np-card p-4 space-y-3 flex flex-col justify-between">
+                    <div className="space-y-2">
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <h3 className="font-semibold text-sm text-theme-primary">{tpl.title}</h3>
+                          <div className="flex items-center gap-1.5 mt-1">
+                            <span className="badge badge-accent text-[10px]">{tpl.niche}</span>
+                            {Boolean(tpl.is_default) && (
+                              <span className="badge badge-gold text-[10px]">DEFAULT FALLBACK</span>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => handleOpenTemplateModal(tpl)}
+                            className="btn btn-secondary btn-sm"
+                          >
+                            Edit
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteTemplate(tpl.id)}
+                            className="btn btn-danger btn-sm"
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="bg-elevated p-3 rounded border-theme text-xs font-mono space-y-1.5">
+                        <div className="text-theme-secondary font-semibold">
+                          Subject: <span className="text-theme-primary">{tpl.subject_template}</span>
+                        </div>
+                        <div className="text-theme-primary whitespace-pre-line line-clamp-4 text-[11px] border-t-theme pt-1.5">
+                          {tpl.body_template}
+                        </div>
+                      </div>
                     </div>
 
-                    <div>
-                      <div className="flex items-center justify-between text-xs font-mono mb-1">
-                        <span className="text-theme-secondary">Daily Send Progress</span>
-                        <span className="font-semibold text-theme-primary">{mb.sent_today} / {mb.daily_limit} ({mb.remaining_quota} left)</span>
-                      </div>
-                      <div className="np-progress-bar">
-                        <div
-                          className={`np-progress-fill ${percent > 80 ? 'danger' : 'success'}`}
-                          style={{ width: `${percent}%` }}
-                        />
-                      </div>
-                    </div>
-
-                    <div className="text-[11px] font-mono bg-elevated p-2.5 rounded border-theme space-y-1">
-                      <div className="flex justify-between text-theme-secondary">
-                        <span>Host:</span>
-                        <span className="text-theme-primary">{mb.smtp_host || `smtp.${mb.domain}`}</span>
-                      </div>
-                      <div className="flex justify-between text-theme-secondary">
-                        <span>Port / TLS:</span>
-                        <span className="text-theme-primary">{mb.smtp_port || 587}</span>
-                      </div>
-                      <div className="flex justify-between text-theme-secondary">
-                        <span>Username:</span>
-                        <span className="text-theme-primary truncate max-w-[160px]">{mb.smtp_username || mb.email_address}</span>
-                      </div>
-                    </div>
-
-                    <div className="pt-2 border-t-theme flex items-center justify-end gap-2">
-                      <button
-                        onClick={() => handleOpenEditMailbox(mb)}
-                        className="btn btn-secondary btn-sm"
-                      >
-                        ⚙️ Configure
-                      </button>
-                      <button
-                        onClick={() => handleDeleteMailbox(mb)}
-                        className="btn btn-danger btn-sm"
-                      >
-                        Delete
-                      </button>
+                    <div className="text-[10px] font-mono text-theme-muted pt-2 border-t-theme flex justify-between">
+                      <span>Niche Match: {tpl.niche}</span>
+                      <span>Updated: {tpl.updated_at ? tpl.updated_at.split("T")[0] : "—"}</span>
                     </div>
                   </div>
-                );
-              })}
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* TAB: DELIVERABILITY ANALYTICS */}
+        {activeTab === "analytics" && (
+          <div className="w-full max-w-6xl mx-auto space-y-5">
+            <div className="flex items-center justify-between pb-3 border-b-theme">
+              <div>
+                <h2 className="font-semibold text-base text-theme-primary flex items-center gap-2">
+                  <span>📈 Campaign Deliverability Analytics Dashboard</span>
+                  <span className="badge badge-success">LIVE TELEMETRY</span>
+                </h2>
+                <p className="text-xs text-theme-secondary mt-0.5">
+                  Visual metric indicators tracking open rates, bounce suppressions, conversion events, and sender reputation.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={fetchData}
+                  className="btn btn-secondary btn-sm"
+                  title="Refresh metrics"
+                >
+                  🔄 Refresh
+                </button>
+                <button
+                  type="button"
+                  onClick={handlePollImap}
+                  disabled={isPollingImap}
+                  className="btn btn-primary btn-sm flex items-center gap-1.5"
+                  title="Trigger background IMAP poll for bounces and replies"
+                >
+                  <span>{isPollingImap ? "Polling Inboxes..." : "📡 Run IMAP Poll"}</span>
+                </button>
+              </div>
+            </div>
+
+            {/* 4 Primary KPI Indicator Cards */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="np-card p-4 space-y-2 border-l-4 border-l-[var(--accent)]">
+                <div className="text-xs text-theme-secondary font-semibold uppercase tracking-wider">Open Rate %</div>
+                <div className="text-2xl font-bold font-mono text-theme-accent">
+                  {deliverabilityStats.open_rate_percent}%
+                </div>
+                <div className="text-[11px] text-theme-muted font-mono">
+                  {deliverabilityStats.total_opened} of {deliverabilityStats.total_delivered} delivered opened
+                </div>
+              </div>
+
+              <div className="np-card p-4 space-y-2 border-l-4 border-l-[var(--danger)]">
+                <div className="text-xs text-theme-secondary font-semibold uppercase tracking-wider">Bounce Rate %</div>
+                <div className="text-2xl font-bold font-mono text-theme-danger">
+                  {deliverabilityStats.bounce_rate_percent}%
+                </div>
+                <div className="text-[11px] text-theme-muted font-mono">
+                  {deliverabilityStats.total_bounced} bounces auto-suppressed
+                </div>
+              </div>
+
+              <div className="np-card p-4 space-y-2 border-l-4 border-l-[var(--success)]">
+                <div className="text-xs text-theme-secondary font-semibold uppercase tracking-wider">Conversion Rate %</div>
+                <div className="text-2xl font-bold font-mono text-theme-success">
+                  {deliverabilityStats.conversion_rate_percent}%
+                </div>
+                <div className="text-[11px] text-theme-muted font-mono">
+                  {deliverabilityStats.total_replied} replies & hot opportunities
+                </div>
+              </div>
+
+              <div className="np-card p-4 space-y-2 border-l-4 border-l-[var(--gold)]">
+                <div className="text-xs text-theme-secondary font-semibold uppercase tracking-wider">Sent / Delivered</div>
+                <div className="text-2xl font-bold font-mono text-theme-gold">
+                  {deliverabilityStats.total_delivered}
+                </div>
+                <div className="text-[11px] text-theme-muted font-mono">
+                  {deliverabilityStats.total_sent} sent, {deliverabilityStats.total_queued} held in gate
+                </div>
+              </div>
+            </div>
+
+            {/* Secondary Operational Telemetry */}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="np-card p-5 space-y-3">
+                <h3 className="font-semibold text-sm text-theme-primary pb-2 border-b-theme">
+                  Sender Health & Hygiene Telemetry
+                </h3>
+                <div className="space-y-2 text-xs font-mono">
+                  <div className="flex justify-between py-1 border-b-theme text-theme-secondary">
+                    <span>Sender Reputation Rating:</span>
+                    <span className="font-bold text-theme-success">
+                      {deliverabilityStats.bounce_rate_percent < 5 ? "OPTIMAL (98/100)" : "ATTENTION REQUIRED"}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b-theme text-theme-secondary">
+                    <span>Global Suppressed Entities:</span>
+                    <span className="font-bold text-theme-danger">{deliverabilityStats.total_suppressed}</span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b-theme text-theme-secondary">
+                    <span>Enrolled Sending Mailboxes:</span>
+                    <span className="font-bold text-theme-accent">{mailboxes.length} Active</span>
+                  </div>
+                  <div className="flex justify-between py-1 text-theme-secondary">
+                    <span>Zero-Bounce Verification:</span>
+                    <span className="text-theme-success font-semibold">Active DNS MX + SMTP Ping</span>
+                  </div>
+                </div>
+              </div>
+
+              <div className="np-card p-5 space-y-3">
+                <h3 className="font-semibold text-sm text-theme-primary pb-2 border-b-theme">
+                  Outreach Pipeline Status
+                </h3>
+                <div className="space-y-2 text-xs font-mono">
+                  <div className="flex justify-between py-1 border-b-theme text-theme-secondary">
+                    <span>Held in Approval Gate:</span>
+                    <span className="font-bold text-theme-warning">{pendingApprovals.length} Leads</span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b-theme text-theme-secondary">
+                    <span>High-Intent Hot Inquiries:</span>
+                    <span className="font-bold text-theme-danger">{hotLeads.length} Hot Leads</span>
+                  </div>
+                  <div className="flex justify-between py-1 border-b-theme text-theme-secondary">
+                    <span>Total Entities Tracked:</span>
+                    <span className="font-bold text-theme-primary">{kanbanItems.length} Total</span>
+                  </div>
+                  <div className="flex justify-between py-1 text-theme-secondary">
+                    <span>Working Hours Window:</span>
+                    <span className="text-theme-accent font-semibold">9-11 AM & 2-5 PM Local Recipient</span>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         )}
 
         {/* TAB 5: DYNAMIC ADMIN PROFILE */}
-        {activeTab === "security_settings" && (
+        {user.role === "admin" && activeTab === "security_settings" && (
           <div className="w-full max-w-3xl mx-auto space-y-5">
             <div className="pb-3 border-b-theme">
               <h2 className="font-semibold text-base text-theme-primary">
@@ -1971,7 +2608,7 @@ function NexusPulseApp() {
         )}
 
         {/* TAB 6: ROLE-BASED OPERATOR MANAGEMENT & AUDIT TRAIL */}
-        {activeTab === "operator_mgmt" && (
+        {user.role === "admin" && activeTab === "operator_mgmt" && (
           <div className="w-full max-w-7xl mx-auto space-y-6">
             <div className="flex items-center justify-between pb-3 border-b-theme">
               <div>
@@ -1992,213 +2629,228 @@ function NexusPulseApp() {
               </button>
             </div>
 
-            {/* Operator List Table with Fixed Columns & Horizontal Wrapper */}
-            <div className="np-table-wrapper">
-              <table className="np-table">
-                <thead>
-                  <tr>
-                    <th style={{ width: "22%" }}>Operator Identity</th>
-                    <th style={{ width: "8%" }}>Role</th>
-                    <th style={{ width: "11%" }}>Access Status</th>
-                    <th style={{ width: "15%" }}>Device Lock</th>
-                    <th style={{ width: "12%" }}>Daily Quotas</th>
-                    <th style={{ width: "10%" }}>Subscription Expiry</th>
-                    <th style={{ width: "10%" }}>Last Login</th>
-                    <th style={{ width: "12%" }} className="text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {operatorsList.map((op) => (
-                    <React.Fragment key={op.id}>
-                      <tr>
-                        <td>
-                          <div className="font-semibold text-xs text-theme-primary leading-normal truncate">{op.full_name}</div>
-                          <div className="text-[11px] font-mono text-theme-accent leading-normal truncate">{op.username}</div>
-                          <div className="text-[10px] text-theme-muted leading-normal truncate">{op.email}</div>
-                        </td>
-
-                        <td className="np-table-nowrap">
-                          <span className={`badge ${op.role === 'admin' ? 'badge-gold' : 'badge-accent'}`}>
-                            {op.role}
-                          </span>
-                        </td>
-
-                        <td className="np-table-nowrap">
-                          {op.role === "admin" ? (
-                            <span className="badge badge-success">PERMANENT</span>
-                          ) : (
-                            <button
-                              onClick={() => handleToggleOperatorStatus(op.id)}
-                              className={`btn btn-sm ${op.is_active === 1 ? 'btn-success' : 'btn-danger'}`}
-                              title="Click to toggle access"
-                            >
-                              <span className={`w-1.5 h-1.5 rounded-full ${op.is_active === 1 ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'}`} />
-                              <span>{op.is_active === 1 ? 'ACTIVE' : 'REVOKED'}</span>
-                            </button>
-                          )}
-                        </td>
-
-                        <td>
-                          <span className="text-xs font-mono truncate block" title={op.device_lock_id || "Unbound"}>
-                            {op.device_lock_id || "Auto-Bind on Login"}
-                          </span>
-                        </td>
-
-                        <td className="np-table-nowrap font-mono text-xs">
-                          <div>Scrape: <strong>{op.daily_scrape_quota}</strong>/d</div>
-                          <div>Send: <strong>{op.daily_send_quota}</strong>/d</div>
-                        </td>
-
-                        <td className="np-table-nowrap text-xs font-mono">
-                          {op.expiry_date ? op.expiry_date.split(" ")[0] : "Perpetual"}
-                        </td>
-
-                        <td className="np-table-nowrap text-xs text-theme-muted font-mono">
-                          {op.last_login ? op.last_login.split(" ")[0] : "Never"}
-                        </td>
-
-                        <td className="np-table-actions">
-                          <div className="flex items-center justify-end gap-1.5">
-                            <button
-                              onClick={() => handleOpenResetPasswordModal(op)}
-                              className="btn btn-secondary btn-sm"
-                              title="Reset Operator Password"
-                            >
-                              Reset Pass
-                            </button>
-                            <button
-                              onClick={() => handleToggleInlineAdjust(op)}
-                              className={`btn btn-sm ${expandedOperatorId === op.id ? 'btn-primary' : 'btn-secondary'}`}
-                              title="Adjust Quotas & Subscription"
-                            >
-                              {expandedOperatorId === op.id ? 'Close' : 'Adjust'}
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-
-                      {/* Streamlined Inline Action Bar */}
-                      {expandedOperatorId === op.id && (
+            {operatorsList.length === 0 ? (
+              <div className="np-card p-12 text-center">
+                <span className="text-3xl mb-2 block">👥</span>
+                <h3 className="font-semibold text-sm text-theme-primary">No Data Available: Zero Operators Registered</h3>
+                <p className="text-xs text-theme-secondary mt-1">Issue hardware-locked credentials and license tokens to onboard your team.</p>
+                <button
+                  onClick={() => setIsCreateOperatorOpen(true)}
+                  className="btn btn-primary btn-sm mt-4"
+                >
+                  + Create Operator Account
+                </button>
+              </div>
+            ) : (
+              /* Operator List Table with Fixed Columns & Horizontal Wrapper */
+              <div className="np-table-wrapper">
+                <table className="np-table">
+                  <thead>
+                    <tr>
+                      <th style={{ width: "22%" }}>Operator Identity</th>
+                      <th style={{ width: "8%" }}>Role</th>
+                      <th style={{ width: "11%" }}>Access Status</th>
+                      <th style={{ width: "15%" }}>Device Lock</th>
+                      <th style={{ width: "12%" }}>Daily Quotas</th>
+                      <th style={{ width: "10%" }}>Subscription Expiry</th>
+                      <th style={{ width: "10%" }}>Last Login</th>
+                      <th style={{ width: "12%" }} className="text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {operatorsList.map((op) => (
+                      <React.Fragment key={op.id}>
                         <tr>
-                          <td colSpan={8} className="np-expand-cell border-b-theme">
-                            <div className="p-4 sm:p-5 space-y-3 bg-elevated">
-                              <div className="flex items-center justify-between pb-2 border-b-theme">
-                                <span className="text-xs font-semibold text-theme-primary">
-                                  Inline Quota & Subscription Controls: {op.username}
-                                </span>
-                                <span className="text-xs font-mono text-theme-muted">
-                                  Current Expiry: {op.expiry_date || "Perpetual"}
-                                </span>
-                              </div>
+                          <td>
+                            <div className="font-semibold text-xs text-theme-primary leading-normal truncate">{op.full_name}</div>
+                            <div className="text-[11px] font-mono text-theme-accent leading-normal truncate">{op.username}</div>
+                            <div className="text-[10px] text-theme-muted leading-normal truncate">{op.email}</div>
+                          </td>
 
-                              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                                {/* Quick Extension Presets */}
-                                <div>
-                                  <label className="np-label">Extend Subscription</label>
-                                  <div className="grid grid-cols-4 gap-1.5">
-                                    <button
-                                      type="button"
-                                      onClick={() => handleApplyInlineQuotas(op.id, 30)}
-                                      className="btn btn-secondary btn-sm justify-center"
-                                    >
-                                      +30d
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleApplyInlineQuotas(op.id, 90)}
-                                      className="btn btn-secondary btn-sm justify-center"
-                                    >
-                                      +90d
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleApplyInlineQuotas(op.id, 180)}
-                                      className="btn btn-secondary btn-sm justify-center"
-                                    >
-                                      +180d
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => handleApplyInlineQuotas(op.id, 365)}
-                                      className="btn btn-secondary btn-sm justify-center"
-                                    >
-                                      +1y
-                                    </button>
-                                  </div>
-                                </div>
+                          <td className="np-table-nowrap">
+                            <span className={`badge ${op.role === 'admin' ? 'badge-gold' : 'badge-accent'}`}>
+                              {op.role}
+                            </span>
+                          </td>
 
-                                {/* Daily Scrape Limit */}
-                                <div>
-                                  <label className="np-label">Daily Scrape Limit</label>
-                                  <input
-                                    type="number"
-                                    value={inlineScrapeQuota}
-                                    onChange={(e) => setInlineScrapeQuota(e.target.value)}
-                                    className="np-input font-mono"
-                                  />
-                                  <div className="flex gap-1 mt-1">
-                                    {[100, 200, 500, 1000].map(val => (
-                                      <button
-                                        key={val}
-                                        type="button"
-                                        onClick={() => setInlineScrapeQuota(String(val))}
-                                        className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-overlay hover:bg-hover text-theme-secondary"
-                                      >
-                                        {val}
-                                      </button>
-                                    ))}
-                                  </div>
-                                </div>
+                          <td className="np-table-nowrap">
+                            {op.role === "admin" ? (
+                              <span className="badge badge-success">PERMANENT</span>
+                            ) : (
+                              <button
+                                onClick={() => handleToggleOperatorStatus(op.id)}
+                                className={`btn btn-sm ${op.is_active === 1 ? 'btn-success' : 'btn-danger'}`}
+                                title="Click to toggle access"
+                              >
+                                <span className={`w-1.5 h-1.5 rounded-full ${op.is_active === 1 ? 'bg-[var(--success)]' : 'bg-[var(--danger)]'}`} />
+                                <span>{op.is_active === 1 ? 'ACTIVE' : 'REVOKED'}</span>
+                              </button>
+                            )}
+                          </td>
 
-                                {/* Daily Send Limit */}
-                                <div>
-                                  <label className="np-label">Daily Send Limit</label>
-                                  <input
-                                    type="number"
-                                    value={inlineSendQuota}
-                                    onChange={(e) => setInlineSendQuota(e.target.value)}
-                                    className="np-input font-mono"
-                                  />
-                                  <div className="flex gap-1 mt-1">
-                                    {[25, 50, 100, 200].map(val => (
-                                      <button
-                                        key={val}
-                                        type="button"
-                                        onClick={() => setInlineSendQuota(String(val))}
-                                        className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-overlay hover:bg-hover text-theme-secondary"
-                                      >
-                                        {val}
-                                      </button>
-                                    ))}
-                                  </div>
-                                </div>
-                              </div>
+                          <td>
+                            <span className="text-xs font-mono truncate block" title={op.device_lock_id || "Unbound"}>
+                              {op.device_lock_id || "Auto-Bind on Login"}
+                            </span>
+                          </td>
 
-                              <div className="pt-2 flex justify-end gap-2 border-t-theme">
-                                <button
-                                  type="button"
-                                  onClick={() => setExpandedOperatorId(null)}
-                                  className="btn btn-ghost btn-sm"
-                                >
-                                  Cancel
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => handleApplyInlineQuotas(op.id, null)}
-                                  className="btn btn-primary btn-sm"
-                                >
-                                  Apply Changes
-                                </button>
-                              </div>
+                          <td className="np-table-nowrap font-mono text-xs">
+                            <div>Scrape: <strong>{op.daily_scrape_quota}</strong>/d</div>
+                            <div>Send: <strong>{op.daily_send_quota}</strong>/d</div>
+                          </td>
+
+                          <td className="np-table-nowrap text-xs font-mono">
+                            {op.expiry_date ? op.expiry_date.split(" ")[0] : "Perpetual"}
+                          </td>
+
+                          <td className="np-table-nowrap text-xs text-theme-muted font-mono">
+                            {op.last_login ? op.last_login.split(" ")[0] : "Never"}
+                          </td>
+
+                          <td className="np-table-actions">
+                            <div className="flex items-center justify-end gap-1.5">
+                              <button
+                                onClick={() => handleOpenResetPasswordModal(op)}
+                                className="btn btn-secondary btn-sm"
+                                title="Reset Operator Password"
+                              >
+                                Reset Pass
+                              </button>
+                              <button
+                                onClick={() => handleToggleInlineAdjust(op)}
+                                className={`btn btn-sm ${expandedOperatorId === op.id ? 'btn-primary' : 'btn-secondary'}`}
+                                title="Adjust Quotas & Subscription"
+                              >
+                                {expandedOperatorId === op.id ? 'Close' : 'Adjust'}
+                              </button>
                             </div>
                           </td>
                         </tr>
-                      )}
-                    </React.Fragment>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+
+                        {/* Streamlined Inline Action Bar */}
+                        {expandedOperatorId === op.id && (
+                          <tr>
+                            <td colSpan={8} className="np-expand-cell border-b-theme">
+                              <div className="p-4 sm:p-5 space-y-3 bg-elevated">
+                                <div className="flex items-center justify-between pb-2 border-b-theme">
+                                  <span className="text-xs font-semibold text-theme-primary">
+                                    Inline Quota & Subscription Controls: {op.username}
+                                  </span>
+                                  <span className="text-xs font-mono text-theme-muted">
+                                    Current Expiry: {op.expiry_date || "Perpetual"}
+                                  </span>
+                                </div>
+
+                                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                                  {/* Quick Extension Presets */}
+                                  <div>
+                                    <label className="np-label">Extend Subscription</label>
+                                    <div className="grid grid-cols-4 gap-1.5">
+                                      <button
+                                        type="button"
+                                        onClick={() => handleApplyInlineQuotas(op.id, 30)}
+                                        className="btn btn-secondary btn-sm justify-center"
+                                      >
+                                        +30d
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleApplyInlineQuotas(op.id, 90)}
+                                        className="btn btn-secondary btn-sm justify-center"
+                                      >
+                                        +90d
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleApplyInlineQuotas(op.id, 180)}
+                                        className="btn btn-secondary btn-sm justify-center"
+                                      >
+                                        +180d
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleApplyInlineQuotas(op.id, 365)}
+                                        className="btn btn-secondary btn-sm justify-center"
+                                      >
+                                        +1y
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  {/* Daily Scrape Limit */}
+                                  <div>
+                                    <label className="np-label">Daily Scrape Limit</label>
+                                    <input
+                                      type="number"
+                                      value={inlineScrapeQuota}
+                                      onChange={(e) => setInlineScrapeQuota(e.target.value)}
+                                      className="np-input font-mono"
+                                    />
+                                    <div className="flex gap-1 mt-1">
+                                      {[100, 200, 500, 1000].map(val => (
+                                        <button
+                                          key={val}
+                                          type="button"
+                                          onClick={() => setInlineScrapeQuota(String(val))}
+                                          className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-overlay hover:bg-hover text-theme-secondary"
+                                        >
+                                          {val}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </div>
+
+                                  {/* Daily Send Limit */}
+                                  <div>
+                                    <label className="np-label">Daily Send Limit</label>
+                                    <input
+                                      type="number"
+                                      value={inlineSendQuota}
+                                      onChange={(e) => setInlineSendQuota(e.target.value)}
+                                      className="np-input font-mono"
+                                    />
+                                    <div className="flex gap-1 mt-1">
+                                      {[25, 50, 100, 200].map(val => (
+                                        <button
+                                          key={val}
+                                          type="button"
+                                          onClick={() => setInlineSendQuota(String(val))}
+                                          className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-overlay hover:bg-hover text-theme-secondary"
+                                        >
+                                          {val}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  </div>
+                                </div>
+
+                                <div className="pt-2 flex justify-end gap-2 border-t-theme">
+                                  <button
+                                    type="button"
+                                    onClick={() => setExpandedOperatorId(null)}
+                                    className="btn btn-ghost btn-sm"
+                                  >
+                                    Cancel
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleApplyInlineQuotas(op.id, null)}
+                                    disabled={updatingOperatorId === op.id}
+                                    className="btn btn-primary btn-sm"
+                                  >
+                                    {updatingOperatorId === op.id ? "Saving..." : "Apply Changes"}
+                                  </button>
+                                </div>
+                              </div>
+                            </td>
+                          </tr>
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
 
             {/* Interactive Operator Session Audit Trail */}
             <div className="np-card p-5 space-y-4">
@@ -2222,37 +2874,375 @@ function NexusPulseApp() {
               </div>
 
               <div className="space-y-2">
-                {[
-                  { id: 1, action: "LOGIN", user: "h.huddair", status: "SUCCESS", detail: "Hardware machine fingerprint verified (NEXUS-E727-BB0B)", time: "Just now" },
-                  { id: 2, action: "PIPELINE_LAUNCH", user: "h.huddair", status: "SUCCESS", detail: "Scraped 20 Commercial Construction targets in Berlin, Germany", time: "12m ago" },
-                  { id: 3, action: "QUOTA_MODIFIED", user: "admin", status: "ENFORCED", detail: "Adjusted operator daily scrape limit to 200 / send limit 50", time: "1h ago" },
-                  { id: 4, action: "OUTREACH_APPROVED", user: "h.huddair", status: "SCHEDULED", detail: "Authorized 5 tender emails for 9-11 AM CET window", time: "3h ago" },
-                  { id: 5, action: "SECURITY_SCAN", user: "system", status: "ACTIVE", detail: "HMAC-SHA256 license signature verified across all workers", time: "5h ago" }
-                ]
-                .filter(ev => !auditSearch || ev.user.includes(auditSearch.toLowerCase()) || ev.detail.toLowerCase().includes(auditSearch.toLowerCase()))
-                .map((ev) => (
-                  <div key={ev.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-2.5 rounded bg-elevated border-theme text-xs font-mono">
-                    <div className="flex items-center gap-2.5 flex-wrap min-w-0">
-                      <span className={`badge shrink-0 ${
-                        ev.action === 'LOGIN' ? 'badge-accent' :
-                        ev.action === 'QUOTA_MODIFIED' ? 'badge-gold' :
-                        ev.action === 'OUTREACH_APPROVED' ? 'badge-warning' : 'badge-success'
-                      }`}>
-                        {ev.action}
-                      </span>
-                      <span className="font-bold text-theme-primary shrink-0">{ev.user}</span>
-                      <span className="text-theme-secondary break-words">{ev.detail}</span>
-                    </div>
-                    <span className="text-theme-muted text-[11px] shrink-0">{ev.time}</span>
+                {sessionAuditLogs.length === 0 ? (
+                  <div className="text-center py-8 text-xs text-theme-muted font-mono italic">
+                    No session audit records recorded yet. Activity will stream here live as operators log in and execute actions.
                   </div>
-                ))}
+                ) : (
+                  sessionAuditLogs
+                    .filter(ev => {
+                      if (!auditSearch) return true;
+                      const q = auditSearch.toLowerCase();
+                      const u = (ev.username || ev.user || "").toLowerCase();
+                      const d = (ev.detail || "").toLowerCase();
+                      const a = (ev.action || "").toLowerCase();
+                      return u.includes(q) || d.includes(q) || a.includes(q);
+                    })
+                    .map((ev) => (
+                      <div key={ev.id} className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 p-2.5 rounded bg-elevated border-theme text-xs font-mono">
+                        <div className="flex items-center gap-2.5 flex-wrap min-w-0">
+                          <span className={`badge shrink-0 ${
+                            ev.action === 'LOGIN' ? 'badge-accent' :
+                            ev.action === 'QUOTA_MODIFIED' ? 'badge-gold' :
+                            ev.action === 'OUTREACH_APPROVED' ? 'badge-warning' : 'badge-success'
+                          }`}>
+                            {ev.action}
+                          </span>
+                          <span className="font-bold text-theme-primary shrink-0">{ev.username || ev.user || "system"}</span>
+                          <span className="text-theme-secondary break-words">{ev.detail}</span>
+                        </div>
+                        <span className="text-theme-muted text-[11px] shrink-0">
+                          {ev.created_at ? ev.created_at.replace("T", " ").split(".")[0] : "Just now"}
+                        </span>
+                      </div>
+                    ))
+                )}
               </div>
             </div>
           </div>
         )}
 
+        {/* TAB: MANUAL BILLING CONTROLS (SUPER ADMIN ONLY) */}
+        {user.role === "admin" && activeTab === "billing_mgmt" && (
+          <div className="w-full max-w-6xl mx-auto space-y-6">
+            <div className="flex items-center justify-between pb-3 border-b-theme">
+              <div>
+                <h2 className="font-semibold text-base text-theme-primary flex items-center gap-2">
+                  <span>💳 Manual Billing & Subscription Lifecycle</span>
+                  <span className="badge badge-purple">SUPER ADMIN</span>
+                </h2>
+                <p className="text-xs text-theme-secondary mt-0.5">
+                  Direct operator license extensions, custom base pricing, and automated 10% discount on 90-day plans.
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
+              {/* Left 2 Cols: Interactive Billing Action Form */}
+              <div className="lg:col-span-2 np-card p-5 space-y-4">
+                <h3 className="font-semibold text-sm text-theme-primary pb-2 border-b-theme">
+                  Issue / Extend Operator Subscription
+                </h3>
+
+                <form onSubmit={handleApplyBilling} className="space-y-4">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                    <div>
+                      <label className="np-label">Target Operator</label>
+                      <select
+                        value={billingTargetOpId}
+                        onChange={(e) => setBillingTargetOpId(e.target.value)}
+                        className="np-select"
+                        required
+                      >
+                        <option value="">-- Select Operator --</option>
+                        {operatorsList.map(op => (
+                          <option key={op.id} value={op.id}>
+                            {op.full_name || op.username} ({op.username}) - {op.role}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="np-label">Base Price ($ USD)</label>
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="1"
+                        value={billingBasePrice}
+                        onChange={(e) => setBillingBasePrice(e.target.value)}
+                        className="np-input font-mono"
+                        placeholder="199.00"
+                        required
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="np-label">Duration Package Extender</label>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                      {[
+                        { days: 30, label: "+30 Days (1m)", discount: 0 },
+                        { days: 90, label: "+90 Days (3m)", discount: 10, highlight: true },
+                        { days: 180, label: "+180 Days (6m)", discount: 0 },
+                        { days: 365, label: "+1 Year (12m)", discount: 0 }
+                      ].map((pkg) => (
+                        <button
+                          key={pkg.days}
+                          type="button"
+                          onClick={() => setBillingDurationDays(pkg.days)}
+                          className={`btn btn-sm flex-col py-2.5 h-auto ${
+                            billingDurationDays === pkg.days ? 'btn-primary' : 'btn-secondary'
+                          } ${pkg.highlight && billingDurationDays !== pkg.days ? 'border-[var(--accent)] text-theme-accent' : ''}`}
+                        >
+                          <span className="font-bold text-xs">{pkg.label}</span>
+                          {pkg.discount > 0 && (
+                            <span className="text-[10px] text-theme-success font-semibold mt-0.5">
+                              10% Discount
+                            </span>
+                          )}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="np-label">Invoice Reference / Notes (Optional)</label>
+                    <input
+                      type="text"
+                      value={billingNotes}
+                      onChange={(e) => setBillingNotes(e.target.value)}
+                      placeholder="e.g. Wire transfer ref #8841 / Corporate renewal"
+                      className="np-input text-xs"
+                    />
+                  </div>
+
+                  <div className="pt-2 flex justify-end">
+                    <button
+                      type="submit"
+                      disabled={isApplyingBilling || !billingTargetOpId}
+                      className="btn btn-primary btn-sm flex items-center gap-1.5"
+                    >
+                      {isApplyingBilling ? (
+                        <span>Processing Billing...</span>
+                      ) : (
+                        <>
+                          <span>Apply Billing & Extend</span>
+                          <span>➔</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </form>
+              </div>
+
+              {/* Right Col: Automated Price & Discount Summary */}
+              <div className="np-card p-5 space-y-4 bg-elevated border-theme">
+                <h3 className="font-semibold text-sm text-theme-primary pb-2 border-b-theme">
+                  Automated Pricing Breakdown
+                </h3>
+
+                {(() => {
+                  const base = parseFloat(billingBasePrice) || 0;
+                  const days = billingDurationDays || 30;
+                  const isQuarterly = days === 90;
+                  const subtotal = days === 30 ? base : (days === 90 ? base * 3 : (days === 180 ? base * 6 : base * 12));
+                  const discountRate = isQuarterly ? 0.10 : 0.0;
+                  const discountAmt = isQuarterly ? subtotal * discountRate : 0.0;
+                  const finalTotal = subtotal - discountAmt;
+
+                  return (
+                    <div className="space-y-3 text-xs font-mono">
+                      <div className="flex justify-between py-1.5 border-b-theme text-theme-secondary">
+                        <span>Base Rate:</span>
+                        <span className="font-bold text-theme-primary">${base.toFixed(2)}/mo</span>
+                      </div>
+                      <div className="flex justify-between py-1.5 border-b-theme text-theme-secondary">
+                        <span>Selected Duration:</span>
+                        <span className="font-bold text-theme-primary">+{days} Days</span>
+                      </div>
+                      <div className="flex justify-between py-1.5 border-b-theme text-theme-secondary">
+                        <span>Standard Subtotal:</span>
+                        <span className="text-theme-primary">${subtotal.toFixed(2)}</span>
+                      </div>
+                      <div className="flex justify-between py-1.5 border-b-theme">
+                        <span className={isQuarterly ? "text-theme-success font-semibold" : "text-theme-secondary"}>
+                          Discount Applied:
+                        </span>
+                        <span className={isQuarterly ? "text-theme-success font-bold" : "text-theme-primary"}>
+                          {isQuarterly ? `-10% (-$${discountAmt.toFixed(2)})` : "$0.00"}
+                        </span>
+                      </div>
+                      {isQuarterly && (
+                        <div className="p-2 rounded bg-[var(--success-muted)] text-[11px] text-theme-success font-sans">
+                          🎉 <strong>Automated 10% Savings:</strong> 90-day quarterly package incentive applied.
+                        </div>
+                      )}
+                      <div className="flex justify-between py-2 text-sm font-bold border-t-theme pt-3">
+                        <span className="text-theme-primary">Final Amount:</span>
+                        <span className="text-theme-accent text-base">${finalTotal.toFixed(2)}</span>
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            </div>
+
+            {/* Billing Transaction History Table */}
+            <div className="np-card p-5 space-y-3">
+              <div className="flex items-center justify-between pb-2 border-b-theme">
+                <div>
+                  <h3 className="font-semibold text-sm text-theme-primary">Manual Billing Ledger & Audit History</h3>
+                  <p className="text-xs text-theme-secondary mt-0.5">
+                    Immutable log of all manual duration extensions and calculated billing transactions.
+                  </p>
+                </div>
+                <span className="badge badge-accent font-mono text-xs">{billingHistory.length} Transactions</span>
+              </div>
+
+              {billingHistory.length === 0 ? (
+                <div className="p-8 text-center">
+                  <span className="text-2xl mb-1 block">💳</span>
+                  <h4 className="font-semibold text-xs text-theme-primary">No Data Available: Zero Billing Records</h4>
+                  <p className="text-[11px] text-theme-secondary mt-0.5">Manual subscription adjustments will be logged here.</p>
+                </div>
+              ) : (
+                <div className="np-table-wrapper">
+                  <table className="np-table text-xs">
+                    <thead>
+                      <tr>
+                        <th>Date & Time</th>
+                        <th>Operator ID</th>
+                        <th>Base Rate</th>
+                        <th>Duration</th>
+                        <th>Discount</th>
+                        <th>Final Paid</th>
+                        <th>New Expiration</th>
+                        <th>Admin</th>
+                        <th>Notes</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {billingHistory.map((item) => (
+                        <tr key={item.id}>
+                          <td className="font-mono text-theme-muted">{item.created_at ? item.created_at.split(".")[0] : "—"}</td>
+                          <td className="font-mono font-semibold text-theme-primary">{item.operator_id}</td>
+                          <td className="font-mono text-theme-secondary">${parseFloat(item.base_price || 0).toFixed(2)}</td>
+                          <td className="font-mono font-bold text-theme-accent">+{item.duration_days}d</td>
+                          <td className="font-mono">
+                            {item.discount_percent > 0 ? (
+                              <span className="badge badge-success text-[10px]">{item.discount_percent}% OFF</span>
+                            ) : (
+                              <span className="text-theme-muted">None</span>
+                            )}
+                          </td>
+                          <td className="font-mono font-bold text-theme-success">${parseFloat(item.final_price || 0).toFixed(2)}</td>
+                          <td className="font-mono text-theme-primary">{item.new_expiry_date || "—"}</td>
+                          <td className="font-mono text-theme-secondary">{item.created_by || "admin"}</td>
+                          <td className="text-theme-muted truncate max-w-[150px]" title={item.notes || ""}>{item.notes || "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* TAB: GLOBAL DOMAIN BLACKLIST (SUPER ADMIN ONLY) */}
+        {user.role === "admin" && activeTab === "blacklist_mgmt" && (
+          <div className="w-full max-w-5xl mx-auto space-y-6">
+            <div className="flex items-center justify-between pb-3 border-b-theme">
+              <div>
+                <h2 className="font-semibold text-base text-theme-primary flex items-center gap-2">
+                  <span>🚫 Global Domain Blacklist & Suppression Rules</span>
+                  <span className="badge badge-purple">SUPER ADMIN</span>
+                </h2>
+                <p className="text-xs text-theme-secondary mt-0.5">
+                  Enforce wildcard exclusion patterns (e.g., *.gov, competitor domains) across all scrapers, hygiene pipelines, and outbound queues.
+                </p>
+              </div>
+            </div>
+
+            {/* Add Rule Form */}
+            <div className="np-card p-5 space-y-3">
+              <h3 className="font-semibold text-sm text-theme-primary pb-2 border-b-theme">
+                Add Global Blacklist Pattern
+              </h3>
+              <form onSubmit={handleAddBlacklistRule} className="grid grid-cols-1 sm:grid-cols-3 gap-3 items-end">
+                <div>
+                  <label className="np-label">Domain Pattern / Wildcard</label>
+                  <input
+                    type="text"
+                    value={newRulePattern}
+                    onChange={(e) => setNewRulePattern(e.target.value)}
+                    placeholder="e.g. *.gov, competitor.de, @badagency.com"
+                    className="np-input font-mono text-xs"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="np-label">Exclusion Reason</label>
+                  <input
+                    type="text"
+                    value={newRuleReason}
+                    onChange={(e) => setNewRuleReason(e.target.value)}
+                    placeholder="e.g. Government portal, direct competitor"
+                    className="np-input text-xs"
+                  />
+                </div>
+                <div>
+                  <button type="submit" className="btn btn-primary btn-sm w-full justify-center">
+                    + Add Blacklist Rule
+                  </button>
+                </div>
+              </form>
+            </div>
+
+            {/* Blacklist Rules Table */}
+            <div className="np-card p-5 space-y-3">
+              <div className="flex items-center justify-between pb-2 border-b-theme">
+                <h3 className="font-semibold text-sm text-theme-primary">Active Exclusion Rules</h3>
+                <span className="badge badge-accent font-mono text-xs">{blacklistRules.length} Rules Enforced</span>
+              </div>
+
+              {blacklistRules.length === 0 ? (
+                <div className="p-8 text-center">
+                  <span className="text-2xl mb-1 block">🛡️</span>
+                  <h4 className="font-semibold text-xs text-theme-primary">No Data Available: Zero Blacklist Rules</h4>
+                  <p className="text-[11px] text-theme-secondary mt-0.5">Add domain patterns above to automatically reject unwanted targets.</p>
+                </div>
+              ) : (
+                <div className="np-table-wrapper">
+                  <table className="np-table text-xs">
+                    <thead>
+                      <tr>
+                        <th>Domain / Wildcard Pattern</th>
+                        <th>Reason</th>
+                        <th>Created By</th>
+                        <th>Added Date</th>
+                        <th className="text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {blacklistRules.map((rule) => (
+                        <tr key={rule.id}>
+                          <td className="font-mono font-bold text-theme-accent">{rule.pattern}</td>
+                          <td className="text-theme-secondary">{rule.reason || "Excluded"}</td>
+                          <td className="font-mono text-theme-muted">{rule.created_by || "admin"}</td>
+                          <td className="font-mono text-theme-muted">{rule.created_at ? rule.created_at.split("T")[0] : "—"}</td>
+                          <td className="text-right">
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteBlacklistRule(rule.id)}
+                              className="btn btn-danger btn-sm"
+                            >
+                              Remove
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* TAB 7: LICENSE & TELEMETRY MODULE */}
-        {activeTab === "license_mgmt" && (
+        {user.role === "admin" && activeTab === "license_mgmt" && (
           <div className="w-full max-w-6xl mx-auto space-y-5">
             <div className="pb-3 border-b-theme">
               <h2 className="font-semibold text-base text-theme-primary">
@@ -2546,6 +3536,18 @@ function NexusPulseApp() {
                       </button>
                     ))}
                   </div>
+                </div>
+
+                <div>
+                  <label className="np-label">Target Domains / Seed URLs (Optional, one per line)</label>
+                  <textarea
+                    rows={2}
+                    value={huntTargetUrls}
+                    onChange={(e) => setHuntTargetUrls(e.target.value)}
+                    placeholder="https://example-contractor.de&#10;https://berlin-bau.com"
+                    className="np-textarea font-mono text-xs"
+                    disabled={isHunting}
+                  />
                 </div>
 
                 <div>
@@ -3077,8 +4079,12 @@ function NexusPulseApp() {
                     type="text"
                     value={newOpDeviceLock}
                     onChange={(e) => setNewOpDeviceLock(e.target.value)}
+                    placeholder="Leave blank to auto-bind on first login"
                     className="np-input font-mono"
                   />
+                  <span className="text-[10px] text-theme-muted mt-0.5 block">
+                    Optional: If left blank, locks automatically to the first physical device used to log in.
+                  </span>
                 </div>
 
                 <div className="grid grid-cols-3 gap-3">
@@ -3116,12 +4122,13 @@ function NexusPulseApp() {
                 <button
                   type="button"
                   onClick={() => setIsCreateOperatorOpen(false)}
+                  disabled={isCreatingOperator}
                   className="btn btn-ghost btn-sm"
                 >
                   Cancel
                 </button>
-                <button type="submit" className="btn btn-primary btn-sm">
-                  Issue License & Create
+                <button type="submit" disabled={isCreatingOperator} className="btn btn-primary btn-sm">
+                  {isCreatingOperator ? "Issuing License..." : "Issue License & Create"}
                 </button>
               </div>
             </form>
@@ -3171,12 +4178,141 @@ function NexusPulseApp() {
                 <button
                   type="button"
                   onClick={() => setSelectedUserForReset(null)}
+                  disabled={isResettingPassword}
+                  className="btn btn-ghost btn-sm"
+                >
+                  Cancel
+                </button>
+                <button type="submit" disabled={isResettingPassword} className="btn btn-primary btn-sm">
+                  {isResettingPassword ? "Encrypting with Bcrypt..." : "Reset with Bcrypt"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+      {/* MODAL: PROPOSAL TEMPLATE EDITOR */}
+      {isTemplateModalOpen && (
+        <div className="np-modal-backdrop">
+          <div className="np-modal max-w-2xl">
+            <div className="np-modal-header">
+              <div>
+                <h3 className="font-bold text-sm text-theme-primary">
+                  {editingTemplate ? "Edit Proposal Template" : "Create New Proposal Template"}
+                </h3>
+                <p className="text-xs text-theme-secondary mt-0.5">
+                  Dynamic niche-matching proposal with automated token interpolation.
+                </p>
+              </div>
+              <button
+                onClick={() => setIsTemplateModalOpen(false)}
+                className="text-theme-secondary hover:text-theme-primary font-bold"
+              >
+                ✕
+              </button>
+            </div>
+
+            <form onSubmit={handleSaveTemplate}>
+              <div className="np-modal-body space-y-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div>
+                    <label className="np-label">Template Title</label>
+                    <input
+                      type="text"
+                      value={tplTitle}
+                      onChange={(e) => setTplTitle(e.target.value)}
+                      placeholder="e.g. Commercial Tender Outreach"
+                      className="np-input font-medium"
+                      required
+                    />
+                  </div>
+                  <div>
+                    <label className="np-label">Target Niche / Industry</label>
+                    <input
+                      type="text"
+                      value={tplNiche}
+                      onChange={(e) => setTplNiche(e.target.value)}
+                      placeholder="e.g. Commercial Construction"
+                      className="np-input"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="np-label">Email Subject Line</label>
+                  <input
+                    type="text"
+                    value={tplSubject}
+                    onChange={(e) => setTplSubject(e.target.value)}
+                    placeholder="e.g. Commercial Capacity & Tenders // {{company_name}}"
+                    className="np-input font-mono text-xs"
+                    required
+                  />
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="np-label mb-0">Proposal Body Content</label>
+                    <span className="text-[11px] text-theme-muted">Click chips below to insert variables</span>
+                  </div>
+
+                  {/* Token Insertion Chips */}
+                  <div className="flex flex-wrap gap-1.5 mb-2">
+                    {[
+                      "{{company_name}}",
+                      "{{niche}}",
+                      "{{country}}",
+                      "{{city}}",
+                      "{{tech_stack}}",
+                      "{{unsubscribe_link}}"
+                    ].map((tag) => (
+                      <button
+                        key={tag}
+                        type="button"
+                        onClick={() => handleInsertTag(tag)}
+                        className="text-[11px] font-mono px-2 py-0.5 rounded bg-overlay hover:bg-hover text-theme-accent border-theme transition-colors"
+                        title={`Insert ${tag}`}
+                      >
+                        + {tag}
+                      </button>
+                    ))}
+                  </div>
+
+                  <textarea
+                    rows={8}
+                    value={tplBody}
+                    onChange={(e) => setTplBody(e.target.value)}
+                    className="np-textarea font-mono text-xs"
+                    placeholder="Write your dynamic proposal copy here..."
+                    required
+                  />
+                </div>
+
+                <div className="flex items-center gap-2 pt-2 border-t-theme">
+                  <input
+                    type="checkbox"
+                    id="tpl-default"
+                    checked={tplIsDefault}
+                    onChange={(e) => setTplIsDefault(e.target.checked)}
+                    className="cursor-pointer"
+                  />
+                  <label htmlFor="tpl-default" className="text-xs text-theme-primary cursor-pointer select-none">
+                    Set as Default Fallback Template (used when no exact niche matches)
+                  </label>
+                </div>
+              </div>
+
+              <div className="np-modal-footer">
+                <button
+                  type="button"
+                  onClick={() => setIsTemplateModalOpen(false)}
                   className="btn btn-ghost btn-sm"
                 >
                   Cancel
                 </button>
                 <button type="submit" className="btn btn-primary btn-sm">
-                  Reset with Bcrypt
+                  {editingTemplate ? "Save Changes" : "Create Template"}
                 </button>
               </div>
             </form>

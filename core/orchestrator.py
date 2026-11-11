@@ -20,6 +20,8 @@ from core.hygiene.zero_bounce_shield import get_hygiene_shield
 from database.deduplication_shield import get_dedup_shield
 from vault.vault_manager import get_vault_manager
 from core.models import Lead, HygieneStatus, EmailTier
+from core.outreach.blacklist_manager import get_blacklist_manager
+from core.outreach.reply_listener import get_reply_listener
 
 
 class NexusPulseOrchestrator:
@@ -44,6 +46,8 @@ class NexusPulseOrchestrator:
         self.hygiene = get_hygiene_shield()
         self.dedup = get_dedup_shield()
         self.vault = get_vault_manager()
+        self.blacklist = get_blacklist_manager()
+        self.reply_listener = get_reply_listener()
 
     def get_system_status(self) -> Dict[str, Any]:
         """Provides holistic telemetry on system state, security, and storage."""
@@ -70,12 +74,34 @@ class NexusPulseOrchestrator:
             "dedup_metrics": dedup_stats
         }
 
-    def process_and_preserve_lead(self, raw_lead: Lead) -> Dict[str, Any]:
+    def process_and_preserve_lead(self, raw_lead: Lead, operator_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Takes a raw scraped Lead, applies Deduplication Shield,
-        runs Zero-Bounce Hygiene Shield, and archives to Category Vault.
+        Takes a raw scraped Lead, applies Blacklist and Suppression checks,
+        applies Deduplication Shield, runs Zero-Bounce Hygiene Shield,
+        and archives to Category Vault with tenant operator_id.
         """
-        # 1. Deduplication Shield Check
+        # 1. Global Blacklist Check
+        is_bl, bl_reason = self.blacklist.is_domain_blacklisted(raw_lead.domain)
+        if is_bl:
+            return {
+                "success": False,
+                "reason": "BLACKLIST_BLOCKED",
+                "details": bl_reason,
+                "lead_domain": raw_lead.domain,
+                "primary_email": raw_lead.primary_email
+            }
+
+        # 2. Suppression & DNC Opt-Out Check
+        if self.reply_listener.is_suppressed(raw_lead.primary_email) or self.reply_listener.is_suppressed(raw_lead.domain):
+            return {
+                "success": False,
+                "reason": "SUPPRESSION_BLOCKED",
+                "details": "Lead domain or email is in Global Suppression List",
+                "lead_domain": raw_lead.domain,
+                "primary_email": raw_lead.primary_email
+            }
+
+        # 3. Deduplication Shield Check
         is_dup, dup_reason = self.dedup.is_entity_duplicate(
             domain=raw_lead.domain,
             email=raw_lead.primary_email,
@@ -91,7 +117,7 @@ class NexusPulseOrchestrator:
                 "primary_email": raw_lead.primary_email
             }
 
-        # 2. Zero-Bounce 3-Stage Hygiene Shield
+        # 4. Zero-Bounce 3-Stage Hygiene Shield
         hygiene_report = self.hygiene.validate_lead_email(raw_lead.primary_email)
         raw_lead.hygiene_report = hygiene_report
 
@@ -117,11 +143,11 @@ class NexusPulseOrchestrator:
                     "lead_domain": raw_lead.domain
                 }
 
-        # 3. Register in Deduplication Shield
+        # 5. Register in Deduplication Shield
         self.dedup.register_lead(raw_lead, status="VERIFIED")
 
-        # 4. Store in Category Vault & Synchronize Partitions (JSON, CSV, Excel)
-        store_res = self.vault.store_lead(raw_lead)
+        # 6. Store in Category Vault & Synchronize Partitions (JSON, CSV, Excel)
+        store_res = self.vault.store_lead(raw_lead, operator_id=operator_id)
 
         return {
             "success": True,
@@ -136,7 +162,8 @@ class NexusPulseOrchestrator:
             "partition_dir": store_res["partition_dir"],
             "json_path": store_res["json_path"],
             "csv_path": store_res["csv_path"],
-            "xlsx_path": store_res["xlsx_path"]
+            "xlsx_path": store_res["xlsx_path"],
+            "operator_id": operator_id
         }
 
     def execute_targeted_pipeline(
@@ -144,10 +171,12 @@ class NexusPulseOrchestrator:
         country: Optional[str] = None,
         city: Optional[str] = None,
         niche: Optional[str] = None,
-        sample_targets: Optional[List[Dict[str, str]]] = None
+        sample_targets: Optional[List[Dict[str, str]]] = None,
+        operator_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Executes a targeted search and processing run using localized queries.
+        Preserves tenant data isolation via operator_id.
         """
         c_country = country or self.config.target_country
         c_city = city or self.config.target_city
@@ -159,7 +188,7 @@ class NexusPulseOrchestrator:
         processed_leads: List[Dict[str, Any]] = []
         rejected_leads: List[Dict[str, Any]] = []
 
-        # If sample target HTML/domains provided, process them
+        # If target HTML/domains provided, process them
         if sample_targets:
             for item in sample_targets:
                 if "html" in item:
@@ -174,14 +203,14 @@ class NexusPulseOrchestrator:
                     lead = None
 
                 if lead:
-                    result = self.process_and_preserve_lead(lead)
+                    result = self.process_and_preserve_lead(lead, operator_id=operator_id)
                     if result["success"]:
                         processed_leads.append(result)
                     else:
                         rejected_leads.append(result)
 
         # Trigger consolidated multi-format backup export
-        backup_res = self.vault.export_global_snapshot_backups()
+        backup_res = self.vault.export_global_snapshot_backups(operator_id=operator_id)
 
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -191,5 +220,6 @@ class NexusPulseOrchestrator:
             "leads_rejected_count": len(rejected_leads),
             "processed_leads": processed_leads,
             "rejected_leads": rejected_leads,
-            "backup_exports": backup_res
+            "backup_exports": backup_res,
+            "operator_id": operator_id
         }

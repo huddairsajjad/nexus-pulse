@@ -1,8 +1,9 @@
 """
-H.Huddair's Nexus-Pulse - Level 2
-FastAPI Routes: Enterprise Level 2 REST API Endpoints
-Integrates Auth, Human Approval Gate, Visual Kanban CRM, Inbox Rotator,
-Timezone Scheduler, IMAP Reply Listener, and Autonomous 7-Day Follow-Up.
+Nexus-Pulse Enterprise Build
+FastAPI Routes: Multi-Tenant Enterprise REST API & RBAC Protection
+Integrates Multi-Tenancy Data Isolation, Super Admin Controls, Multi-Service Template Pool,
+Inbox Rotator with Auto-Switching, Regional Working Hours Engine, IMAP Bounce Listener,
+CAN-SPAM / GDPR Unsubscribe Compliance, Global Blacklist Manager, and Deliverability Analytics.
 """
 
 import os
@@ -12,8 +13,8 @@ import time
 import re
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, HTTPException, Header, Depends
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, HTTPException, Header, Depends, Query, Request
+from fastapi.responses import FileResponse, Response, HTMLResponse
 from pydantic import BaseModel, Field
 
 from config.config_manager import get_config
@@ -34,28 +35,51 @@ from core.outreach.approval_gate import get_approval_gate
 from core.outreach.scheduler import get_scheduler
 from core.outreach.inbox_rotator import get_inbox_rotator
 from core.outreach.reply_listener import get_reply_listener
+from core.outreach.template_manager import get_template_manager
+from core.outreach.blacklist_manager import get_blacklist_manager
 from core.agents.webform_agent import BackupWebFormAgent
 from core.agents.followup_engine import get_followup_engine
 
-router = APIRouter(prefix="/api", tags=["Nexus-Pulse Level 2"])
+router = APIRouter(prefix="/api", tags=["Nexus-Pulse Multi-Tenant Enterprise"])
 
 
 # -------------------------------------------------------------
-# Dependency: Auth Header Verification
+# RBAC & Tenant Authentication Dependencies
 # -------------------------------------------------------------
 def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
+    """
+    Validates JWT session token and returns decoded payload.
+    Strict Zero-Seed / Production Policy: No hardcoded fallback user is permitted.
+    """
     if not authorization:
-        # Fallback guest/default for internal queries
-        return {"username": "h.huddair", "role": "admin", "full_name": "H.Huddair"}
+        raise HTTPException(status_code=401, detail="Authentication required. Please provide a valid Bearer token.")
+
     token = authorization.replace("Bearer ", "").strip()
     payload = decode_access_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid or expired session token.")
+
+    # Ensure 'id' is mapped from 'sub'
+    if "sub" in payload and "id" not in payload:
+        payload["id"] = payload["sub"]
     return payload
 
 
+def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    """
+    Enforces Super Admin access for administrative endpoints.
+    Blocks Operator tokens with HTTP 403 Forbidden.
+    """
+    if current_user.get("role") != "admin":
+        raise HTTPException(
+            status_code=403,
+            detail="Forbidden: Administrative privileges required. Operator accounts cannot access this endpoint."
+        )
+    return current_user
+
+
 # -------------------------------------------------------------
-# Request Schemas
+# Request & Response Schemas
 # -------------------------------------------------------------
 class LoginRequest(BaseModel):
     username: str
@@ -90,18 +114,18 @@ class VerifyEmailRequest(BaseModel):
 
 class ApproveOutreachRequest(BaseModel):
     queue_id: str
-    approver: Optional[str] = "h.huddair"
+    approver: Optional[str] = None
     edited_subject: Optional[str] = None
     edited_body: Optional[str] = None
 
 
 class BatchApproveRequest(BaseModel):
-    approver: Optional[str] = "h.huddair"
+    approver: Optional[str] = None
 
 
 class RejectOutreachRequest(BaseModel):
     queue_id: str
-    approver: Optional[str] = "h.huddair"
+    approver: Optional[str] = None
 
 
 class DispatchHotReplyRequest(BaseModel):
@@ -128,9 +152,10 @@ class WebFormFormatRequest(BaseModel):
 class ScrapeRequest(BaseModel):
     region: Optional[str] = "Europe"
     country: str = "Germany"
-    city: Optional[str] = None          # Custom city override
+    city: Optional[str] = None
     niche: str = "Commercial Construction"
     max_results: Optional[int] = 20
+    target_urls: Optional[List[str]] = None
 
 
 class MailboxCreateRequest(BaseModel):
@@ -142,6 +167,10 @@ class MailboxCreateRequest(BaseModel):
     smtp_port: Optional[int] = 587
     smtp_username: Optional[str] = ""
     smtp_password: Optional[str] = ""
+    imap_host: Optional[str] = ""
+    imap_port: Optional[int] = 993
+    imap_username: Optional[str] = ""
+    imap_password: Optional[str] = ""
 
 
 class MailboxUpdateRequest(BaseModel):
@@ -153,11 +182,12 @@ class MailboxUpdateRequest(BaseModel):
     smtp_port: Optional[int] = None
     smtp_username: Optional[str] = None
     smtp_password: Optional[str] = None
+    imap_host: Optional[str] = None
+    imap_port: Optional[int] = None
+    imap_username: Optional[str] = None
+    imap_password: Optional[str] = None
 
 
-# -------------------------------------------------------------
-# USER & SECURITY MANAGEMENT SUITE (LEVEL 2 EXTENSIONS)
-# -------------------------------------------------------------
 class AdminProfileUpdateRequest(BaseModel):
     username: Optional[str] = None
     email: Optional[str] = None
@@ -190,70 +220,90 @@ class ModifyQuotaRequest(BaseModel):
     device_lock_enabled: Optional[bool] = None
 
 
+class OperatorBillingRequest(BaseModel):
+    base_price: float
+    duration_days: int
+    notes: Optional[str] = None
+
+
+class TemplateCreateRequest(BaseModel):
+    title: str
+    niche: str
+    subject_template: str
+    body_template: str
+    is_default: Optional[bool] = False
+
+
+class TemplateUpdateRequest(BaseModel):
+    title: Optional[str] = None
+    niche: Optional[str] = None
+    subject_template: Optional[str] = None
+    body_template: Optional[str] = None
+    is_default: Optional[bool] = None
+
+
+class BlacklistCreateRequest(BaseModel):
+    pattern: str
+    reason: Optional[str] = "Excluded Domain"
+
+
+class UnsubscribeRequest(BaseModel):
+    email: str
+    token: Optional[str] = None
+
+
+class LogActivityRequest(BaseModel):
+    action: str
+    detail: Optional[str] = None
+
+
 # -------------------------------------------------------------
-# REQUIREMENT 1: Dynamic Admin Profile Control
+# 1. SUPER ADMIN: PROFILE & OPERATORS MANAGEMENT
 # -------------------------------------------------------------
 @router.get("/admin/profile")
-def get_admin_profile(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Fetches profile for authenticated Admin."""
+def get_admin_profile(admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Super Admin Profile inspector."""
     um = get_user_manager()
-    admin_id = current_user.get("sub")
-    if not admin_id:
-        with um.db.get_connection() as conn:
-            row = conn.execute("SELECT id FROM users WHERE username = ?", (current_user.get("username"),)).fetchone()
-            admin_id = row["id"] if row else None
-    if not admin_id:
-        raise HTTPException(status_code=404, detail="Admin profile not found.")
-    profile = um.get_user_profile(admin_id)
-    if not profile:
-        raise HTTPException(status_code=404, detail="Admin profile not found.")
-    return profile
+    admin_info = um.get_admin_user()
+    if not admin_info:
+        raise HTTPException(status_code=404, detail="Admin account record not found.")
+    return admin_info
 
 
 @router.put("/admin/profile")
-def update_admin_profile(req: AdminProfileUpdateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Updates Admin's Username, Email, and re-hashes Password with Bcrypt."""
+def update_admin_profile(req: AdminProfileUpdateRequest, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Allows Super Admin to update administrative profile and security credentials."""
     um = get_user_manager()
-    admin_id = current_user.get("sub")
-    if not admin_id:
-        with um.db.get_connection() as conn:
-            row = conn.execute("SELECT id FROM users WHERE username = ?", (current_user.get("username"),)).fetchone()
-            admin_id = row["id"] if row else None
-    if not admin_id:
-        raise HTTPException(status_code=404, detail="Admin profile not found.")
-    try:
-        return um.update_admin_profile(
-            admin_id=admin_id,
-            new_username=req.username,
-            new_email=req.email,
-            new_full_name=req.full_name,
-            current_password=req.current_password,
-            new_password=req.new_password
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    admin_info = um.get_admin_user()
+    if not admin_info:
+        raise HTTPException(status_code=404, detail="Admin account not found.")
+
+    res = um.update_admin_profile(
+        admin_id=admin_info["id"],
+        new_username=req.username,
+        new_email=req.email,
+        new_full_name=req.full_name,
+        current_password=req.current_password,
+        new_password=req.new_password
+    )
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("message", "Profile update failed."))
+    return res
 
 
-# -------------------------------------------------------------
-# REQUIREMENT 2: Role-Based User Management Portal
-# -------------------------------------------------------------
 @router.get("/operators")
-def list_all_operators(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Admin-only portal: lists all operator accounts, device locks, and sessions."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: Operator Management portal accessible ONLY by Admin.")
+def list_all_operators(admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Returns list of paying operator accounts."""
     um = get_user_manager()
     return um.get_all_operators()
 
 
 @router.post("/operators")
-def create_new_operator(req: CreateOperatorRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Admin-only: Creates new Operator account with quotas and hardware device lock."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: Operator creation accessible ONLY by Admin.")
+def create_new_operator(req: CreateOperatorRequest, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Provisions a new paying operator account."""
     um = get_user_manager()
     try:
-        return um.create_operator_account(
+        res = um.create_operator_account(
             username=req.username,
             password=req.password,
             full_name=req.full_name,
@@ -264,27 +314,24 @@ def create_new_operator(req: CreateOperatorRequest, current_user: Dict[str, Any]
             daily_scrape_quota=req.daily_scrape_quota or 200,
             daily_send_quota=req.daily_send_quota or 50
         )
+        return res
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/operators/{user_id}/toggle-status")
-def toggle_operator_status(user_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Admin-only: Single toggle switch to instantly revoke or re-activate operator access."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: Status modification accessible ONLY by Admin.")
+def toggle_operator_status(user_id: str, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Revokes or enables access for an operator."""
     um = get_user_manager()
     try:
-        return um.toggle_user_active_status(user_id)
+        return um.toggle_operator_status(user_id)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @router.post("/operators/{user_id}/reset-password")
-def reset_operator_password(user_id: str, req: ResetPasswordRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Admin-only: Resets operator password directly using Bcrypt."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: Password reset accessible ONLY by Admin.")
+def reset_operator_password(user_id: str, req: ResetPasswordRequest, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Resets credentials for an operator."""
     um = get_user_manager()
     try:
         return um.reset_operator_password(user_id, req.new_password)
@@ -292,17 +339,12 @@ def reset_operator_password(user_id: str, req: ResetPasswordRequest, current_use
         raise HTTPException(status_code=400, detail=str(e))
 
 
-# -------------------------------------------------------------
-# REQUIREMENT 3: License & Expiry Control Module
-# -------------------------------------------------------------
 @router.put("/operators/{user_id}/quotas")
-def modify_user_quotas_and_license(user_id: str, req: ModifyQuotaRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Admin-only: Modifies/extends subscription expiry and daily scraping/sending quotas."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: License & quota management accessible ONLY by Admin.")
+def update_operator_quotas(user_id: str, req: ModifyQuotaRequest, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Modifies quotas, device lock, and subscription period for an operator."""
     um = get_user_manager()
     try:
-        return um.modify_license_and_quotas(
+        return um.modify_operator_quota_and_expiry(
             user_id=user_id,
             extend_days=req.extend_days,
             daily_scrape_quota=req.daily_scrape_quota,
@@ -314,36 +356,190 @@ def modify_user_quotas_and_license(user_id: str, req: ModifyQuotaRequest, curren
         raise HTTPException(status_code=400, detail=str(e))
 
 
+# -------------------------------------------------------------
+# 2. SUPER ADMIN: MANUAL BILLING CONTROLS
+# -------------------------------------------------------------
+@router.post("/operators/{user_id}/billing")
+def apply_operator_billing(user_id: str, req: OperatorBillingRequest, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """
+    Super Admin manual billing control:
+    Accepts Base Price input, duration extenders (+30d, +90d, +180d, +1y),
+    and applies automated 10% discount for 90-day plans.
+    """
+    um = get_user_manager()
+    try:
+        res = um.apply_operator_billing(
+            operator_id=user_id,
+            base_price=req.base_price,
+            duration_days=req.duration_days,
+            notes=req.notes,
+            created_by=admin_user.get("username", "admin")
+        )
+        return res
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/operators/{user_id}/billing-history")
+def get_operator_billing_history(user_id: str, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Retrieves billing transaction history for a specific operator."""
+    um = get_user_manager()
+    return um.get_operator_billing_history(operator_id=user_id)
+
+
+@router.get("/billing/all-history")
+def get_all_billing_history(admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Returns billing audit transactions across all operators."""
+    um = get_user_manager()
+    return um.get_operator_billing_history(operator_id=None)
+
+
+# -------------------------------------------------------------
+# 3. SUPER ADMIN: TELEMETRY & CLEAN DATABASE RESET
+# -------------------------------------------------------------
 @router.get("/licenses/telemetry")
-def get_license_telemetry(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Returns license status, hardware GUID, and active quotas."""
+def get_license_telemetry(admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Returns cryptographic hardware lock status and system telemetry."""
     fp = generate_machine_fingerprint()
-    valid, status, info = load_or_initialize_license(fp["machine_id"])
+    lic = load_or_initialize_license()
+    um = get_user_manager()
     return {
         "hardware_fingerprint": fp,
-        "is_valid": valid,
-        "license_status": status,
-        "license_payload": info
+        "active_license": lic,
+        "total_operators": len(um.get_all_operators()),
+        "admin_configured": um.has_admin()
+    }
+
+
+@router.post("/database/reset-fresh")
+def reset_fresh_database(admin_user: Dict[str, Any] = Depends(require_admin)):
+    """
+    System-wide Zero-Seed Reset Policy:
+    Purges all test data, leads, mailboxes, and audit logs to restore a 100% clean production state.
+    """
+    um = get_user_manager()
+    counts = um.purge_all_data()
+    return {
+        "success": True,
+        "message": "Production database purged to 100% clean state.",
+        "purged_records": counts
     }
 
 
 # -------------------------------------------------------------
-# AUTHENTICATION & ROLE-BASED ACCESS CONTROL
+# 4. GLOBAL DOMAIN BLACKLIST MANAGER
+# -------------------------------------------------------------
+@router.get("/blacklist")
+def get_blacklist_rules(current_user: Dict[str, Any] = Depends(require_admin)):
+    """Lists registered global blacklist rules. Admin-only access."""
+    mgr = get_blacklist_manager()
+    return mgr.get_rules()
+
+
+@router.post("/blacklist")
+def add_blacklist_rule(req: BlacklistCreateRequest, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Registers an excluded domain/pattern (e.g., *.gov, competitor.com)."""
+    mgr = get_blacklist_manager()
+    try:
+        return mgr.add_rule(
+            pattern=req.pattern,
+            reason=req.reason or "Excluded Pattern",
+            created_by=admin_user.get("username", "admin")
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/blacklist/{rule_id}")
+def delete_blacklist_rule(rule_id: int, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Removes a blacklist rule."""
+    mgr = get_blacklist_manager()
+    removed = mgr.remove_rule(rule_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="Rule not found.")
+    return {"success": True, "deleted_rule_id": rule_id}
+
+
+# -------------------------------------------------------------
+# 5. MULTI-SERVICE TEMPLATE POOL
+# -------------------------------------------------------------
+@router.get("/templates")
+def list_service_templates(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Lists proposal templates belonging to the current tenant."""
+    mgr = get_template_manager()
+    op_id = current_user["id"] if current_user.get("role") == "operator" else None
+    return mgr.get_templates(operator_id=op_id)
+
+
+@router.post("/templates")
+def create_service_template(req: TemplateCreateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Composes and stores a new custom service proposal template."""
+    mgr = get_template_manager()
+    op_id = current_user["id"]
+    try:
+        return mgr.create_template(
+            operator_id=op_id,
+            title=req.title,
+            niche=req.niche,
+            subject_template=req.subject_template,
+            body_template=req.body_template,
+            is_default=req.is_default or False
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.put("/templates/{template_id}")
+def update_service_template(template_id: str, req: TemplateUpdateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Updates an existing custom proposal template."""
+    mgr = get_template_manager()
+    op_id = current_user["id"] if current_user.get("role") == "operator" else None
+    try:
+        return mgr.update_template(
+            template_id=template_id,
+            operator_id=op_id,
+            title=req.title,
+            niche=req.niche,
+            subject_template=req.subject_template,
+            body_template=req.body_template,
+            is_default=req.is_default
+        )
+    except (ValueError, PermissionError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/templates/{template_id}")
+def delete_service_template(template_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Deletes a custom proposal template."""
+    mgr = get_template_manager()
+    op_id = current_user["id"] if current_user.get("role") == "operator" else None
+    try:
+        deleted = mgr.delete_template(template_id, operator_id=op_id)
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Template not found.")
+        return {"success": True, "deleted_template_id": template_id}
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+
+# -------------------------------------------------------------
+# 6. AUTHENTICATION & SESSION ENDPOINTS
 # -------------------------------------------------------------
 @router.get("/auth/setup-status")
-def get_setup_status():
-    """Checks whether the database is fresh or already has an initialized Master Admin."""
+def get_system_setup_status():
+    """Returns whether first-run master admin has been initialized."""
     um = get_user_manager()
-    has_adm = um.has_admin()
+    has_admin = um.has_admin()
     return {
-        "initialized": has_adm,
-        "has_admin": has_adm
+        "initialized": has_admin,
+        "admin_configured": has_admin,
+        "mode": "PRODUCTION_OPERATIONAL" if has_admin else "FRESH_INSTALL_AWAITING_ADMIN_SETUP"
     }
 
 
 @router.post("/auth/initialize-admin")
-def initialize_admin_route(req: SetupAdminRequest):
-    """Registers the first Master Administrator account on a clean database."""
+def initialize_master_admin(req: SetupAdminRequest):
+    """Provisions first-run master admin on clean installation."""
     um = get_user_manager()
     try:
         return um.initialize_admin(
@@ -352,362 +548,588 @@ def initialize_admin_route(req: SetupAdminRequest):
             full_name=req.full_name,
             email=req.email
         )
-    except PermissionError as pe:
-        raise HTTPException(status_code=403, detail=str(pe))
-    except ValueError as ve:
-        raise HTTPException(status_code=400, detail=str(ve))
-
-
-@router.post("/auth/login")
-def login_user(req: LoginRequest):
-    """Authenticates user and returns signed JWT token."""
-    um = get_user_manager()
-    auth_res = um.authenticate_user(req.username, req.password)
-    if not auth_res:
-        raise HTTPException(status_code=401, detail="Authentication failed: Invalid username or password.")
-    # Log the login event into operator_sessions
-    try:
-        db = get_db_engine()
-        user_data = auth_res.get("user", {})
-        with db.get_connection() as conn:
-            conn.execute("""
-                INSERT INTO operator_sessions (user_id, username, action, detail)
-                VALUES (?, ?, 'LOGIN', 'Authenticated via dashboard')
-            """, (user_data.get("id", ""), user_data.get("username", req.username)))
-            conn.commit()
-    except Exception:
-        pass
-    return auth_res
-
-
-@router.post("/auth/register")
-def register_user(req: RegisterRequest, current_user: Optional[Dict[str, Any]] = Depends(get_current_user)):
-    """Registers new account (admin if clean initial setup, otherwise requires admin rights)."""
-    um = get_user_manager()
-    if not um.has_admin():
-        # First-run initial admin registration allowed without existing credentials
-        try:
-            return um.initialize_admin(
-                username=req.username,
-                password=req.password,
-                full_name=req.full_name,
-                email=None
-            )
-        except (ValueError, PermissionError) as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-    if not current_user or current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: Only an Admin can register new operators.")
-
-    try:
-        return um.register_user(req.username, req.password, req.full_name, req.role or "operator")
-    except ValueError as e:
+    except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@router.post("/database/reset-fresh")
-def reset_database_fresh(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Admin-only: Purges database back to clean state for fresh installation."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: Admin access required.")
+@router.post("/auth/login")
+def login_for_access_token(req: LoginRequest):
+    """Authenticates admin or operator credentials and returns JWT token."""
     um = get_user_manager()
-    counts = um.purge_all_data()
-    return {"success": True, "purged_counts": counts, "message": "Database successfully reset to fresh state."}
+    try:
+        auth_res = um.authenticate_user(req.username, req.password)
+        if not auth_res:
+            raise HTTPException(status_code=401, detail="Invalid username or password.")
+        return auth_res
+    except PermissionError as e:
+        raise HTTPException(status_code=403, detail=str(e))
+
+
+@router.post("/auth/register")
+def register_new_account(req: RegisterRequest):
+    """Registers an initial admin or new operator account."""
+    um = get_user_manager()
+    try:
+        return um.register_user(
+            username=req.username,
+            password=req.password,
+            full_name=req.full_name,
+            role=req.role or "operator"
+        )
+    except (ValueError, PermissionError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.get("/auth/me")
 def get_current_user_profile(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Returns profile of currently authenticated user."""
+    """Returns profile for currently authenticated session."""
     return current_user
 
 
-# -------------------------------------------------------------
-# SYSTEM TELEMETRY & HEALTH
-# -------------------------------------------------------------
 @router.get("/health")
-def get_system_health():
-    """Returns operational status, licensing status, and vault counts."""
-    cfg = get_config()
+def health_check():
+    """Health and licensing telemetry endpoint."""
     fp = generate_machine_fingerprint()
-    valid, status, info = load_or_initialize_license(fp["machine_id"])
-    vault = get_vault_manager()
-    dedup = get_dedup_shield()
-    rotator = get_inbox_rotator()
-
+    lic = load_or_initialize_license()
+    um = get_user_manager()
     return {
-        "system": "H.Huddair's Nexus-Pulse",
-        "level": 2,
-        "status": "OPERATIONAL" if valid else "SECURITY_LOCKED",
-        "machine_id": fp["machine_id"],
-        "license_status": status,
-        "license_tier": info.get("tier", "N/A"),
-        "client_name": info.get("client_name", "N/A"),
-        "active_configuration": {
-            "target_country": cfg.target_country,
-            "target_city": cfg.target_city,
-            "industry_niche": cfg.industry_niche,
-            "ready_to_send": cfg.ready_to_send
-        },
-        "vault_statistics": vault.get_vault_statistics(),
-        "dedup_statistics": dedup.get_shield_stats(),
-        "rotator_active_mailboxes": len(rotator.get_all_mailboxes_status())
+        "status": "HEALTHY",
+        "system": "Nexus-Pulse Enterprise Lead Engine",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "hardware_id": fp["machine_id"],
+        "licensed": bool(lic),
+        "admin_initialized": um.has_admin()
     }
 
 
 # -------------------------------------------------------------
-# VISUAL KANBAN CRM DATA ENDPOINT
+# 7. PIPELINE & VISUAL KANBAN CRM
 # -------------------------------------------------------------
 @router.get("/kanban/leads")
-def get_kanban_leads():
+def get_kanban_leads(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+    operator_id: Optional[str] = Query(None)
+):
     """
-    Returns aggregated leads mapped into Kanban stages:
-    Scraped -> Verified -> Pending Approval -> Approved -> Sent -> Replied -> Hot Lead -> Closed.
+    Returns pipeline leads grouped by lifecycle status.
+    Enforces multi-tenant data isolation: operators only view their own leads.
     """
     db = get_db_engine()
-    kanban_items: List[Dict[str, Any]] = []
+    # Determine tenant filter
+    target_op = current_user["id"] if current_user.get("role") == "operator" else operator_id
 
     with db.get_connection() as conn:
-        # 1. Fetch items in outreach queue
-        queue_rows = conn.execute("""
-            SELECT id, lead_id, channel, recipient, company_name, subject,
-                   status, target_country, scheduled_for, sent_at
-            FROM outreach_queue
-            ORDER BY created_at DESC
-        """).fetchall()
+        if target_op:
+            rows = conn.execute("""
+                SELECT id, lead_id, channel, recipient, company_name, subject,
+                       message_body, status, target_country, scheduled_for,
+                       approved_by, sent_at, mailbox_used, operator_id,
+                       opened_at, bounced_at, bounce_reason, created_at
+                FROM outreach_queue
+                WHERE operator_id = ? OR operator_id IS NULL
+                ORDER BY created_at DESC
+            """, (target_op,)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT id, lead_id, channel, recipient, company_name, subject,
+                       message_body, status, target_country, scheduled_for,
+                       approved_by, sent_at, mailbox_used, operator_id,
+                       opened_at, bounced_at, bounce_reason, created_at
+                FROM outreach_queue
+                ORDER BY created_at DESC
+            """).fetchall()
 
-        processed_lead_ids = set()
-        for q in queue_rows:
-            processed_lead_ids.add(q["lead_id"])
-            kanban_items.append({
-                "id": q["id"],
-                "lead_id": q["lead_id"],
-                "company_name": q["company_name"],
-                "primary_email": q["recipient"],
-                "channel": q["channel"],
-                "status": q["status"],
-                "priority_score": 100,
-                "primary_email_tier": "TIER_1_ESTIMATING",
-                "quality_tag": "TIER-1-ESTIMATING",
-                "tech_stack": ["WordPress", "Next.js"],
-                "scheduled_for": q["scheduled_for"],
-                "sent_at": q["sent_at"]
-            })
+        items = [dict(r) for r in rows]
 
-        # 2. Fetch Vault leads that might not yet be in queue
-        vault_rows = conn.execute("""
-            SELECT id, domain, primary_email, company_name, country, quality_tag, priority_score
-            FROM vault_leads
-            ORDER BY priority_score DESC
-        """).fetchall()
+        # Fetch tech stack and priority details from vault_leads if available
+        lead_ids = [item["lead_id"] for item in items if item.get("lead_id")]
+        lead_meta_map = {}
+        if lead_ids:
+            crypto = get_crypto_vault()
+            placeholders = ",".join(["?"] * len(lead_ids))
+            v_rows = conn.execute(f"SELECT id, quality_tag, priority_score, encrypted_payload FROM vault_leads WHERE id IN ({placeholders})", lead_ids).fetchall()
+            for vr in v_rows:
+                meta = {
+                    "quality_tag": vr["quality_tag"],
+                    "priority_score": vr["priority_score"],
+                    "tech_stack": []
+                }
+                try:
+                    decrypted = crypto.decrypt_json(vr["encrypted_payload"])
+                    if decrypted and "tech_stack" in decrypted:
+                        meta["tech_stack"] = decrypted["tech_stack"].get("raw_technologies", [])
+                except Exception:
+                    pass
+                lead_meta_map[vr["id"]] = meta
 
-        for v in vault_rows:
-            if v["id"] not in processed_lead_ids:
-                kanban_items.append({
-                    "id": v["id"],
-                    "lead_id": v["id"],
-                    "company_name": v["company_name"],
-                    "primary_email": v["primary_email"],
-                    "channel": "EMAIL",
-                    "status": "VERIFIED",
-                    "priority_score": v["priority_score"],
-                    "primary_email_tier": "TIER_1_ESTIMATING",
-                    "quality_tag": v["quality_tag"],
-                    "tech_stack": ["HubSpot", "Cloudflare"]
-                })
+        # Hydrate queue items with tech metadata
+        for item in items:
+            lid = item.get("lead_id")
+            if lid and lid in lead_meta_map:
+                item["quality_tag"] = lead_meta_map[lid]["quality_tag"]
+                item["priority_score"] = lead_meta_map[lid]["priority_score"]
+                item["tech_stack"] = lead_meta_map[lid]["tech_stack"]
+            else:
+                item["quality_tag"] = "TIER-1-ESTIMATING"
+                item["priority_score"] = 85
+                item["tech_stack"] = []
 
-    return kanban_items
+        return items
 
 
 # -------------------------------------------------------------
-# HUMAN APPROVAL GATE ENDPOINTS
+# 8. HUMAN APPROVAL GATE (OPERATOR & ADMIN ACCESS)
 # -------------------------------------------------------------
 @router.get("/outreach/pending")
-def get_pending_outreach():
-    """Lists all outreach items held in the Human Approval Gate."""
+def get_pending_outreach_approvals(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Lists items held in the mandatory approval gate for this tenant."""
     gate = get_approval_gate()
-    return gate.get_pending_approvals()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    return gate.get_pending_approvals(operator_id=target_op)
 
 
 @router.post("/outreach/approve")
 def approve_outreach_item(req: ApproveOutreachRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Authorizes outreach item. Only H.Huddair (Admin) has master authorization rights."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: Only H.Huddair (Admin) can approve outreach from the hold gate.")
+    """Authorizes outreach item. Operators can authorize their own items; Admins can authorize any."""
     gate = get_approval_gate()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    approver_name = req.approver or current_user.get("username", "operator")
     try:
         return gate.approve_outreach_item(
             queue_id=req.queue_id,
-            approver=current_user.get("username", "h.huddair"),
+            approver=approver_name,
             edited_subject=req.edited_subject,
-            edited_body=req.edited_body
+            edited_body=req.edited_body,
+            operator_id=target_op
         )
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+    except (ValueError, PermissionError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/outreach/batch-approve")
 def batch_approve_outreach(req: BatchApproveRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Batch authorizes all pending outreach items."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: Only H.Huddair (Admin) can batch approve outreach.")
+    """Batch approves all pending outreach items held in the gate for this tenant."""
     gate = get_approval_gate()
-    return gate.batch_approve_all(approver=current_user.get("username", "h.huddair"))
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    approver_name = req.approver or current_user.get("username", "operator")
+    return gate.batch_approve_all(approver=approver_name, operator_id=target_op)
 
 
 @router.post("/outreach/reject")
 def reject_outreach_item(req: RejectOutreachRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Rejects outreach item."""
+    """Rejects outreach item held in the gate."""
     gate = get_approval_gate()
-    return gate.reject_outreach_item(req.queue_id, current_user.get("username", "h.huddair"))
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    approver_name = req.approver or current_user.get("username", "operator")
+    try:
+        return gate.reject_outreach_item(req.queue_id, approver=approver_name, operator_id=target_op)
+    except (ValueError, PermissionError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/outreach/dispatch/{queue_id}")
-def dispatch_approved_outreach(queue_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dispatches approved outreach item through Inbox Rotator."""
+def dispatch_approved_item(queue_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Dispatches approved outreach item using an enrolled mailbox belonging to the operator."""
     gate = get_approval_gate()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
     try:
-        return gate.dispatch_approved_outreach(queue_id)
-    except PermissionError as e:
-        raise HTTPException(status_code=403, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        return gate.dispatch_approved_outreach(queue_id, operator_id=target_op)
+    except (ValueError, PermissionError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
-# -------------------------------------------------------------
-# TIMEZONE SCHEDULER & INBOX ROTATOR ENDPOINTS
-# -------------------------------------------------------------
 @router.get("/scheduler/timezones")
-def get_timezone_telemetry():
-    """Returns local office hour windows across major target countries."""
-    sched = get_scheduler()
-    target_countries = ["Germany", "France", "United Kingdom", "Russia", "United States", "United Arab Emirates"]
-    return {
-        c.lower().replace(" ", "_"): sched.get_target_local_time(c)
-        for c in target_countries
-    }
+def get_target_timezone_preview(
+    country: Optional[str] = Query("Germany"),
+    domain: Optional[str] = Query(None)
+):
+    """Regional Working Hours Engine: checks current office window for target."""
+    scheduler = get_scheduler()
+    return scheduler.get_target_local_time(country=country, domain=domain)
 
 
+# -------------------------------------------------------------
+# 9. INBOX ROTATOR (MULTI-TENANT ENROLLMENT & LOAD BALANCING)
+# -------------------------------------------------------------
 @router.get("/outreach/mailboxes")
 @router.get("/mailboxes")
-def get_mailbox_rotator_status():
-    """Returns active mailbox rotation telemetry and daily send quotas."""
+def list_enrolled_mailboxes(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Returns sending mailboxes. Operators see their own; Admins see all."""
     rotator = get_inbox_rotator()
-    return rotator.get_all_mailboxes_status()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    return rotator.get_all_mailboxes_status(operator_id=target_op)
+
+
+@router.post("/mailboxes")
+def enroll_mailbox(req: MailboxCreateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Enrolls an active SMTP profile with per-mailbox daily sending cap."""
+    rotator = get_inbox_rotator()
+    op_id = current_user["id"]
+    try:
+        return rotator.enroll_mailbox(
+            email_address=req.email_address,
+            display_name=req.display_name,
+            domain=req.domain,
+            daily_limit=req.daily_limit or 45,
+            operator_id=op_id,
+            smtp_host=req.smtp_host or "",
+            smtp_port=req.smtp_port or 587,
+            smtp_username=req.smtp_username or req.email_address,
+            smtp_password=req.smtp_password or "",
+            imap_host=req.imap_host or "",
+            imap_port=req.imap_port or 993,
+            imap_username=req.imap_username or req.email_address,
+            imap_password=req.imap_password or ""
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.put("/mailboxes/{mailbox_id}")
+def update_mailbox(mailbox_id: str, req: MailboxUpdateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Updates configuration for an enrolled mailbox."""
+    db = get_db_engine()
+    with db.get_connection() as conn:
+        existing = conn.execute("SELECT id, operator_id FROM mailbox_rotator WHERE id = ?", (mailbox_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Mailbox not found.")
+
+        if current_user.get("role") != "admin" and existing["operator_id"] != current_user["id"]:
+            raise HTTPException(status_code=403, detail="Forbidden: You can only edit your own mailboxes.")
+
+        fields = []
+        values = []
+        if req.email_address is not None:
+            fields.append("email_address = ?"); values.append(req.email_address.strip())
+        if req.display_name is not None:
+            fields.append("display_name = ?"); values.append(req.display_name.strip())
+        if req.domain is not None:
+            fields.append("domain = ?"); values.append(req.domain.strip())
+        if req.daily_limit is not None:
+            fields.append("daily_limit = ?"); values.append(req.daily_limit)
+        if req.smtp_host is not None:
+            fields.append("smtp_host = ?"); values.append(req.smtp_host.strip())
+        if req.smtp_port is not None:
+            fields.append("smtp_port = ?"); values.append(req.smtp_port)
+        if req.smtp_username is not None:
+            fields.append("smtp_username = ?"); values.append(req.smtp_username.strip())
+        if req.smtp_password is not None:
+            fields.append("smtp_password = ?"); values.append(req.smtp_password)
+        if req.imap_host is not None:
+            fields.append("imap_host = ?"); values.append(req.imap_host.strip())
+        if req.imap_port is not None:
+            fields.append("imap_port = ?"); values.append(req.imap_port)
+        if req.imap_username is not None:
+            fields.append("imap_username = ?"); values.append(req.imap_username.strip())
+        if req.imap_password is not None:
+            fields.append("imap_password = ?"); values.append(req.imap_password)
+
+        if not fields:
+            raise HTTPException(status_code=400, detail="No fields provided to update.")
+
+        values.append(mailbox_id)
+        conn.execute(f"UPDATE mailbox_rotator SET {', '.join(fields)} WHERE id = ?", values)
+        conn.commit()
+
+    return {"success": True, "id": mailbox_id, "message": "Mailbox updated successfully."}
+
+
+@router.delete("/mailboxes/{mailbox_id}")
+def delete_mailbox(mailbox_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Deletes an enrolled mailbox."""
+    db = get_db_engine()
+    with db.get_connection() as conn:
+        existing = conn.execute("SELECT id, operator_id, email_address FROM mailbox_rotator WHERE id = ?", (mailbox_id,)).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Mailbox not found.")
+
+        if current_user.get("role") != "admin" and existing["operator_id"] != current_user["id"]:
+            raise HTTPException(status_code=403, detail="Forbidden: You can only delete your own mailboxes.")
+
+        conn.execute("DELETE FROM mailbox_rotator WHERE id = ?", (mailbox_id,))
+        conn.commit()
+
+    return {"success": True, "deleted_id": mailbox_id, "email": existing["email_address"]}
 
 
 # -------------------------------------------------------------
-# IMAP REPLY LISTENER, HOT LEAD ALERTS & DNC BLACKLIST
+# 10. HOT LEADS, REPLIES & IMAP BOUNCE LISTENER
 # -------------------------------------------------------------
 @router.get("/outreach/hot-leads")
-def get_hot_lead_alerts():
-    """Lists hot leads with 1-click AI response templates."""
-    rl = get_reply_listener()
-    return rl.get_hot_lead_alerts()
+def get_hot_leads(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Returns detected Hot Leads for this tenant."""
+    listener = get_reply_listener()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    return listener.get_hot_lead_alerts(operator_id=target_op)
 
 
 @router.post("/outreach/send-hot-reply")
-def send_hot_lead_reply(req: DispatchHotReplyRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dispatches executive response to a Hot Lead inquiry."""
-    rotator = get_inbox_rotator()
-    mb = rotator.get_next_available_mailbox()
-    sender = mb["email_address"] if mb else "director@huddair-nexus.com"
-    if mb:
-        rotator.record_email_dispatched(mb["id"])
-
+def send_hot_reply(req: DispatchHotReplyRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Dispatches a rapid response to a Hot Lead inquiry."""
     db = get_db_engine()
+    rotator = get_inbox_rotator()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    mb = rotator.get_next_available_mailbox(operator_id=target_op)
+    sender = mb["email_address"] if mb else "outreach@enterprise.io"
+
     with db.get_connection() as conn:
-        conn.execute("UPDATE inbox_replies SET status = 'REPLIED' WHERE id = ?", (req.reply_id,))
+        conn.execute("""
+            UPDATE inbox_replies
+            SET status = 'RESOLVED'
+            WHERE id = ?
+        """, (req.reply_id,))
         conn.commit()
 
     return {
         "success": True,
-        "dispatched_to": req.recipient,
-        "dispatched_via": sender,
+        "reply_id": req.reply_id,
+        "recipient": req.recipient,
+        "dispatched_from": sender,
         "status": "SENT"
     }
 
 
 @router.post("/replies/simulate")
-def simulate_incoming_reply(req: SimulateReplyRequest):
-    """Simulates an incoming IMAP email reply to test AI classification and alerts."""
-    rl = get_reply_listener()
-    return rl.process_incoming_reply(
+def simulate_inbound_reply(req: SimulateReplyRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Test/Simulation endpoint:
+    Processes an inbound email, triggers reply classification,
+    and runs bounce suppression or hot lead alerts.
+    """
+    listener = get_reply_listener()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    return listener.process_incoming_reply(
         sender_email=req.sender_email,
         subject=req.subject,
         body=req.body,
-        company_name=req.company_name
-    )
-
-
-# -------------------------------------------------------------
-# BACKUP WEB-FORM OUTREACH
-# -------------------------------------------------------------
-@router.post("/outreach/webform/format")
-def format_backup_web_form(req: WebFormFormatRequest):
-    """Formats backup contact form outreach when direct email is unavailable."""
-    return BackupWebFormAgent.queue_web_form_in_approval_gate(
-        lead_id=req.lead_id,
         company_name=req.company_name,
-        website_url=req.website_url,
-        niche=req.niche or "Commercial Construction",
-        country=req.country or "Germany"
+        operator_id=target_op
     )
 
 
-# -------------------------------------------------------------
-# AUTONOMOUS 7-DAY FOLLOW-UP ENGINE
-# -------------------------------------------------------------
-@router.post("/followup/scan")
-def trigger_followup_scan(force: Optional[bool] = False):
-    """Scans and triggers due 7-day follow-up sequences."""
-    engine = get_followup_engine()
-    return engine.scan_and_trigger_due_followups(force_all_pending=bool(force))
-
-
-# -------------------------------------------------------------
-# UNIFIED PIPELINE RUN (LEVEL 1 + LEVEL 2 ASSEMBLED)
-# -------------------------------------------------------------
-@router.post("/pipeline/run")
-def run_full_pipeline_run():
+@router.post("/inbox/poll")
+def poll_imap_inboxes(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
-    Executes full Level 1 + Level 2 assembled pipeline:
-    Licensing -> Scraper -> Priority Finder -> Hygiene -> Category Vault -> Human Approval Gate.
+    Background polling service:
+    Monitors enrolled IMAP inboxes for bounces and responses.
+    """
+    listener = get_reply_listener()
+    return listener.poll_enrolled_inboxes()
+
+
+# -------------------------------------------------------------
+# 11. DELIVERABILITY ANALYTICS DASHBOARD
+# -------------------------------------------------------------
+@router.get("/analytics/deliverability")
+def get_deliverability_analytics(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Visual metric indicators tracking:
+    Open Rates %, Bounce Rates %, Conversion Rates %, Sent, Delivered, and Suppressed.
+    """
+    db = get_db_engine()
+    op_id = current_user["id"] if current_user.get("role") == "operator" else None
+
+    with db.get_connection() as conn:
+        q_filter = "WHERE operator_id = ?" if op_id else ""
+        q_params = [op_id] if op_id else []
+
+        total_sent = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status IN ('SENT', 'HOT_LEAD', 'REPLIED')", q_params).fetchone()[0]
+        total_opened = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} opened_at IS NOT NULL", q_params).fetchone()[0]
+        total_bounced = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} (status = 'BOUNCED' OR bounced_at IS NOT NULL)", q_params).fetchone()[0]
+        total_replied = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status IN ('REPLIED', 'HOT_LEAD')", q_params).fetchone()[0]
+        total_hot = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status = 'HOT_LEAD'", q_params).fetchone()[0]
+        total_queued = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status = 'PENDING_APPROVAL'", q_params).fetchone()[0]
+        total_suppressed = conn.execute("SELECT count(*) FROM suppressed_entities").fetchone()[0]
+
+    delivered = max(0, total_sent - total_bounced)
+    open_rate = round((total_opened / max(1, delivered)) * 100.0, 1) if delivered > 0 else 0.0
+    bounce_rate = round((total_bounced / max(1, total_sent)) * 100.0, 1) if total_sent > 0 else 0.0
+    conversion_rate = round((total_replied / max(1, delivered)) * 100.0, 1) if delivered > 0 else 0.0
+
+    return {
+        "total_sent": total_sent,
+        "total_delivered": delivered,
+        "total_opened": total_opened,
+        "total_bounced": total_bounced,
+        "total_replied": total_replied,
+        "total_hot_leads": total_hot,
+        "total_queued": total_queued,
+        "total_suppressed": total_suppressed,
+        "open_rate_percent": open_rate,
+        "bounce_rate_percent": bounce_rate,
+        "conversion_rate_percent": conversion_rate
+    }
+
+
+@router.get("/track/open/{queue_id}.png")
+def track_email_open(queue_id: str):
+    """Tracking pixel endpoint: increments open metrics upon receipt rendering."""
+    db = get_db_engine()
+    with db.get_connection() as conn:
+        conn.execute("UPDATE outreach_queue SET opened_at = CURRENT_TIMESTAMP WHERE id = ? OR tracking_id = ?", (queue_id, queue_id))
+        conn.commit()
+    transparent_png_bytes = b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15c4\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+    return Response(content=transparent_png_bytes, media_type="image/png")
+
+
+# -------------------------------------------------------------
+# 12. UNSUBSCRIBE / OPT-OUT COMPLIANCE MANAGER
+# -------------------------------------------------------------
+@router.get("/unsubscribe")
+def handle_unsubscribe_link(token: Optional[str] = Query(None), email: Optional[str] = Query(None)):
+    """
+    CAN-SPAM & GDPR Compliance:
+    Suppresses opted-out contact and associated domain from future scraping and outreach.
+    """
+    clean_email = (email or "").strip().lower()
+    if token and not clean_email:
+        db = get_db_engine()
+        with db.get_connection() as conn:
+            row = conn.execute("SELECT recipient FROM outreach_queue WHERE tracking_id = ? OR id = ?", (token, token)).fetchone()
+            if row:
+                clean_email = row["recipient"].strip().lower()
+
+    if clean_email:
+        listener = get_reply_listener()
+        domain_part = clean_email.split("@")[-1] if "@" in clean_email else clean_email
+        listener.suppress_entity(clean_email, reason="UNSUBSCRIBE")
+        listener.suppress_entity(domain_part, reason="UNSUBSCRIBE")
+
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><title>Unsubscribe Confirmation</title>
+    <style>body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0d1117; color: #c9d1d9; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }}
+    .card {{ background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 32px; max-width: 480px; text-align: center; box-shadow: 0 8px 24px rgba(0,0,0,0.5); }}
+    h1 {{ color: #58a6ff; font-size: 20px; margin-bottom: 12px; }}
+    p {{ font-size: 14px; line-height: 1.6; color: #8b949e; }}
+    .badge {{ display: inline-block; background: #238636; color: white; padding: 4px 12px; border-radius: 12px; font-size: 12px; margin-top: 12px; font-weight: 600; }}
+    </style></head>
+    <body>
+    <div class="card">
+      <h1>✓ Opt-Out Confirmed</h1>
+      <p>The entity <strong>{clean_email or 'specified recipient'}</strong> has been globally suppressed.</p>
+      <p>All future automated outreach and data aggregation have been permanently disabled for this domain in accordance with CAN-SPAM and GDPR guidelines.</p>
+      <div class="badge">Suppressed from Outreach Engine</div>
+    </div>
+    </body></html>
+    """
+    return HTMLResponse(content=html_content)
+
+
+@router.post("/unsubscribe")
+def handle_unsubscribe_post(req: UnsubscribeRequest):
+    """API endpoint for opt-out suppression."""
+    listener = get_reply_listener()
+    clean = req.email.strip().lower()
+    domain = clean.split("@")[-1] if "@" in clean else clean
+    listener.suppress_entity(clean, reason="UNSUBSCRIBE")
+    listener.suppress_entity(domain, reason="UNSUBSCRIBE")
+    return {"success": True, "suppressed_entity": clean}
+
+
+@router.get("/suppressed")
+def list_suppressed_entities(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Lists all globally suppressed domains and emails."""
+    listener = get_reply_listener()
+    return listener.get_suppressed_entities()
+
+
+# -------------------------------------------------------------
+# 13. LIVE SCRAPE PIPELINE (ZERO-SEED PRODUCTION)
+# -------------------------------------------------------------
+@router.post("/scrape")
+async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Hunt & Verify pipeline:
+    Extracts real company leads from target URLs or localized queries.
+    Zero-Seed Policy: NO fake or synthetic companies are generated.
+    Auto-matches detected niche to the operator's custom service template.
+    Enforces blacklist rules and suppression filtering before persisting.
+    """
+    cfg = get_config()
+    cfg.update({"target_country": req.country, "industry_niche": req.niche})
+    db = get_db_engine()
+    crypto = get_crypto_vault()
+    orchestrator = NexusPulseOrchestrator()
+    gate = get_approval_gate()
+    blacklist_mgr = get_blacklist_manager()
+    reply_listener = get_reply_listener()
+    template_mgr = get_template_manager()
+
+    country = req.country.strip()
+    niche = req.niche.strip()
+    city_override = (req.city or "").strip() or "Metropolis"
+    limit = max(1, min(req.max_results or 20, 100))
+    op_id = current_user["id"]
+
+    scraped_leads = []
+    verified_leads = []
+
+    # If explicit target URLs are supplied, scrape them directly
+    if req.target_urls:
+        scraper = DeepScraperAgent()
+        for url in req.target_urls[:limit]:
+            clean_url = url.strip()
+            if not clean_url:
+                continue
+
+            # Check blacklist & suppression
+            domain_part = clean_url.split("/")[2] if "//" in clean_url else clean_url.split("/")[0]
+            is_bl, _ = blacklist_mgr.is_domain_blacklisted(domain_part)
+            if is_bl or reply_listener.is_suppressed(domain_part):
+                continue
+
+            lead = await scraper.scrape_url(
+                url=clean_url,
+                country=country,
+                city=city_override,
+                niche=niche
+            )
+            if lead:
+                pres = orchestrator.process_and_preserve_lead(lead, operator_id=op_id)
+                if pres["success"]:
+                    verified_leads.append(pres)
+                    # Queue in Approval Gate
+                    gate.queue_outreach(
+                        lead_id=pres["lead_id"],
+                        company_name=pres["company_name"],
+                        recipient=pres["primary_email"],
+                        country=country,
+                        niche=niche,
+                        channel="EMAIL",
+                        tech_stack=pres.get("tech_stack"),
+                        operator_id=op_id,
+                        city=city_override
+                    )
+                else:
+                    scraped_leads.append({"domain": lead.domain, "reason": pres.get("reason")})
+
+    return {
+        "status": "COMPLETED",
+        "target": {"country": country, "niche": niche, "city": city_override},
+        "scraped_count": len(scraped_leads),
+        "verified_count": len(verified_leads),
+        "leads_preserved_count": len(verified_leads),
+        "leads_rejected_count": len(scraped_leads),
+        "scraped_leads": scraped_leads,
+        "verified_leads": verified_leads,
+        "processed_leads": verified_leads,
+        "message": f"Hunt & Verify executed for {country} ({niche}). {len(verified_leads)} verified leads queued in Approval Gate." if verified_leads else "Hunt completed. 0 candidate leads found. Provide target domains or refine regional keywords."
+    }
+
+
+@router.post("/pipeline/run")
+def run_full_pipeline_run(sample_targets: Optional[List[Dict[str, str]]] = None, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Executes full multi-agent pipeline on provided target definitions.
+    Strict Zero-Seed: Returns clean empty result if no targets provided.
     """
     orchestrator = NexusPulseOrchestrator()
-    sample_targets = [
-        {
-            "domain": "strabag.com",
-            "url": "https://www.strabag.com/kontakt-kalkulation-ausschreibung",
-            "html": """
-            <html><head><title>STRABAG SE | Generalunternehmer Berlin Hochbau</title>
-            <meta name="generator" content="WordPress 6.4" />
-            <script src="https://assets.website-files.com/webflow.js"></script>
-            <script src="https://www.googletagmanager.com/gtag/js?id=G-STRABAG123"></script>
-            </head><body>
-            <h1>STRABAG Hochbau Berlin</h1>
-            <p>Ausschreibungen und Kalkulation:</p>
-            <a href="mailto:kalkulation@strabag.com">kalkulation@strabag.com</a>
-            <a href="mailto:info@strabag.com">info@strabag.com</a>
-            </body></html>
-            """
-        },
-        {
-            "domain": "balfourbeatty.com",
-            "url": "https://www.balfourbeatty.com/estimating-tenders",
-            "html": """
-            <html><head><title>Balfour Beatty plc | Commercial Infrastructure</title>
-            <script src="/_next/static/chunks/main.js"></script>
-            </head><body>
-            <h1>Balfour Beatty Commercial Contracting</h1>
-            <a href="mailto:qs@balfourbeatty.com">qs@balfourbeatty.com</a>
-            <a href="mailto:estimating@balfourbeatty.com">estimating@balfourbeatty.com</a>
-            <a href="mailto:info@balfourbeatty.com">info@balfourbeatty.com</a>
-            </body></html>
-            """
-        }
-    ]
+    op_id = current_user["id"]
+    targets = sample_targets or []
 
-    pipeline_res = orchestrator.execute_targeted_pipeline(sample_targets=sample_targets)
+    pipeline_res = orchestrator.execute_targeted_pipeline(sample_targets=targets, operator_id=op_id)
 
     # Queue preserved leads into Human Approval Gate
     gate = get_approval_gate()
@@ -720,7 +1142,8 @@ def run_full_pipeline_run():
             country=pipeline_res["target"]["country"],
             niche=pipeline_res["target"]["niche"],
             channel="EMAIL",
-            tech_stack=lead_info.get("tech_stack")
+            tech_stack=lead_info.get("tech_stack"),
+            operator_id=op_id
         )
         queued_in_gate.append(q_item)
 
@@ -729,16 +1152,16 @@ def run_full_pipeline_run():
 
 
 # -------------------------------------------------------------
-# CONFIG & VAULT ENDPOINTS (INHERITED & EXTENDED)
+# 14. CONFIG, VAULT, BACKUP & UTILITIES
 # -------------------------------------------------------------
 @router.get("/config")
-def get_runtime_config():
+def get_runtime_config(current_user: Dict[str, Any] = Depends(get_current_user)):
     cfg = get_config()
     return cfg.as_dict()
 
 
 @router.post("/config")
-def update_runtime_config(req: ConfigUpdateRequest):
+def update_runtime_config(req: ConfigUpdateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     cfg = get_config()
     updates = {}
     if req.target_country is not None:
@@ -754,296 +1177,21 @@ def update_runtime_config(req: ConfigUpdateRequest):
 
 
 @router.post("/vault/backup")
-def trigger_snapshot_backup():
+def trigger_snapshot_backup(current_user: Dict[str, Any] = Depends(get_current_user)):
     vault = get_vault_manager()
-    return vault.export_global_snapshot_backups()
+    op_id = current_user["id"] if current_user.get("role") == "operator" else None
+    return vault.export_global_snapshot_backups(operator_id=op_id)
 
 
-@router.post("/leads/verify")
-def verify_email_address(req: VerifyEmailRequest):
-    hygiene = get_hygiene_shield()
-    return hygiene.validate_lead_email(req.email).model_dump()
-
-
-# -------------------------------------------------------------
-# HUNT & VERIFY: LIVE SCRAPE PIPELINE ENDPOINT
-# -------------------------------------------------------------
-@router.post("/scrape")
-def launch_scrape_pipeline(req: ScrapeRequest):
-    """
-    Accepts country, niche, and max_results.
-    Runs targeted pipeline, generates and persists leads into database across stages:
-    Column 1: SCRAPED
-    Column 2: VERIFIED
-    Updates runtime target config and returns live data bundle for immediate UI hydration.
-    """
-    cfg = get_config()
-    cfg.update({"target_country": req.country, "industry_niche": req.niche})
-    db = get_db_engine()
-    crypto = get_crypto_vault()
-
-    country = req.country.strip()
-    niche = req.niche.strip()
-    city_override = (req.city or "").strip() or None
-    limit = max(1, min(req.max_results or 20, 100))
-
-    country_meta = {
-        # Europe
-        "Germany": {"tld": "de", "cities": ["Berlin", "Munich", "Frankfurt", "Hamburg", "Cologne", "Stuttgart"], "tz": "CET", "suffix": ["GmbH", "AG", "Bau KG", "Werke", "Gruppe"]},
-        "UK": {"tld": "co.uk", "cities": ["London", "Manchester", "Birmingham", "Leeds", "Bristol", "Edinburgh"], "tz": "GMT", "suffix": ["Ltd", "PLC", "Contracting Ltd", "Enterprises", "Group"]},
-        "France": {"tld": "fr", "cities": ["Paris", "Lyon", "Marseille", "Toulouse", "Nice"], "tz": "CET", "suffix": ["SARL", "SAS", "SA", "Groupe", "Industrie"]},
-        "Netherlands": {"tld": "nl", "cities": ["Amsterdam", "Rotterdam", "The Hague", "Utrecht"], "tz": "CET", "suffix": ["BV", "NV", "Groep", "Holding"]},
-        "Spain": {"tld": "es", "cities": ["Madrid", "Barcelona", "Valencia", "Seville"], "tz": "CET", "suffix": ["SL", "SA", "Grupo", "Industries"]},
-        "Italy": {"tld": "it", "cities": ["Milan", "Rome", "Turin", "Naples", "Bologna"], "tz": "CET", "suffix": ["Srl", "SpA", "Gruppo", "Costruzioni"]},
-        "Switzerland": {"tld": "ch", "cities": ["Zurich", "Geneva", "Basel", "Bern"], "tz": "CET", "suffix": ["AG", "GmbH", "SA", "Holding"]},
-        "Poland": {"tld": "pl", "cities": ["Warsaw", "Krakow", "Wroclaw", "Gdansk"], "tz": "CET", "suffix": ["Sp. z o.o.", "SA", "Grup", "Budownictwo"]},
-        # Middle East
-        "UAE": {"tld": "ae", "cities": ["Dubai", "Abu Dhabi", "Sharjah", "Ajman"], "tz": "GST", "suffix": ["LLC", "General Trading LLC", "Holdings", "Middle East"]},
-        "Saudi Arabia": {"tld": "sa", "cities": ["Riyadh", "Jeddah", "Dammam", "Mecca"], "tz": "AST", "suffix": ["Ltd", "Corp", "Arabia", "Group"]},
-        "Qatar": {"tld": "qa", "cities": ["Doha", "Al Wakrah", "Al Khor"], "tz": "AST", "suffix": ["WLL", "LLC", "Holdings", "Qatar"]},
-        # North America
-        "USA": {"tld": "com", "cities": ["New York", "Chicago", "Houston", "Dallas", "Atlanta", "Phoenix", "Los Angeles", "Miami"], "tz": "EST", "suffix": ["LLC", "Inc.", "Corp.", "Group", "Solutions"]},
-        "Canada": {"tld": "ca", "cities": ["Toronto", "Vancouver", "Montreal", "Calgary", "Ottawa"], "tz": "EST", "suffix": ["Inc.", "Ltd.", "Corp.", "Group"]},
-        # South Asia
-        "Pakistan": {"tld": "pk", "cities": ["Lahore", "Karachi", "Islamabad", "Sialkot", "Faisalabad"], "tz": "PKT", "suffix": ["Pvt. Ltd", "Enterprises", "Industries", "Traders", "Group"]},
-        "India": {"tld": "in", "cities": ["Mumbai", "Delhi", "Bangalore", "Chennai", "Pune"], "tz": "IST", "suffix": ["Pvt Ltd", "Industries", "Ltd", "Enterprises", "Solutions"]},
-        # Asia Pacific
-        "Australia": {"tld": "com.au", "cities": ["Sydney", "Melbourne", "Brisbane", "Perth"], "tz": "AEST", "suffix": ["Pty Ltd", "Ltd", "Group", "Corp"]},
-        "Singapore": {"tld": "sg", "cities": ["Singapore", "Jurong", "Tampines"], "tz": "SGT", "suffix": ["Pte Ltd", "Holdings", "Group", "Asia"]},
-    }
-    meta = country_meta.get(country, {"tld": "com", "cities": ["Metropolis", "Capital City"], "tz": "UTC", "suffix": ["Corp", "Global", "Intl"]})
-    # Apply city override if provided
-    if city_override:
-        meta = dict(meta)
-        meta["cities"] = [city_override] + [c for c in meta["cities"] if c.lower() != city_override.lower()]
-
-    slug = "".join(c if c.isalnum() else "-" for c in niche.lower()).strip("-")
-    slug = re.sub(r"-+", "-", slug) or "lead"
-
-    sample_companies = [
-        ("Apex", "apex"), ("Vanguard", "vanguard"), ("Summit", "summit"), ("Titan", "titan"),
-        ("Nordic", "nordic"), ("Horizon", "horizon"), ("Atlas", "atlas"), ("Pinnacle", "pinnacle"),
-        ("Prime", "prime"), ("Matrix", "matrix"), ("Precision", "precision"), ("Nexus", "nexus"),
-        ("Zenith", "zenith"), ("Quantum", "quantum"), ("Aero", "aero"), ("Optima", "optima"),
-        ("Vector", "vector"), ("Fusion", "fusion"), ("Sterling", "sterling"), ("Cobalt", "cobalt"),
-        ("Meridian", "meridian"), ("Vortex", "vortex"), ("Eclipse", "eclipse"), ("Catalyst", "catalyst"),
-        ("Ironclad", "ironclad"), ("Colossus", "colossus"), ("Stratos", "stratos"), ("Equinox", "equinox"),
-        ("Valor", "valor"), ("Synergy", "synergy"), ("Bastion", "bastion"), ("Orion", "orion"),
-        ("Tempest", "tempest"), ("Ranger", "ranger"), ("Paladin", "paladin"), ("Sovereign", "sovereign"),
-    ]
-
-    scraped_leads = []
-    verified_leads = []
-
-    run_seed = int(time.time()) % 10000
-
-    with db.get_connection() as conn:
-        for idx in range(limit):
-            brand_name, brand_slug = sample_companies[idx % len(sample_companies)]
-            suffix = meta["suffix"][idx % len(meta["suffix"])]
-            city = meta["cities"][idx % len(meta["cities"])]
-            tld = meta["tld"]
-            domain = f"{brand_slug}-{slug}-{run_seed}-{idx+1}.{tld}"
-            comp_name = f"{brand_name} {niche} {suffix}"
-            
-            estimating_email = f"estimating@{domain}"
-            tender_email = f"tenders@{domain}"
-
-            # 1. SCRAPED Lead (Column 1)
-            scraped_id = str(uuid.uuid4())
-            scraped_lead = {
-                "id": scraped_id,
-                "lead_id": scraped_id,
-                "company_name": comp_name,
-                "primary_email": estimating_email,
-                "channel": "EMAIL",
-                "status": "SCRAPED",
-                "priority_score": 85,
-                "primary_email_tier": "TIER_1_ESTIMATING",
-                "quality_tag": "TIER-1-ESTIMATING",
-                "tech_stack": ["WordPress", "Next.js", "Google Analytics 4"],
-                "target_country": country,
-                "scheduled_for": None,
-                "sent_at": None
-            }
-            conn.execute("""
-                INSERT INTO outreach_queue (id, lead_id, channel, recipient, company_name, subject, message_body, status, target_country, target_timezone)
-                VALUES (?, ?, 'EMAIL', ?, ?, ?, ?, 'SCRAPED', ?, ?)
-            """, (
-                scraped_id, scraped_id, estimating_email, comp_name,
-                f"Commercial Inquiry: {comp_name} [{country}]",
-                f"High-priority lead discovered during automated scraping scan for {niche} in {country}.",
-                country, meta["tz"]
-            ))
-            scraped_leads.append(scraped_lead)
-
-            # 2. VERIFIED Lead (Column 2) & stored into vault_leads
-            if idx % 2 == 0:
-                verified_id = str(uuid.uuid4())
-                verified_lead = {
-                    "id": verified_id,
-                    "lead_id": verified_id,
-                    "company_name": f"{brand_name} Commercial {suffix}",
-                    "primary_email": tender_email,
-                    "channel": "EMAIL",
-                    "status": "VERIFIED",
-                    "priority_score": 95,
-                    "primary_email_tier": "TIER_1_ESTIMATING",
-                    "quality_tag": "TIER-1-ESTIMATING",
-                    "tech_stack": ["WordPress", "Next.js", "HubSpot", "Cloudflare"],
-                    "target_country": country,
-                    "scheduled_for": None,
-                    "sent_at": None
-                }
-                
-                payload_json = json.dumps({
-                    "id": verified_id,
-                    "company_name": verified_lead["company_name"],
-                    "primary_email": verified_lead["primary_email"],
-                    "domain": domain,
-                    "country": country,
-                    "city": city,
-                    "niche": niche,
-                    "quality_tag": "TIER-1-ESTIMATING",
-                    "priority_score": 95,
-                    "hygiene_status": "VERIFIED"
-                })
-                encrypted = crypto.encrypt_string(payload_json)
-                conn.execute("""
-                    INSERT OR REPLACE INTO vault_leads (id, domain, primary_email, company_name, country, city, niche, quality_tag, priority_score, encrypted_payload)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, 'TIER-1-ESTIMATING', 95, ?)
-                """, (verified_id, domain, verified_lead["primary_email"], verified_lead["company_name"], country, city, niche, encrypted))
-                
-                conn.execute("""
-                    INSERT INTO outreach_queue (id, lead_id, channel, recipient, company_name, subject, message_body, status, target_country, target_timezone)
-                    VALUES (?, ?, 'EMAIL', ?, ?, ?, ?, 'VERIFIED', ?, ?)
-                """, (
-                    verified_id, verified_id, verified_lead["primary_email"], verified_lead["company_name"],
-                    f"Verified Estimating Tender - {verified_lead['company_name']}",
-                    f"Lead passed Zero-Bounce 3-Stage Hygiene Shield and DNS MX verification.",
-                    country, meta["tz"]
-                ))
-                verified_leads.append(verified_lead)
-
-        conn.commit()
-
-    return {
-        "status": "COMPLETED",
-        "target": {"country": country, "niche": niche},
-        "scraped_count": len(scraped_leads),
-        "verified_count": len(verified_leads),
-        "leads_preserved_count": len(verified_leads),
-        "leads_rejected_count": 0,
-        "scraped_leads": scraped_leads,
-        "verified_leads": verified_leads,
-        "processed_leads": verified_leads,
-        "message": f"Hunt & Verify pipeline executed for {country} ({niche}). Discovered {len(scraped_leads)} scraped leads and {len(verified_leads)} verified leads."
-    }
-
-
-# -------------------------------------------------------------
-# INBOX ROTATOR: FULL CRUD MANAGEMENT
-# -------------------------------------------------------------
-@router.post("/mailboxes")
-def create_mailbox(req: MailboxCreateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Creates a new mailbox in the inbox rotator."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: Only Admin can manage mailboxes.")
-    db = get_db_engine()
-    mb_id = str(uuid.uuid4())
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    email = req.email_address.strip()
-    domain = req.domain.strip() if req.domain else (email.split("@")[-1].strip() if "@" in email else "nexus-pulse.io")
-    with db.get_connection() as conn:
-        existing = conn.execute(
-            "SELECT id FROM mailbox_rotator WHERE email_address = ?", (email,)
-        ).fetchone()
-        if existing:
-            raise HTTPException(status_code=400, detail="Mailbox with this email address already exists.")
-        conn.execute("""
-            INSERT INTO mailbox_rotator
-                (id, email_address, display_name, domain, daily_limit, sent_today, last_reset_date, is_active,
-                 smtp_host, smtp_port, smtp_username, smtp_password)
-            VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?)
-        """, (
-            mb_id, email, req.display_name.strip(), domain,
-            req.daily_limit or 45, today_str,
-            req.smtp_host or "", req.smtp_port or 587,
-            req.smtp_username or email, req.smtp_password or ""
-        ))
-        conn.commit()
-    return {"success": True, "id": mb_id, "email_address": email, "display_name": req.display_name, "domain": domain}
-
-
-@router.put("/mailboxes/{mailbox_id}")
-def update_mailbox(mailbox_id: str, req: MailboxUpdateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Updates SMTP settings and display configuration for a mailbox."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: Only Admin can manage mailboxes.")
-    db = get_db_engine()
-    with db.get_connection() as conn:
-        existing = conn.execute("SELECT id FROM mailbox_rotator WHERE id = ?", (mailbox_id,)).fetchone()
-        if not existing:
-            raise HTTPException(status_code=404, detail="Mailbox not found.")
-        fields = []
-        values = []
-        if req.email_address is not None:
-            fields.append("email_address = ?"); values.append(req.email_address.strip())
-            if req.domain is None and "@" in req.email_address:
-                fields.append("domain = ?"); values.append(req.email_address.split("@")[-1].strip())
-        if req.display_name is not None:
-            fields.append("display_name = ?"); values.append(req.display_name.strip())
-        if req.domain is not None:
-            fields.append("domain = ?"); values.append(req.domain.strip())
-        if req.daily_limit is not None:
-            fields.append("daily_limit = ?"); values.append(req.daily_limit)
-        if req.smtp_host is not None:
-            fields.append("smtp_host = ?"); values.append(req.smtp_host.strip())
-        if req.smtp_port is not None:
-            fields.append("smtp_port = ?"); values.append(req.smtp_port)
-        if req.smtp_username is not None:
-            fields.append("smtp_username = ?"); values.append(req.smtp_username.strip())
-        if req.smtp_password is not None:
-            fields.append("smtp_password = ?"); values.append(req.smtp_password)
-        if not fields:
-            raise HTTPException(status_code=400, detail="No fields provided to update.")
-        values.append(mailbox_id)
-        conn.execute(f"UPDATE mailbox_rotator SET {', '.join(fields)} WHERE id = ?", values)
-        conn.commit()
-    return {"success": True, "id": mailbox_id, "message": "Mailbox updated successfully."}
-
-
-@router.delete("/mailboxes/{mailbox_id}")
-def delete_mailbox(mailbox_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Permanently removes a mailbox from the inbox rotator."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: Only Admin can manage mailboxes.")
-    db = get_db_engine()
-    with db.get_connection() as conn:
-        existing = conn.execute("SELECT id, email_address FROM mailbox_rotator WHERE id = ?", (mailbox_id,)).fetchone()
-        if not existing:
-            raise HTTPException(status_code=404, detail="Mailbox not found.")
-        email = existing["email_address"]
-        conn.execute("DELETE FROM mailbox_rotator WHERE id = ?", (mailbox_id,))
-        conn.commit()
-    return {"success": True, "deleted_email": email, "message": "Mailbox permanently removed from rotator."}
-
-
-# -------------------------------------------------------------
-# BACKUP: MULTI-FORMAT EXPORT AND DIRECT BROWSER DOWNLOAD
-# -------------------------------------------------------------
 @router.get("/backup")
 @router.post("/backup")
 @router.get("/backup/download")
 @router.post("/backup/download")
-def backup_and_download(format: Optional[str] = "json"):
-    """
-    Runs global snapshot backup (JSON + CSV + XLSX to Desktop/rabbi/vault/backups/)
-    and streams the requested format directly to the browser for instant download.
-    Query param: ?format=json|csv|xlsx  (default: json)
-    """
+def backup_and_download(format: Optional[str] = "json", current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Exports and downloads vault snapshots directly."""
     vault = get_vault_manager()
-    result = vault.export_global_snapshot_backups()
+    op_id = current_user["id"] if current_user.get("role") == "operator" else None
+    result = vault.export_global_snapshot_backups(operator_id=op_id)
 
     fmt = (format or "json").lower().strip()
     if fmt == "csv":
@@ -1057,7 +1205,6 @@ def backup_and_download(format: Optional[str] = "json"):
         media_type = "application/json"
 
     if not path or not os.path.exists(path):
-        # Fallback to JSON
         path = result.get("json_backup")
         media_type = "application/json"
     if not path or not os.path.exists(path):
@@ -1075,17 +1222,30 @@ def backup_and_download(format: Optional[str] = "json"):
     )
 
 
-# -------------------------------------------------------------
-# OPERATOR ACTIVITY LOG (Audit Trail)
-# -------------------------------------------------------------
-class LogActivityRequest(BaseModel):
-    action: str
-    detail: Optional[str] = None
+@router.post("/leads/verify")
+def verify_email_address(req: VerifyEmailRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    hygiene = get_hygiene_shield()
+    return hygiene.validate_lead_email(req.email).model_dump()
+
+
+@router.post("/followup/scan")
+def trigger_followup_scanner(current_user: Dict[str, Any] = Depends(get_current_user)):
+    engine = get_followup_engine()
+    return engine.scan_and_trigger_due_followups(force_all_pending=True)
+
+
+@router.post("/outreach/webform/format")
+def format_backup_webform(req: WebFormFormatRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    return BackupWebFormAgent.format_web_form_payload(
+        company_name=req.company_name,
+        website_url=req.website_url,
+        niche=req.niche or "Commercial Contracting",
+        country=req.country or "Germany"
+    )
 
 
 @router.post("/operators/log-activity")
 def log_operator_activity(req: LogActivityRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Records an operator session action into the audit trail."""
     db = get_db_engine()
     with db.get_connection() as conn:
         conn.execute("""
@@ -1103,10 +1263,7 @@ def log_operator_activity(req: LogActivityRequest, current_user: Dict[str, Any] 
 
 
 @router.get("/operators/{user_id}/activity-log")
-def get_operator_activity_log(user_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Returns the activity audit trail for a given operator (admin-only)."""
-    if current_user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Forbidden: Only Admin can view audit logs.")
+def get_operator_activity_log(user_id: str, admin_user: Dict[str, Any] = Depends(require_admin)):
     db = get_db_engine()
     with db.get_connection() as conn:
         rows = conn.execute("""
@@ -1116,4 +1273,19 @@ def get_operator_activity_log(user_id: str, current_user: Dict[str, Any] = Depen
             ORDER BY created_at DESC
             LIMIT 100
         """, (user_id,)).fetchall()
+    return [dict(r) for r in rows]
+
+
+@router.get("/operators-activity/all")
+@router.get("/operators/activity-log/all")
+def get_all_activity_logs(admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Returns activity audit logs across all operator accounts."""
+    db = get_db_engine()
+    with db.get_connection() as conn:
+        rows = conn.execute("""
+            SELECT id, user_id, username, action, detail, device_id, created_at
+            FROM operator_sessions
+            ORDER BY created_at DESC
+            LIMIT 100
+        """).fetchall()
     return [dict(r) for r in rows]

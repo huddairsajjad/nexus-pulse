@@ -202,8 +202,9 @@ def interactive_menu():
         elif choice == "6":
             trigger_followup_scanner()
         elif choice == "7":
-            from cli import run_pipeline_demonstration
-            run_pipeline_demonstration()
+            orch = NexusPulseOrchestrator()
+            res = orch.execute_targeted_pipeline()
+            print(f"{Fore.GREEN}[PIPELINE COMPLETE] Scraped {res.get('leads_preserved_count', 0)} verified leads!{Style.RESET_ALL}\n")
         elif choice == "8":
             vault = get_vault_manager()
             res = vault.export_global_snapshot_backups()

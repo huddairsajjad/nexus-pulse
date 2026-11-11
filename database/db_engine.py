@@ -146,6 +146,12 @@ class DatabaseEngine:
                 if col_name not in existing_user_cols:
                     conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def};")
 
+            # Dynamic migration for vault_leads
+            existing_vl_cols = {col["name"] for col in conn.execute("PRAGMA table_info(vault_leads)").fetchall()}
+            if "operator_id" not in existing_vl_cols:
+                conn.execute("ALTER TABLE vault_leads ADD COLUMN operator_id TEXT;")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_operator ON vault_leads(operator_id);")
+
             # 5. Outreach Queue (Human Approval Gate & Scheduled Dispatch)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS outreach_queue (
@@ -156,7 +162,7 @@ class DatabaseEngine:
                     company_name TEXT NOT NULL,
                     subject TEXT NOT NULL,
                     message_body TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'PENDING_APPROVAL', -- 'PENDING_APPROVAL', 'APPROVED', 'REJECTED', 'SCHEDULED', 'SENT', 'REPLIED', 'HOT_LEAD', 'CLOSED'
+                    status TEXT NOT NULL DEFAULT 'PENDING_APPROVAL', -- 'PENDING_APPROVAL', 'APPROVED', 'REJECTED', 'SCHEDULED', 'SENT', 'REPLIED', 'HOT_LEAD', 'CLOSED', 'BOUNCED', 'SUPPRESSED'
                     target_country TEXT NOT NULL DEFAULT 'Germany',
                     target_timezone TEXT NOT NULL DEFAULT 'CET',
                     scheduled_for TIMESTAMP,
@@ -164,11 +170,31 @@ class DatabaseEngine:
                     approved_at TIMESTAMP,
                     sent_at TIMESTAMP,
                     mailbox_used TEXT,
+                    operator_id TEXT,
+                    tracking_id TEXT,
+                    opened_at TIMESTAMP,
+                    bounced_at TIMESTAMP,
+                    bounce_reason TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
+            # Dynamic migration for outreach_queue columns (must run before indices)
+            existing_oq_cols = {col["name"] for col in conn.execute("PRAGMA table_info(outreach_queue)").fetchall()}
+            oq_migrations = [
+                ("operator_id", "TEXT"),
+                ("tracking_id", "TEXT"),
+                ("opened_at", "TIMESTAMP"),
+                ("bounced_at", "TIMESTAMP"),
+                ("bounce_reason", "TEXT")
+            ]
+            for col_name, col_def in oq_migrations:
+                if col_name not in existing_oq_cols:
+                    conn.execute(f"ALTER TABLE outreach_queue ADD COLUMN {col_name} {col_def};")
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_status ON outreach_queue(status);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_lead ON outreach_queue(lead_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_operator ON outreach_queue(operator_id);")
 
             # 6. Mailbox Rotator (Domain & Daily Limits)
             conn.execute("""
@@ -184,21 +210,33 @@ class DatabaseEngine:
                     smtp_host TEXT DEFAULT '',
                     smtp_port INTEGER DEFAULT 587,
                     smtp_username TEXT DEFAULT '',
-                    smtp_password TEXT DEFAULT ''
+                    smtp_password TEXT DEFAULT '',
+                    operator_id TEXT,
+                    imap_host TEXT DEFAULT '',
+                    imap_port INTEGER DEFAULT 993,
+                    imap_username TEXT DEFAULT '',
+                    imap_password TEXT DEFAULT ''
                 );
             """)
 
-            # Dynamic migration for mailbox_rotator SMTP columns
+            # Dynamic migration for mailbox_rotator columns (must run before indices)
             existing_mb_cols = {col["name"] for col in conn.execute("PRAGMA table_info(mailbox_rotator)").fetchall()}
             mb_migrations = [
                 ("smtp_host", "TEXT DEFAULT ''"),
                 ("smtp_port", "INTEGER DEFAULT 587"),
                 ("smtp_username", "TEXT DEFAULT ''"),
                 ("smtp_password", "TEXT DEFAULT ''"),
+                ("operator_id", "TEXT"),
+                ("imap_host", "TEXT DEFAULT ''"),
+                ("imap_port", "INTEGER DEFAULT 993"),
+                ("imap_username", "TEXT DEFAULT ''"),
+                ("imap_password", "TEXT DEFAULT ''")
             ]
             for col_name, col_def in mb_migrations:
                 if col_name not in existing_mb_cols:
                     conn.execute(f"ALTER TABLE mailbox_rotator ADD COLUMN {col_name} {col_def};")
+
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_operator ON mailbox_rotator(operator_id);")
 
             # 7. Inbox Replies, AI Classification & Hot Lead Alerts
             conn.execute("""
@@ -213,11 +251,18 @@ class DatabaseEngine:
                     is_hot_lead INTEGER NOT NULL DEFAULT 0,
                     ai_suggested_reply TEXT,
                     received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT NOT NULL DEFAULT 'UNREAD' -- 'UNREAD', 'RESOLVED', 'REPLIED'
+                    status TEXT NOT NULL DEFAULT 'UNREAD', -- 'UNREAD', 'RESOLVED', 'REPLIED'
+                    operator_id TEXT
                 );
             """)
+            # Dynamic migration for inbox_replies columns
+            existing_rep_cols = {col["name"] for col in conn.execute("PRAGMA table_info(inbox_replies)").fetchall()}
+            if "operator_id" not in existing_rep_cols:
+                conn.execute("ALTER TABLE inbox_replies ADD COLUMN operator_id TEXT;")
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_hot ON inbox_replies(is_hot_lead);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_class ON inbox_replies(classification);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_operator ON inbox_replies(operator_id);")
 
             # 8. Autonomous 7-Day Follow-Up Sequences
             conn.execute("""
@@ -262,6 +307,70 @@ class DatabaseEngine:
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON operator_sessions(user_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_created ON operator_sessions(created_at);")
+
+            # -------------------------------------------------------------
+            # SAAS MULTI-TENANCY & COMPLIANCE EXTENSIONS
+            # -------------------------------------------------------------
+            # 11. Multi-Service Template Pool
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS service_templates (
+                    id TEXT PRIMARY KEY,
+                    operator_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    niche TEXT NOT NULL,
+                    subject_template TEXT NOT NULL,
+                    body_template TEXT NOT NULL,
+                    is_default INTEGER NOT NULL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_template_operator ON service_templates(operator_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_template_niche ON service_templates(niche);")
+
+            # 12. Global Suppressed Domains / Emails (Unsubscribes & Bounces)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS suppressed_entities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    entity TEXT NOT NULL UNIQUE, -- clean lowercase domain or email
+                    entity_type TEXT NOT NULL,   -- 'email', 'domain'
+                    reason TEXT NOT NULL,        -- 'UNSUBSCRIBE', 'BOUNCE', 'SPAM_COMPLAINT', 'MANUAL_OPT_OUT'
+                    operator_id TEXT,
+                    suppressed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_suppressed_entity ON suppressed_entities(entity);")
+
+            # 13. Global Domain Blacklist Rules
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS blacklist_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pattern TEXT NOT NULL UNIQUE, -- e.g. '*.gov', '*.edu', 'competitor.com'
+                    entity_type TEXT NOT NULL DEFAULT 'domain',
+                    reason TEXT NOT NULL DEFAULT 'Excluded Domain Pattern',
+                    created_by TEXT DEFAULT 'admin',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_blacklist_pattern ON blacklist_rules(pattern);")
+
+            # 14. Manual Operator Billing & License Subscriptions
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS operator_billing (
+                    id TEXT PRIMARY KEY,
+                    operator_id TEXT NOT NULL,
+                    base_price REAL NOT NULL,
+                    duration_days INTEGER NOT NULL,
+                    discount_percent REAL DEFAULT 0.0,
+                    discount_amount REAL DEFAULT 0.0,
+                    final_price REAL NOT NULL,
+                    extended_until TEXT NOT NULL,
+                    notes TEXT,
+                    created_by TEXT NOT NULL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_billing_operator ON operator_billing(operator_id);")
 
             conn.commit()
 

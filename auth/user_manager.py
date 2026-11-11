@@ -105,6 +105,7 @@ class UserManager:
         return {
             "success": True,
             "token": token,
+            "access_token": token,
             "user": {
                 "id": admin_id,
                 "username": clean_user,
@@ -138,8 +139,8 @@ class UserManager:
 
     def purge_all_data(self) -> Dict[str, int]:
         """
-        Wipes all users, leads, audit logs, queues, and histories.
-        Resets the database to a completely clean fresh state for production.
+        Wipes all users, leads, audit logs, queues, mailboxes, templates, and billing records.
+        Resets the database to a completely clean fresh state for production. Zero default records allowed.
         """
         counts = {}
         with self.db.get_connection() as conn:
@@ -149,20 +150,168 @@ class UserManager:
                 "dedup_registry",
                 "hygiene_audit_log",
                 "outreach_queue",
+                "mailbox_rotator",
                 "inbox_replies",
                 "followup_sequences",
                 "operator_sessions",
-                "dnc_blacklist"
+                "dnc_blacklist",
+                "service_templates",
+                "suppressed_entities",
+                "blacklist_rules",
+                "operator_billing"
             ]
             for tbl in tables_to_purge:
-                cnt = conn.execute(f"SELECT count(*) as cnt FROM {tbl}").fetchone()["cnt"]
-                counts[tbl] = cnt
-                conn.execute(f"DELETE FROM {tbl};")
+                try:
+                    cnt = conn.execute(f"SELECT count(*) as cnt FROM {tbl}").fetchone()["cnt"]
+                    counts[tbl] = cnt
+                    conn.execute(f"DELETE FROM {tbl};")
+                except Exception:
+                    pass
 
-            conn.execute("UPDATE mailbox_rotator SET sent_today = 0;")
             conn.commit()
             conn.execute("VACUUM;")
+
+        # Also wipe partitions and backup files to enforce zero-seed policy across the filesystem
+        try:
+            from vault.vault_manager import get_vault_manager
+            vm = get_vault_manager()
+            vm.purge_partitions_and_backups()
+        except Exception:
+            pass
+
         return counts
+
+    def apply_operator_billing(
+        self,
+        operator_id: str,
+        base_price: float,
+        duration_days: int,
+        notes: Optional[str] = None,
+        created_by: str = "admin"
+    ) -> Dict[str, Any]:
+        """
+        Super Admin manual billing control:
+        Calculates pricing, applies automated 10% discount for 90-day plans,
+        extends account expiration, and logs billing history.
+        """
+        clean_op_id = operator_id.strip()
+        base_price = float(max(0.0, base_price))
+        duration_days = int(duration_days)
+        if duration_days <= 0:
+            raise ValueError("Duration must be a positive number of days.")
+
+        # Automated discount calculation: 10% discount for 90-day plan
+        discount_percent = 0.0
+        if duration_days == 90:
+            discount_percent = 10.0
+            months = 3.0
+            gross_price = round(base_price * months, 2)
+            discount_amount = round(gross_price * 0.10, 2)
+            final_price = round(gross_price - discount_amount, 2)
+        elif duration_days == 30:
+            months = 1.0
+            gross_price = round(base_price, 2)
+            discount_amount = 0.0
+            final_price = gross_price
+        elif duration_days == 180:
+            months = 6.0
+            gross_price = round(base_price * months, 2)
+            discount_amount = 0.0
+            final_price = gross_price
+        elif duration_days == 365:
+            months = 12.0
+            gross_price = round(base_price * months, 2)
+            discount_amount = 0.0
+            final_price = gross_price
+        else:
+            months = round(duration_days / 30.0, 2)
+            gross_price = round(base_price * months, 2)
+            discount_amount = 0.0
+            final_price = gross_price
+
+        now_utc = datetime.now(timezone.utc)
+        with self.db.get_connection() as conn:
+            user = conn.execute("SELECT id, username, expiry_date FROM users WHERE id = ?", (clean_op_id,)).fetchone()
+            if not user:
+                raise ValueError("Target operator not found.")
+
+            # Calculate new expiration
+            current_expiry_str = user["expiry_date"]
+            start_date = now_utc
+            if current_expiry_str:
+                try:
+                    parsed = datetime.fromisoformat(current_expiry_str.replace(" ", "T"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    if parsed > now_utc:
+                        start_date = parsed
+                except Exception:
+                    start_date = now_utc
+
+            new_expiry_dt = start_date + timedelta(days=duration_days)
+            new_expiry_str = new_expiry_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+            conn.execute("UPDATE users SET expiry_date = ?, is_active = 1 WHERE id = ?", (new_expiry_str, clean_op_id))
+
+            billing_id = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO operator_billing (
+                    id, operator_id, base_price, duration_days, discount_percent,
+                    discount_amount, final_price, extended_until, notes, created_by
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                billing_id, clean_op_id, base_price, duration_days, discount_percent,
+                discount_amount, final_price, new_expiry_str, notes or f"+{duration_days}d plan extension",
+                created_by
+            ))
+
+            try:
+                conn.execute("""
+                    INSERT INTO operator_sessions (user_id, username, action, detail)
+                    VALUES (?, ?, 'BILLING_EXTENSION', ?)
+                """, (
+                    clean_op_id, user["username"],
+                    f"Plan extended +{duration_days}d for ${final_price} (Expiry: {new_expiry_str})"
+                ))
+            except Exception:
+                pass
+
+            conn.commit()
+
+        return {
+            "success": True,
+            "billing_id": billing_id,
+            "operator_id": clean_op_id,
+            "username": user["username"],
+            "base_price": base_price,
+            "subtotal": gross_price,
+            "duration_days": duration_days,
+            "discount_percent": discount_percent,
+            "discount_amount": discount_amount,
+            "final_price": final_price,
+            "new_expiry_date": new_expiry_str,
+            "message": f"Successfully extended operator license by {duration_days} days until {new_expiry_str}."
+        }
+
+    def get_operator_billing_history(self, operator_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Returns billing transactions for an operator or across all operators for admin."""
+        with self.db.get_connection() as conn:
+            if operator_id:
+                rows = conn.execute("""
+                    SELECT b.*, u.username
+                    FROM operator_billing b
+                    LEFT JOIN users u ON b.operator_id = u.id
+                    WHERE b.operator_id = ?
+                    ORDER BY b.created_at DESC, b.rowid DESC
+                """, (operator_id,)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT b.*, u.username
+                    FROM operator_billing b
+                    LEFT JOIN users u ON b.operator_id = u.id
+                    ORDER BY b.created_at DESC, b.rowid DESC
+                """).fetchall()
+            return [dict(r) for r in rows]
 
     def seed_default_users(self) -> None:
         """Seeds master Admin and default Operator accounts (for automated verification tests)."""
@@ -273,6 +422,7 @@ class UserManager:
 
             return {
                 "token": token,
+                "access_token": token,
                 "user": {
                     "id": row["id"],
                     "username": row["username"],
@@ -390,6 +540,9 @@ class UserManager:
                 ORDER BY role ASC, created_at DESC
             """).fetchall()
             return [dict(r) for r in rows]
+
+    # Alias for backwards compatibility
+    list_all_operators = get_all_operators
 
     def create_operator_account(
         self,
