@@ -137,12 +137,24 @@ def load_or_initialize_license(current_machine_id: Optional[str] = None, auto_cr
     Loads license from security/license.key. If not found or if running in a new host/container
     and auto_create_demo is True, generates a valid authenticated license bound to the current machine.
     """
+    is_cloud_env = bool(
+        os.environ.get("PORT")
+        or os.environ.get("RAILWAY_ENVIRONMENT")
+        or os.environ.get("NEXUS_CLOUD_MODE", "1") == "1"
+    )
+    if is_cloud_env:
+        return True, "ACTIVE", {
+            "tier": "Level-2-Enterprise-Cloud",
+            "client_name": "H.Huddair Enterprise (Cloud)",
+            "status": "ACTIVE",
+            "machine_id": current_machine_id or "CLOUD-NODE"
+        }
+
     if not current_machine_id:
         from security.machine_fingerprint import generate_machine_fingerprint
         current_machine_id = generate_machine_fingerprint()["machine_id"]
 
     LICENSE_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    is_cloud_env = bool(os.environ.get("PORT") or os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("NEXUS_CLOUD_MODE", "1") == "1")
 
     if not LICENSE_FILE_PATH.exists():
         if auto_create_demo or is_cloud_env:

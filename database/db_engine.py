@@ -17,7 +17,7 @@ DB_DIR = ROOT_DIR / "database"
 
 def _resolve_default_db_path() -> Path:
     env_path = os.environ.get("NEXUS_DB_PATH") or os.environ.get("DATABASE_URL")
-    if env_path:
+    if env_path and not env_path.startswith(("postgres://", "postgresql://", "mysql://", "redis://")):
         # Strip sqlite:/// prefix if present
         clean_path = env_path.replace("sqlite:///", "").replace("sqlite://", "").strip()
         if clean_path:
