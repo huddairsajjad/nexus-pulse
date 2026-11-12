@@ -814,3 +814,100 @@ html, body {
   85%  { opacity: 1; }
   100% { top: 96%; opacity: 0; }
 }
+
+/* =============================================================
+   MOBILE RESPONSIVE & PWA COMPACT ADAPTATIONS
+   ============================================================= */
+@supports (padding-top: env(safe-area-inset-top)) {
+  body {
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+  }
+  .np-header {
+    padding-top: calc(10px + env(safe-area-inset-top));
+  }
+}
+
+@media (max-width: 768px) {
+  /* Navigation Bar Touch Optimization */
+  .np-nav {
+    padding: 0 12px;
+    gap: 2px;
+    -webkit-overflow-scrolling: touch;
+    touch-action: pan-x;
+  }
+  .np-nav-tab {
+    flex-shrink: 0;
+    padding: 8px 12px;
+    font-size: 13px;
+  }
+
+  /* Header Optimization */
+  .np-header {
+    flex-wrap: wrap;
+    padding: 8px 12px;
+    gap: 8px;
+  }
+
+  /* Stat and Overview Cards */
+  .np-card {
+    padding: 14px;
+    border-radius: 8px;
+  }
+
+  /* Modal Dialog Adaptations */
+  .np-modal-backdrop {
+    padding: 8px;
+  }
+  .np-modal {
+    max-width: 100%;
+    max-height: 94vh;
+    border-radius: 8px;
+  }
+  .np-modal-header {
+    padding: 12px 14px;
+  }
+  .np-modal-body {
+    padding: 14px;
+  }
+  .np-modal-footer {
+    padding: 10px 14px;
+    flex-wrap: wrap;
+  }
+
+  /* Table horizontal scroll touch friction */
+  .np-table-wrapper {
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior-x: contain;
+  }
+}
+
+@media (max-width: 640px) {
+  /* Prevent iOS input focus auto-zooming */
+  .np-input,
+  .np-select,
+  .np-textarea {
+    font-size: 16px !important;
+    min-height: 40px;
+  }
+
+  /* Touch Targets */
+  .np-btn {
+    min-height: 38px;
+    padding: 7px 14px;
+  }
+
+  /* Main Container Padding */
+  .np-main-content {
+    padding: 10px;
+  }
+
+  /* Stack Modal Actions Vertically if needed */
+  .np-modal-footer .np-btn {
+    flex: 1 1 auto;
+    justify-content: center;
+  }
+}
+

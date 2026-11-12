@@ -1,4 +1,4 @@
-# H.Huddair's Nexus-Pulse (Level 1) Requirements
+# H.Huddair's Nexus-Pulse Production Requirements
 fastapi>=0.110.0
 uvicorn>=0.28.0
 pydantic>=2.6.0
@@ -9,3 +9,7 @@ colorama>=0.4.6
 pyyaml>=6.0
 openpyxl>=3.1.2
 cryptography>=42.0.0
+bcrypt>=4.1.2
+beautifulsoup4>=4.12.3
+aiosqlite>=0.20.0
+python-multipart>=0.0.9

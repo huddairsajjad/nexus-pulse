@@ -192,6 +192,7 @@ class CategoryVaultManager:
                 except Exception:
                     pass
 
+        BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         json_backup = BACKUPS_DIR / f"nexus_leads_backup_{timestamp}.json"
         csv_backup = BACKUPS_DIR / f"nexus_leads_backup_{timestamp}.csv"

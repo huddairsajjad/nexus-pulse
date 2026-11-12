@@ -2,8 +2,19 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
   <title>H.Huddair’s Nexus-Pulse [Level 2 Enterprise]</title>
+
+  <!-- PWA & Mobile Web App Meta -->
+  <link rel="manifest" href="/manifest.json">
+  <meta name="theme-color" content="#00ff9d">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="NexusPulse">
+  <link rel="apple-touch-icon" href="/ui/assets/icon-192.png">
+  <link rel="icon" type="image/x-icon" href="/favicon.ico">
+  <link rel="icon" type="image/svg+xml" href="/ui/assets/icon.svg">
 
   <!-- Tailwind CSS CDN -->
   <script src="https://cdn.tailwindcss.com"></script>
@@ -43,17 +54,42 @@
   <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
-  <link rel="icon" type="image/x-icon" href="/ui/assets/favicon.ico">
-
   <script>
     // Apply saved theme before first paint to prevent Flash of Unstyled Content (FOUC)
     (function() {
       var saved = localStorage.getItem('nexus_theme') || 'github-dark';
       document.documentElement.setAttribute('data-theme', saved);
     })();
+
+    // PWA Service Worker Registration & Deferred Install Prompt Handler
+    window.deferredPrompt = null;
+    window.addEventListener('beforeinstallprompt', function(e) {
+      e.preventDefault();
+      window.deferredPrompt = e;
+      window.dispatchEvent(new CustomEvent('pwa-install-available'));
+      console.log('[PWA] Native installation prompt captured and ready.');
+    });
+
+    window.addEventListener('appinstalled', function() {
+      window.deferredPrompt = null;
+      console.log('[PWA] Application successfully installed.');
+      window.dispatchEvent(new CustomEvent('pwa-installed'));
+    });
+
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', function() {
+        navigator.serviceWorker.register('/sw.js', { scope: '/' })
+          .then(function(reg) {
+            console.log('[PWA] Service Worker active with scope:', reg.scope);
+          })
+          .catch(function(err) {
+            console.warn('[PWA] Service Worker registration failed:', err);
+          });
+      });
+    }
   </script>
 </head>
-<body class="bg-base text-theme-primary antialiased m-0 p-0">
+<body class="bg-base text-theme-primary antialiased m-0 p-0 selection:bg-[var(--accent)] selection:text-black">
   <div id="root"></div>
 
   <!-- Main React App Script (Transpiled via Babel in browser) -->

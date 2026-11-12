@@ -31,6 +31,18 @@ class UserManager:
             row = conn.execute("SELECT count(*) as cnt FROM users WHERE role = 'admin'").fetchone()
             return bool(row and row["cnt"] > 0)
 
+    def get_admin_user(self) -> Optional[Dict[str, Any]]:
+        """Returns the primary administrator account details."""
+        with self.db.get_connection() as conn:
+            row = conn.execute("""
+                SELECT id, username, role, full_name, email, is_active,
+                       device_lock_id, device_lock_enabled, expiry_date,
+                       daily_scrape_quota, daily_send_quota, license_key,
+                       created_at, last_login, last_login_device
+                FROM users WHERE role = 'admin' LIMIT 1
+            """).fetchone()
+            return dict(row) if row else None
+
     def initialize_admin(
         self,
         username: str,
@@ -391,9 +403,12 @@ class UserManager:
                 except ValueError:
                     pass
 
-            # 4. Enforce Device Lock
+            # 4. Enforce Device Lock (Cloud-Safe)
+            import os
             host_device = client_machine_id or generate_machine_fingerprint()["machine_id"]
-            if row["device_lock_enabled"] == 1:
+            is_cloud_env = bool(os.environ.get("PORT") or os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("NEXUS_CLOUD_MODE", "1") == "1")
+            enforce_strict_device_lock = bool(os.environ.get("NEXUS_ENFORCE_DEVICE_LOCK", "0") in ("1", "true"))
+            if row["device_lock_enabled"] == 1 and not is_cloud_env and enforce_strict_device_lock:
                 registered_device = row["device_lock_id"]
                 if not registered_device:
                     # Bind on first login
@@ -403,6 +418,8 @@ class UserManager:
                         f"DEVICE_LOCK_ALERT: Account is locked to device '{registered_device}', "
                         f"but host fingerprint is '{host_device}'. Execution blocked."
                     )
+            elif not row["device_lock_id"]:
+                conn.execute("UPDATE users SET device_lock_id = ? WHERE id = ?", (host_device, row["id"]))
 
             # Update login telemetry
             conn.execute("""

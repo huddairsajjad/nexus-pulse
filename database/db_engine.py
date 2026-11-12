@@ -14,7 +14,17 @@ from typing import Optional, Dict, Any, List
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 DB_DIR = ROOT_DIR / "database"
-DB_FILE_PATH = DB_DIR / "nexus_vault.db"
+
+def _resolve_default_db_path() -> Path:
+    env_path = os.environ.get("NEXUS_DB_PATH") or os.environ.get("DATABASE_URL")
+    if env_path:
+        # Strip sqlite:/// prefix if present
+        clean_path = env_path.replace("sqlite:///", "").replace("sqlite://", "").strip()
+        if clean_path:
+            return Path(clean_path).resolve()
+    return DB_DIR / "nexus_vault.db"
+
+DB_FILE_PATH = _resolve_default_db_path()
 
 
 def compute_sha256(text: str) -> str:
@@ -25,11 +35,11 @@ def compute_sha256(text: str) -> str:
 class DatabaseEngine:
     """
     Manages SQLite database operations with support for field encryption
-    and persistent deduplication indices.
+    and persistent deduplication indices. Supports sync and async connections.
     """
 
     def __init__(self, db_path: Optional[Path] = None):
-        self.db_path = db_path or DB_FILE_PATH
+        self.db_path = db_path or _resolve_default_db_path()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_schema()
 
@@ -43,6 +53,20 @@ class DatabaseEngine:
         try:
             yield conn
         finally:
+            conn.close()
+
+    async def get_async_connection(self):
+        """Asynchronous SQLite connection helper for high-concurrency cloud workloads."""
+        try:
+            import aiosqlite
+            conn = await aiosqlite.connect(str(self.db_path), timeout=20.0)
+            conn.row_factory = aiosqlite.Row
+            await conn.execute("PRAGMA journal_mode = WAL;")
+            await conn.execute("PRAGMA foreign_keys = ON;")
+            return conn
+        except ImportError:
+            # Fallback wrapper if aiosqlite is not yet installed
+            return None
             conn.close()
 
     def _init_schema(self) -> None:
