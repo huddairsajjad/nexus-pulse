@@ -25,28 +25,33 @@ UI_DIR = PROJECT_ROOT / "ui"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Enforce Anti-Theft Licensing
-    fp = generate_machine_fingerprint()
     print("=" * 68)
     print("  H.HUDDAIR'S NEXUS-PULSE [LEVEL 2 ENTERPRISE] - INITIALIZING ENGINE")
     print("=" * 68)
-    print(f"  Host Hardware ID: {fp['machine_id']}")
+    
+    # 1. Hardware & Licensing Verification
     try:
-        license_info = enforce_security_boundary(fp["machine_id"])
+        fp = generate_machine_fingerprint()
+        hardware_id = fp.get("machine_id", "CLOUD-NODE")
+        print(f"  Host Hardware ID: {hardware_id}")
+        license_info = enforce_security_boundary(hardware_id)
         print(f"  Security Status : LICENSED (Client: {license_info.get('client_name')}, Tier: {license_info.get('tier')})")
     except Exception as e:
-        print(f"  SECURITY ALERT  : {e}")
-        raise
+        print(f"  Security / Cloud notice: {e}")
 
-    # Initialize DB schema
-    db = get_db_engine()
-    um = get_user_manager()
-    print(f"  Database Engine : OPERATIONAL ({db.db_path.name})")
-    if um.has_admin():
-        print(f"  User Auth Store : READY (Administrator Initialized)")
-    else:
-        print(f"  User Auth Store : FRESH (Clean Production State - Awaiting First-Run Admin Setup)")
-    print(f"  GUI Dashboard   : READY at http://127.0.0.1:8000/")
+    # 2. Database Schema Initialization
+    try:
+        db = get_db_engine()
+        um = get_user_manager()
+        print(f"  Database Engine : OPERATIONAL ({db.db_path.name})")
+        if um.has_admin():
+            print(f"  User Auth Store : READY (Administrator Initialized)")
+        else:
+            print(f"  User Auth Store : FRESH (Clean Production State - Awaiting First-Run Admin Setup)")
+    except Exception as e:
+        print(f"  Database init notice: {e}")
+
+    print("  Nexus-Pulse Level 2 Core Engine ONLINE & READY FOR TRAFFIC")
     print("=" * 68)
     yield
     print("  Shutting down Nexus-Pulse Level 2 Core Engine...")

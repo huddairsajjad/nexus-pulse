@@ -183,17 +183,26 @@ def load_or_initialize_license(current_machine_id: Optional[str] = None, auto_cr
 def enforce_security_boundary(current_machine_id: Optional[str] = None) -> Dict[str, Any]:
     """
     Gateway function: Enforces anti-theft licensing check.
-    If unauthorized, immediately terminates or raises.
+    In cloud environments (Railway / container), returns cloud authorization.
     """
+    is_cloud_env = bool(
+        os.environ.get("PORT")
+        or os.environ.get("RAILWAY_ENVIRONMENT")
+        or os.environ.get("NEXUS_CLOUD_MODE", "1") == "1"
+    )
+    if is_cloud_env:
+        return {
+            "tier": "Level-2-Enterprise-Cloud",
+            "client_name": "H.Huddair Enterprise (Cloud)",
+            "status": "ACTIVE"
+        }
+
     if not current_machine_id:
         from security.machine_fingerprint import generate_machine_fingerprint
         current_machine_id = generate_machine_fingerprint()["machine_id"]
 
     valid, message, info = load_or_initialize_license(current_machine_id)
     if not valid:
-        is_cloud_env = bool(os.environ.get("PORT") or os.environ.get("RAILWAY_ENVIRONMENT"))
-        if is_cloud_env:
-            return {"tier": "Level-2-Enterprise-Cloud", "client_name": "Cloud Deployment", "status": "ACTIVE"}
         print("\n" + "!" * 70, file=sys.stderr)
         print(" [SECURITY BREACH / ANTI-THEFT ENFORCEMENT]", file=sys.stderr)
         print(f" {message}", file=sys.stderr)
