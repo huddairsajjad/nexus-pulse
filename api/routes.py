@@ -12,6 +12,7 @@ import uuid
 import time
 import re
 from datetime import datetime, timezone
+import logging
 from typing import Dict, Any, List, Optional
 from fastapi import APIRouter, HTTPException, Header, Depends, Query, Request
 from fastapi.responses import FileResponse, Response, HTMLResponse
@@ -23,11 +24,13 @@ from security.license_validator import load_or_initialize_license
 from security.crypto_vault import get_crypto_vault
 from core.agents.localization_engine import LocalizationEngine
 from core.hygiene.zero_bounce_shield import get_hygiene_shield
-from core.agents.scraper_agent import DeepScraperAgent
+from core.agents.scraper_agent import DeepScraperAgent, SearchDiscoveryAgent
 from database.deduplication_shield import get_dedup_shield
 from database.db_engine import get_db_engine
 from vault.vault_manager import get_vault_manager
 from core.orchestrator import NexusPulseOrchestrator
+
+logger = logging.getLogger("nexus.api")
 
 from auth.user_manager import get_user_manager
 from auth.jwt_handler import decode_access_token
@@ -1094,59 +1097,127 @@ async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any
     limit = max(1, min(req.max_results or 20, 100))
     op_id = current_user["id"]
 
-    scraped_leads = []
+    logger.info(f"[HUNT] Launching scrape pipeline: country='{country}', city='{city_override}', niche='{niche}', limit={limit}, operator='{op_id}', seed_urls={req.target_urls}")
+
+    # Determine target URLs: either explicit seeds or autonomous multi-engine discovery
+    target_urls: List[str] = [u.strip() for u in (req.target_urls or []) if u.strip()]
+    if not target_urls:
+        logger.info(f"[HUNT] No seed URLs provided. Generating localized B2B queries for {country} ({city_override})...")
+        queries = LocalizationEngine.generate_localized_queries(country, city_override, niche)
+        discovery_agent = SearchDiscoveryAgent(timeout_seconds=float(cfg.get("crawler.request_timeout_seconds", 12.0)))
+        target_urls = await discovery_agent.discover_candidate_urls(
+            queries=queries,
+            limit=limit,
+            country=country,
+            city=city_override,
+            niche=niche
+        )
+        logger.info(f"[HUNT] Autonomous search discovery found {len(target_urls)} candidate domains.")
+
+    scraped_leads_summary = []
     verified_leads = []
+    rejected_leads = []
 
-    # If explicit target URLs are supplied, scrape them directly
-    if req.target_urls:
-        scraper = DeepScraperAgent()
-        for url in req.target_urls[:limit]:
-            clean_url = url.strip()
-            if not clean_url:
-                continue
+    timeout_sec = float(cfg.get("crawler.request_timeout_seconds", 12.0))
+    scraper = DeepScraperAgent(timeout_seconds=timeout_sec)
 
-            # Check blacklist & suppression
-            domain_part = clean_url.split("/")[2] if "//" in clean_url else clean_url.split("/")[0]
-            is_bl, _ = blacklist_mgr.is_domain_blacklisted(domain_part)
-            if is_bl or reply_listener.is_suppressed(domain_part):
-                continue
+    for url in target_urls[:limit]:
+        clean_url = url.strip()
+        if not clean_url:
+            continue
 
-            lead = await scraper.scrape_url(
-                url=clean_url,
+        domain_part = clean_url.split("/")[2] if "//" in clean_url else clean_url.split("/")[0]
+        domain_part = domain_part.replace("www.", "").split(":")[0]
+
+        # Check blacklist & suppression
+        is_bl, bl_reason = blacklist_mgr.is_domain_blacklisted(domain_part)
+        if is_bl:
+            logger.info(f"[HUNT] Domain '{domain_part}' blocked by Blacklist: {bl_reason}")
+            rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "BLACKLIST_BLOCKED", "details": bl_reason})
+            continue
+
+        if reply_listener.is_suppressed(domain_part):
+            logger.info(f"[HUNT] Domain '{domain_part}' blocked by Suppression List")
+            rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "SUPPRESSION_BLOCKED", "details": "Domain in suppression list"})
+            continue
+
+        logger.info(f"[HUNT] Scraping target: {clean_url}")
+        lead = await scraper.scrape_url(
+            url=clean_url,
+            country=country,
+            city=city_override,
+            niche=niche
+        )
+
+        if not lead:
+            logger.warning(f"[HUNT] No contact information extracted from {clean_url}")
+            rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "NO_CONTACTS_FOUND"})
+            continue
+
+        lead_summary = {
+            "id": lead.id or f"{lead.domain}_{lead.primary_email}",
+            "domain": lead.domain,
+            "company_name": lead.company_name,
+            "primary_email": lead.primary_email,
+            "email_tier": lead.primary_email_tier.value,
+            "quality_tag": lead.quality_tag,
+            "priority_score": lead.priority_score,
+            "tech_stack": lead.tech_stack.raw_technologies
+        }
+        scraped_leads_summary.append(lead_summary)
+
+        # Process and preserve lead (runs hygiene, dedup, and category vault archiving)
+        pres = orchestrator.process_and_preserve_lead(lead, operator_id=op_id)
+        if pres["success"]:
+            logger.info(f"[HUNT] Lead verified and preserved: {pres['company_name']} ({pres['primary_email']})")
+            verified_leads.append(pres)
+            # Queue in Approval Gate
+            gate.queue_outreach(
+                lead_id=pres["lead_id"],
+                company_name=pres["company_name"],
+                recipient=pres["primary_email"],
                 country=country,
-                city=city_override,
-                niche=niche
+                niche=niche,
+                channel="EMAIL",
+                tech_stack=pres.get("tech_stack"),
+                operator_id=op_id,
+                city=city_override
             )
-            if lead:
-                pres = orchestrator.process_and_preserve_lead(lead, operator_id=op_id)
-                if pres["success"]:
-                    verified_leads.append(pres)
-                    # Queue in Approval Gate
-                    gate.queue_outreach(
-                        lead_id=pres["lead_id"],
-                        company_name=pres["company_name"],
-                        recipient=pres["primary_email"],
-                        country=country,
-                        niche=niche,
-                        channel="EMAIL",
-                        tech_stack=pres.get("tech_stack"),
-                        operator_id=op_id,
-                        city=city_override
-                    )
-                else:
-                    scraped_leads.append({"domain": lead.domain, "reason": pres.get("reason")})
+        else:
+            logger.warning(f"[HUNT] Lead preservation rejected for {lead.domain}: {pres.get('reason')} - {pres.get('diagnostic', '')}")
+            rejected_leads.append({
+                "domain": lead.domain,
+                "email": lead.primary_email,
+                "reason": pres.get("reason"),
+                "diagnostic": pres.get("diagnostic"),
+                "status": pres.get("status")
+            })
+
+    scraped_count = len(scraped_leads_summary)
+    verified_count = len(verified_leads)
+    rejected_count = len(rejected_leads)
+
+    logger.info(f"[HUNT] Pipeline complete: Scraped: {scraped_count} | Verified: {verified_count} | Rejected: {rejected_count}")
+
+    if verified_count > 0:
+        msg = f"Hunt & Verify executed for {country} ({niche}). {scraped_count} scraped, {verified_count} verified leads queued in Approval Gate."
+    elif scraped_count > 0:
+        msg = f"Hunt scraped {scraped_count} candidate leads, but 0 passed zero-bounce verification. Check hygiene diagnostics."
+    else:
+        msg = f"Hunt completed. 0 candidate leads found for {niche} in {city_override}, {country}. Provide target domains or refine regional keywords."
 
     return {
         "status": "COMPLETED",
         "target": {"country": country, "niche": niche, "city": city_override},
-        "scraped_count": len(scraped_leads),
-        "verified_count": len(verified_leads),
-        "leads_preserved_count": len(verified_leads),
-        "leads_rejected_count": len(scraped_leads),
-        "scraped_leads": scraped_leads,
+        "scraped_count": scraped_count,
+        "verified_count": verified_count,
+        "leads_preserved_count": verified_count,
+        "leads_rejected_count": rejected_count,
+        "scraped_leads": scraped_leads_summary,
         "verified_leads": verified_leads,
+        "rejected_leads": rejected_leads,
         "processed_leads": verified_leads,
-        "message": f"Hunt & Verify executed for {country} ({niche}). {len(verified_leads)} verified leads queued in Approval Gate." if verified_leads else "Hunt completed. 0 candidate leads found. Provide target domains or refine regional keywords."
+        "message": msg
     }
 
 

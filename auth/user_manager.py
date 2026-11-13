@@ -406,9 +406,8 @@ class UserManager:
             # 4. Enforce Device Lock (Cloud-Safe)
             import os
             host_device = client_machine_id or generate_machine_fingerprint()["machine_id"]
-            is_cloud_env = bool(os.environ.get("PORT") or os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("NEXUS_CLOUD_MODE", "1") == "1")
-            enforce_strict_device_lock = bool(os.environ.get("NEXUS_ENFORCE_DEVICE_LOCK", "0") in ("1", "true"))
-            if row["device_lock_enabled"] == 1 and not is_cloud_env and enforce_strict_device_lock:
+            is_cloud_env = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("NEXUS_CLOUD_MODE") == "1")
+            if row["device_lock_enabled"] == 1 and not is_cloud_env:
                 registered_device = row["device_lock_id"]
                 if not registered_device:
                     # Bind on first login

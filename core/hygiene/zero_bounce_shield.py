@@ -4,8 +4,11 @@ Hygiene Engine: Zero-Bounce 3-Stage Hygiene Shield
 Stage 1: RFC 5322 Syntax Validation & Disposable Domain Shield
 Stage 2: DNS MX Record Verification & Null-MX Detection
 Stage 3: Silent SMTP Ping Test (Zero-Send Handshake HELO/MAIL FROM/RCPT TO)
+Adapted for cloud/container environments (Railway, Render, AWS) with port 25 restriction handling.
 """
 
+import logging
+import os
 import re
 import socket
 import smtplib
@@ -14,6 +17,8 @@ import dns.resolver
 
 from ..models import HygieneReport, HygieneStatus
 from database.db_engine import get_db_engine
+
+logger = logging.getLogger("nexus.hygiene")
 
 # RFC 5322 Compliant Email Regex
 EMAIL_SYNTAX_PATTERN = re.compile(
@@ -42,9 +47,12 @@ class ZeroBounceHygieneShield:
     Eliminates bounced, dead, or non-existent email addresses before outreach.
     """
 
+    _port_25_probe_checked: Optional[bool] = None
+    _port_25_available: bool = False
+
     def __init__(
         self,
-        smtp_timeout: float = 5.0,
+        smtp_timeout: float = 3.0,
         helo_hostname: str = "nexus-pulse.huddair.io",
         log_to_db: bool = True
     ):
@@ -52,6 +60,47 @@ class ZeroBounceHygieneShield:
         self.helo_hostname = helo_hostname
         self.log_to_db = log_to_db
         self.db = get_db_engine() if log_to_db else None
+
+    @classmethod
+    def is_port_25_available(cls, timeout: float = 1.5) -> bool:
+        """
+        Fast cached pre-check to determine if outbound SMTP port 25 is permitted by hosting network.
+        Cloud container environments like Railway, AWS, and GCP restrict outbound port 25.
+        """
+        if cls._port_25_probe_checked is not None:
+            return cls._port_25_available
+
+        # Check cloud environment indicators
+        is_cloud = bool(
+            os.environ.get("RAILWAY_ENVIRONMENT") or
+            os.environ.get("RAILWAY_PROJECT_ID") or
+            os.environ.get("PORT") or
+            os.environ.get("NEXUS_CLOUD_MODE") == "1"
+        )
+        if is_cloud:
+            cls._port_25_probe_checked = True
+            cls._port_25_available = False
+            logger.info("[HYGIENE] Cloud environment detected (Railway/container). Outbound SMTP port 25 is restricted by host policy.")
+            return False
+
+        # Fast socket probe on local or unblocked environments
+        test_hosts = ["gmail-smtp-in.l.google.com", "smtp.gmail.com"]
+        for th in test_hosts:
+            try:
+                with socket.create_connection((th, 25), timeout=timeout):
+                    cls._port_25_probe_checked = True
+                    cls._port_25_available = True
+                    logger.info("[HYGIENE] Outbound SMTP port 25 verified accessible.")
+                    return True
+            except (socket.timeout, TimeoutError, ConnectionRefusedError, OSError):
+                continue
+            except Exception:
+                continue
+
+        cls._port_25_probe_checked = True
+        cls._port_25_available = False
+        logger.info("[HYGIENE] Outbound SMTP port 25 is closed or restricted by local network firewall.")
+        return False
 
     # ---------------------------------------------------------
     # STAGE 1: Syntax & Disposable Email Verification
@@ -96,8 +145,8 @@ class ZeroBounceHygieneShield:
 
         try:
             resolver = dns.resolver.Resolver()
-            resolver.timeout = 4.0
-            resolver.lifetime = 4.0
+            resolver.timeout = 3.5
+            resolver.lifetime = 3.5
             answers = resolver.resolve(clean_domain, "MX")
 
             # Sort by MX preference (lowest preference number first)
@@ -140,45 +189,91 @@ class ZeroBounceHygieneShield:
     ) -> Tuple[Optional[bool], Optional[int], str]:
         """
         Executes a zero-send SMTP probe (HELO -> MAIL FROM -> RCPT TO -> RSET/QUIT).
+        Handles cloud environment restrictions (port 25 blocked) and server IP reputation blocks.
         Returns: (is_deliverable: Optional[bool], smtp_code: Optional[int], message: str)
         """
         clean_email = email.strip().lower()
 
-        try:
-            # Connect on standard SMTP port 25 with short timeout
-            server = smtplib.SMTP(timeout=self.smtp_timeout)
-            server.connect(mx_host, 25)
-            server.helo(self.helo_hostname)
-            server.mail(f"probe@{self.helo_hostname}")
+        # Check if outbound port 25 is available
+        if not self.is_port_25_available():
+            msg = "Cloud environment: Outbound port 25 restricted by hosting network. High deliverability confidence via verified DNS MX records."
+            logger.debug(f"[HYGIENE S3] Port 25 restricted for {clean_email}: {msg}")
+            return None, None, msg
 
-            # RCPT TO is the critical mailbox existence test
+        effective_timeout = min(self.smtp_timeout, 2.5)
+
+        # Resolve authentic HELO hostname
+        helo = self.helo_hostname
+        if "huddair.io" in helo:
+            try:
+                fqdn = socket.getfqdn()
+                if fqdn and "." in fqdn:
+                    helo = fqdn
+                else:
+                    domain_part = clean_email.split("@")[1]
+                    helo = f"mail.{domain_part}"
+            except Exception:
+                helo = "mail.gmail.com"
+
+        try:
+            server = smtplib.SMTP(timeout=effective_timeout)
+            server.connect(mx_host, 25)
+            server.helo(helo)
+            server.mail(f"probe@{helo}")
+
+            # RCPT TO is the mailbox existence test
             code, resp_bytes = server.rcpt(clean_email)
             resp_msg = resp_bytes.decode("utf-8", errors="ignore").strip()
 
-            # Clean exit without sending data
             try:
                 server.rset()
                 server.quit()
             except Exception:
                 pass
 
-            # Status code evaluation
+            logger.info(f"[HYGIENE S3] Response for {clean_email} on {mx_host}: {code} - {resp_msg}")
+
             if code in (250, 251):
                 return True, code, f"SMTP Ping SUCCESS ({code}): Mailbox exists and accepts mail. Details: {resp_msg}"
-            elif code in (550, 551, 552, 553, 554, 501):
-                return False, code, f"DEAD ADDRESS REJECTED ({code}): Recipient address rejected by mail server ({resp_msg})"
-            elif code == 450 or code == 451:
+            elif code in (450, 451):
                 return True, code, f"Greylisted / Rate-limited ({code}): Mailbox likely valid but deferred ({resp_msg})"
+            elif code in (550, 551, 552, 553, 554, 501):
+                resp_lower = resp_msg.lower()
+                # Check if server blocked the connection/IP rather than the mailbox
+                is_policy_block = any(k in resp_lower for k in [
+                    "spamhaus", "blacklist", "block", "reputation", "relay",
+                    "policy", "prohibition", "denied", "unavailable", "ptr",
+                    "dnsbl", "client host", "helo", "administrative", "spf", "dmarc"
+                ])
+                if is_policy_block:
+                    logger.warning(f"[HYGIENE S3] Server policy block on probe for {clean_email} ({code}): {resp_msg}")
+                    return None, code, f"SMTP probe deferred by server policy/IP reputation ({code}): {resp_msg}"
+
+                # Actual dead mailbox check
+                is_dead_mailbox = any(k in resp_lower for k in [
+                    "user unknown", "no such user", "mailbox not found", "recipient unknown",
+                    "invalid recipient", "does not exist", "undeliverable", "unknown user",
+                    "recipient rejected", "not found"
+                ])
+                if is_dead_mailbox:
+                    logger.warning(f"[HYGIENE S3] Mailbox rejected as dead for {clean_email} ({code}): {resp_msg}")
+                    return False, code, f"DEAD ADDRESS REJECTED ({code}): Recipient address rejected by mail server ({resp_msg})"
+
+                return None, code, f"Indeterminate SMTP response code {code}: {resp_msg}"
             else:
                 return None, code, f"Indeterminate SMTP response code {code}: {resp_msg}"
 
         except (socket.timeout, TimeoutError):
+            logger.info(f"[HYGIENE S3] Connection timed out to {mx_host}:25 (port 25 blocked by network)")
             return None, None, f"SMTP connection timed out connecting to {mx_host}:25 (likely port 25 blocked by local network)"
         except (ConnectionRefusedError, OSError) as os_err:
+            logger.info(f"[HYGIENE S3] Connection refused on port 25 for {mx_host}: {os_err}")
             return None, None, f"SMTP connection refused on port 25 for {mx_host}: {str(os_err)}"
         except smtplib.SMTPServerDisconnected:
+            logger.info(f"[HYGIENE S3] SMTP server disconnected prematurely from {mx_host}")
             return None, None, f"SMTP server disconnected prematurely from {mx_host}"
         except Exception as ex:
+            logger.warning(f"[HYGIENE S3] SMTP probe error for {clean_email} on {mx_host}: {ex}")
             return None, None, f"SMTP probe error: {str(ex)}"
 
     # ---------------------------------------------------------
@@ -199,6 +294,7 @@ class ZeroBounceHygieneShield:
         if not s1_valid or is_disposable:
             report.status = HygieneStatus.SYNTAX_INVALID
             report.smtp_diagnostic_message = s1_msg
+            logger.info(f"[HYGIENE] {clean_email} failed Stage 1: {s1_msg}")
             self._record_audit(report)
             return report
 
@@ -211,6 +307,7 @@ class ZeroBounceHygieneShield:
         if not s2_valid or not mx_hosts:
             report.status = HygieneStatus.DOMAIN_NO_MX
             report.smtp_diagnostic_message = s2_msg
+            logger.info(f"[HYGIENE] {clean_email} failed Stage 2 (MX): {s2_msg}")
             self._record_audit(report)
             return report
 
@@ -226,9 +323,10 @@ class ZeroBounceHygieneShield:
         elif s3_valid is True:
             report.status = HygieneStatus.VERIFIED
         else:
-            # Indeterminate (e.g. port 25 blocked locally) - retains high MX confidence
+            # Indeterminate (e.g. port 25 blocked in cloud) - retains high MX confidence
             report.status = HygieneStatus.SMTP_INDETERMINATE
 
+        logger.info(f"[HYGIENE] Completed {clean_email} -> {report.status.value} (S1: {s1_valid}, S2: {s2_valid}, S3: {s3_valid})")
         self._record_audit(report)
         return report
 
@@ -254,8 +352,8 @@ class ZeroBounceHygieneShield:
                     report.smtp_diagnostic_message or ""
                 ))
                 conn.commit()
-        except Exception:
-            pass
+        except Exception as ex:
+            logger.debug(f"[HYGIENE] Failed to record hygiene audit: {ex}")
 
 
 _global_hygiene_shield = None

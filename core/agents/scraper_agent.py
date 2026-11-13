@@ -3,10 +3,13 @@ H.Huddair's Nexus-Pulse - Level 1
 Agent Module: Deep Scraper & Tech-Stack Detector
 Extracts contact emails, phones, addresses, and full tech-stack footprints from target domains.
 Prioritizes high-value estimating & tender contacts over generic mailboxes.
+Supports autonomous multi-engine search discovery and deep subpage contact extraction.
 """
 
 import html
+import logging
 import re
+import urllib.parse
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
@@ -14,6 +17,8 @@ import httpx
 
 from ..models import Lead, TechStack, EmailTier, ScrapedEmail
 from .priority_finder import PriorityEmailFinder
+
+logger = logging.getLogger("nexus.scraper")
 
 # Regex for email detection including mailto: and obfuscation
 EMAIL_REGEX = re.compile(
@@ -25,13 +30,35 @@ PHONE_REGEX = re.compile(
     r'(?:\+?\d{1,4}[-.\s]?)?(?:\(?\d{2,5}\)?[-.\s]?)?\d{3,5}[-.\s]?\d{3,5}'
 )
 
+# Realistic modern browser headers preventing cloud bot blocks
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9,de;q=0.8,fr;q=0.7",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+    "Accept-Language": "en-US,en;q=0.9,de;q=0.8,fr;q=0.7,es;q=0.6",
+    "Accept-Encoding": "gzip, deflate",
     "DNT": "1",
-    "Connection": "keep-alive"
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1"
 }
+
+# Subpage anchor keywords to crawl when landing page has no emails
+CONTACT_SUBPAGE_KEYWORDS = [
+    "kontakt", "contact", "impressum", "about", "ueber-uns", "uber-uns",
+    "ansprechpartner", "team", "mentions", "mentions-legales", "legal",
+    "contacto", "contatti", "contacts", "direction", "firmensitz", "standort"
+]
+
+COMMON_SUBPATHS = [
+    "/kontakt", "/kontakt/", "/impressum", "/impressum/",
+    "/contact", "/contact/", "/about", "/about-us", "/ueber-uns"
+]
 
 
 class TechStackDetector:
@@ -111,9 +138,159 @@ class TechStackDetector:
         return stack
 
 
+class SearchDiscoveryAgent:
+    """
+    Autonomous B2B Search Discovery Engine.
+    Discovers candidate target domains and URLs across search engines
+    (DuckDuckGo Lite, DuckDuckGo HTML, and Bing fallback) using localized native queries.
+    """
+
+    DISCARD_DOMAINS = {
+        "google.", "duckduckgo.", "bing.", "yahoo.", "microsoft.",
+        "facebook.", "instagram.", "twitter.", "x.com", "linkedin.",
+        "youtube.", "wikipedia.", "reddit.", "amazon.", "apple.",
+        "github.", "pinterest.", "tiktok.", "medium.", "quora.",
+        "tripadvisor.", "yelp.", "w3schools.", "stackoverflow.", "t.me"
+    }
+
+    def __init__(self, timeout_seconds: float = 10.0):
+        self.timeout = timeout_seconds
+
+    @classmethod
+    def clean_candidate_url(cls, raw_url: str) -> Optional[str]:
+        """Validates and unpacks wrapped search result links."""
+        if not raw_url:
+            return None
+
+        # Handle DDG redirect /uddg=
+        if "uddg=" in raw_url:
+            raw_url = urllib.parse.unquote(raw_url.split("uddg=")[1].split("&")[0])
+
+        # Handle Bing redirect /ck/a?!...&u=a1<base64>
+        if "bing.com/ck/a" in raw_url and "u=a1" in raw_url:
+            try:
+                import base64
+                u_param = raw_url.split("u=a1")[1].split("&")[0]
+                raw_url = base64.urlsafe_b64decode(u_param + "==").decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+
+        if not raw_url.startswith("http://") and not raw_url.startswith("https://"):
+            return None
+
+        parsed = urlparse(raw_url)
+        domain = parsed.netloc.lower().replace("www.", "")
+        if not domain or any(d in domain for d in cls.DISCARD_DOMAINS):
+            return None
+
+        # Return root domain website URL
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    @classmethod
+    def sanitize_search_query(cls, query: str) -> str:
+        """Strips nested quotes, boolean OR, and site: operators that cause search engines to return 0 results."""
+        cleaned = re.sub(r'[\(\)"]', '', query)
+        cleaned = re.sub(r'\bOR\b', '', cleaned)
+        cleaned = re.sub(r'site:\S+', '', cleaned)
+        cleaned = " ".join(cleaned.split())
+        return cleaned
+
+    async def discover_candidate_urls(
+        self,
+        queries: List[Dict[str, str]],
+        limit: int = 20,
+        country: str = "Germany",
+        city: str = "Berlin",
+        niche: str = "Commercial Construction"
+    ) -> List[str]:
+        """
+        Queries search engines using localized query matrices and returns unique candidate website URLs.
+        """
+        discovered_urls: List[str] = []
+        seen_domains: Set[str] = set()
+
+        async with httpx.AsyncClient(
+            headers=DEFAULT_HEADERS,
+            timeout=self.timeout,
+            follow_redirects=True,
+            verify=False
+        ) as client:
+            for q_item in queries:
+                raw_q = q_item.get("query", "")
+                q_type = q_item.get("type", "GENERAL")
+                clean_q = self.sanitize_search_query(raw_q)
+                if not clean_q:
+                    continue
+
+                logger.info(f"[DISCOVERY] Executing search query [{q_type}]: '{clean_q}'")
+                found_links: List[str] = []
+
+                # Strategy 1: DuckDuckGo Lite (POST)
+                try:
+                    resp = await client.post("https://lite.duckduckgo.com/lite/", data={"q": clean_q})
+                    if resp.status_code == 200:
+                        soup = BeautifulSoup(resp.text, "html.parser")
+                        for a_tag in soup.select(".result-link"):
+                            href = a_tag.get("href", "")
+                            u = self.clean_candidate_url(href)
+                            if u:
+                                found_links.append(u)
+                        logger.info(f"[DISCOVERY] DDG Lite returned {len(found_links)} candidate links for '{clean_q}'")
+                    else:
+                        logger.warning(f"[DISCOVERY] DDG Lite returned status {resp.status_code} for '{clean_q}'")
+                except Exception as ex:
+                    logger.warning(f"[DISCOVERY] DDG Lite request error for '{clean_q}': {ex}")
+
+                # Strategy 2: DuckDuckGo HTML Fallback (GET/POST)
+                if not found_links:
+                    try:
+                        resp = await client.get("https://html.duckduckgo.com/html/", params={"q": clean_q})
+                        if resp.status_code == 200:
+                            soup = BeautifulSoup(resp.text, "html.parser")
+                            for a_tag in soup.select("h2.result__title a, a.result__url"):
+                                href = a_tag.get("href", "")
+                                u = self.clean_candidate_url(href)
+                                if u:
+                                    found_links.append(u)
+                            logger.info(f"[DISCOVERY] DDG HTML returned {len(found_links)} candidate links for '{clean_q}'")
+                        else:
+                            logger.warning(f"[DISCOVERY] DDG HTML returned status {resp.status_code} for '{clean_q}'")
+                    except Exception as ex:
+                        logger.warning(f"[DISCOVERY] DDG HTML request error for '{clean_q}': {ex}")
+
+                # Strategy 3: Bing Search Fallback
+                if not found_links:
+                    try:
+                        resp = await client.get("https://www.bing.com/search", params={"q": clean_q})
+                        if resp.status_code == 200:
+                            soup = BeautifulSoup(resp.text, "html.parser")
+                            for a_tag in soup.select("li.b_algo h2 a"):
+                                href = a_tag.get("href", "")
+                                u = self.clean_candidate_url(href)
+                                if u:
+                                    found_links.append(u)
+                            logger.info(f"[DISCOVERY] Bing fallback returned {len(found_links)} candidate links for '{clean_q}'")
+                    except Exception as ex:
+                        logger.warning(f"[DISCOVERY] Bing fallback request error for '{clean_q}': {ex}")
+
+                # Deduplicate and register found domains
+                for u in found_links:
+                    domain = urlparse(u).netloc.replace("www.", "").lower()
+                    if domain and domain not in seen_domains:
+                        seen_domains.add(domain)
+                        discovered_urls.append(u)
+
+                if len(discovered_urls) >= limit:
+                    break
+
+        logger.info(f"[DISCOVERY] Finished discovery run: {len(discovered_urls)} unique candidate domains found.")
+        return discovered_urls[:limit]
+
+
 class DeepScraperAgent:
     """
-    Scraper Agent equipped with Tech-Stack Detection and Priority Contact Extraction.
+    Scraper Agent equipped with Tech-Stack Detection, Priority Contact Extraction,
+    and Deep Contact Subpage Crawling.
     """
 
     def __init__(self, timeout_seconds: float = 12.0):
@@ -157,7 +334,7 @@ class DeepScraperAgent:
             # Basic hygiene
             if "@" in clean_match and "." in clean_match.split("@")[-1]:
                 # Exclude image/asset false positives
-                if not any(clean_match.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif"]):
+                if not any(clean_match.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".css", ".js"]):
                     emails_found.add(clean_match)
 
         if not emails_found:
@@ -179,7 +356,6 @@ class DeepScraperAgent:
         title_tag = soup.find("title")
         if title_tag and title_tag.text:
             raw_title = title_tag.text.strip()
-            # Remove tagline after delimiters (|, -, –, :)
             split_parts = re.split(r'[\|\-\–\:\•]', raw_title)
             company_name = split_parts[0].strip()
 
@@ -243,9 +419,15 @@ class DeepScraperAgent:
         city: str = "Berlin",
         niche: str = "Commercial Construction"
     ) -> Optional[Lead]:
-        """Asynchronously scrapes target live URL with browser emulation."""
-        if not url.startswith("http"):
-            url = f"https://{url}"
+        """
+        Asynchronously scrapes target live URL with modern browser headers, SSL fallback,
+        and automatic contact/impressum subpage crawling.
+        """
+        target_url = url.strip()
+        if not target_url.startswith("http://") and not target_url.startswith("https://"):
+            target_url = f"https://{target_url}"
+
+        logger.info(f"[SCRAPER] Target URL initiated: {target_url}")
 
         try:
             async with httpx.AsyncClient(
@@ -254,18 +436,95 @@ class DeepScraperAgent:
                 follow_redirects=True,
                 verify=False
             ) as client:
-                resp = await client.get(url)
-                if resp.status_code < 400:
-                    headers_dict = dict(resp.headers)
-                    return self.parse_html_content(
-                        html_content=resp.text,
-                        source_url=str(resp.url),
-                        country=country,
-                        city=city,
-                        niche=niche,
-                        headers=headers_dict
-                    )
-        except Exception:
-            pass
+                resp = None
+                try:
+                    resp = await client.get(target_url)
+                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, Exception) as fetch_err:
+                    logger.warning(f"[SCRAPER] Initial GET failed for {target_url} ({type(fetch_err).__name__}: {fetch_err})")
+                    # Try http:// fallback if https:// failed
+                    if target_url.startswith("https://"):
+                        fallback_url = "http://" + target_url[8:]
+                        logger.info(f"[SCRAPER] Attempting HTTP fallback for {fallback_url}")
+                        try:
+                            resp = await client.get(fallback_url)
+                        except Exception as fb_err:
+                            logger.warning(f"[SCRAPER] HTTP fallback failed for {fallback_url}: {fb_err}")
 
-        return None
+                if not resp or resp.status_code >= 400:
+                    status_code = resp.status_code if resp else "NO_RESPONSE"
+                    logger.warning(f"[SCRAPER] Target {target_url} returned non-success status: {status_code}")
+                    return None
+
+                base_url = str(resp.url)
+                base_domain = urlparse(base_url).netloc.replace("www.", "").lower()
+                headers_dict = dict(resp.headers)
+
+                # Attempt 1: Parse root page HTML
+                lead = self.parse_html_content(
+                    html_content=resp.text,
+                    source_url=base_url,
+                    country=country,
+                    city=city,
+                    niche=niche,
+                    headers=headers_dict
+                )
+
+                if lead and lead.all_emails:
+                    logger.info(f"[SCRAPER] Root page hit on {target_url}: found {len(lead.all_emails)} email(s) (Primary: {lead.primary_email})")
+                    return lead
+
+                # Attempt 2: If root landing page has no emails, crawl contact & impressum subpages
+                logger.info(f"[SCRAPER] No emails on root of {target_url}. Discovering contact & impressum subpages...")
+                soup = BeautifulSoup(resp.text, "html.parser")
+                candidate_subpages: List[str] = []
+
+                # Scan anchor links on page
+                for a_tag in soup.find_all("a", href=True):
+                    href = a_tag["href"].strip()
+                    text = a_tag.get_text(strip=True).lower()
+                    href_lower = href.lower()
+
+                    if any(kw in href_lower or kw in text for kw in CONTACT_SUBPAGE_KEYWORDS):
+                        full_sub_url = urljoin(base_url, href)
+                        sub_domain = urlparse(full_sub_url).netloc.replace("www.", "").lower()
+                        # Ensure subpage belongs to same company domain
+                        if sub_domain == base_domain and full_sub_url not in candidate_subpages and full_sub_url != base_url:
+                            candidate_subpages.append(full_sub_url)
+
+                # If no matching links found in DOM, test standard regional subpaths
+                if len(candidate_subpages) < 2:
+                    for sp in COMMON_SUBPATHS:
+                        guess_url = urljoin(base_url, sp)
+                        if guess_url not in candidate_subpages and guess_url != base_url:
+                            candidate_subpages.append(guess_url)
+
+                logger.info(f"[SCRAPER] Discovered {len(candidate_subpages)} contact subpages for {base_domain}: {candidate_subpages[:3]}")
+
+                # Crawl top 3 subpages for business contacts
+                for sub_url in candidate_subpages[:3]:
+                    try:
+                        sub_resp = await client.get(sub_url)
+                        if sub_resp.status_code < 400:
+                            sub_lead = self.parse_html_content(
+                                html_content=sub_resp.text,
+                                source_url=str(sub_resp.url),
+                                country=country,
+                                city=city,
+                                niche=niche,
+                                headers=dict(sub_resp.headers)
+                            )
+                            if sub_lead and sub_lead.all_emails:
+                                logger.info(f"[SCRAPER] Contact subpage {sub_url} resolved {len(sub_lead.all_emails)} email(s) for {base_domain} (Primary: {sub_lead.primary_email})")
+                                # Retain root company name if subpage is generic (e.g. "Impressum")
+                                if lead and lead.company_name and len(lead.company_name) > 3:
+                                    sub_lead.company_name = lead.company_name
+                                return sub_lead
+                    except Exception as sub_err:
+                        logger.debug(f"[SCRAPER] Subpage fetch error for {sub_url}: {sub_err}")
+
+                logger.warning(f"[SCRAPER] Discarding {target_url}: 0 business emails found after scanning root and contact subpages.")
+                return None
+
+        except Exception as ex:
+            logger.error(f"[SCRAPER] Unexpected scraping error for {target_url}: {type(ex).__name__} - {ex}", exc_info=False)
+            return None
