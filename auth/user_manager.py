@@ -661,6 +661,37 @@ class UserManager:
                 "message": "Password successfully reset with Bcrypt encryption."
             }
 
+    def delete_operator_account(self, user_id: str) -> Dict[str, Any]:
+        """
+        Permanently deletes an operator account.
+        Enforces strict protection: Master Administrator accounts cannot be deleted.
+        Revokes active sessions and clears user record while preserving production data.
+        """
+        with self.db.get_connection() as conn:
+            row = conn.execute("SELECT id, username, role, full_name FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not row:
+                raise ValueError(f"Operator user with ID '{user_id}' not found.")
+            if row["role"] == "admin":
+                raise PermissionError("Forbidden: Master Administrator accounts cannot be deleted.")
+
+            username = row["username"]
+            # 1. Invalidate active operator sessions
+            try:
+                conn.execute("DELETE FROM user_sessions WHERE user_id = ?", (user_id,))
+            except Exception:
+                pass
+
+            # 2. Delete user record
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            conn.commit()
+
+            return {
+                "success": True,
+                "deleted_id": user_id,
+                "username": username,
+                "message": f"Operator '{username}' was permanently removed."
+            }
+
     # -------------------------------------------------------------
     # REQUIREMENT 3: License & Expiry Control Module
     # -------------------------------------------------------------

@@ -181,7 +181,7 @@ class TestNexusPulseLevel2(unittest.TestCase):
     # 5. Time-Zone Smart Scheduler & Inbox Rotator
     # -------------------------------------------------------------
     def test_05_timezone_scheduler_and_inbox_rotator(self):
-        """Tests 9-11 AM office hours calculation and 40-50/day mailbox limits."""
+        """Tests dynamic 9-5 working hours calculation and 40-50/day mailbox limits."""
         # Timezone scheduler
         tz_de = self.scheduler.get_target_local_time("Germany")
         self.assertEqual(tz_de["timezone_code"], "CET")

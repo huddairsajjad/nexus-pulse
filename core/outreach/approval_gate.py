@@ -289,6 +289,94 @@ class HumanApprovalGate:
                 "followup_scheduled_for_days": 7
             }
 
+    def dispatch_ready_queue(
+        self,
+        bypass_window: bool = False,
+        operator_id: Optional[str] = None,
+        limit: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """
+        Dispatches all approved or scheduled outreach leads whose target local window
+        is currently active (9:00 AM - 5:00 PM local time on weekdays) OR if bypass_window is True.
+        """
+        with self.db.get_connection() as conn:
+            query = """
+                SELECT id, target_country, recipient, status, operator_id, scheduled_for
+                FROM outreach_queue
+                WHERE status IN ('APPROVED', 'SCHEDULED')
+            """
+            params: List[Any] = []
+            if operator_id:
+                query += " AND (operator_id = ? OR operator_id IS NULL)"
+                params.append(operator_id)
+            query += " ORDER BY created_at ASC"
+            if limit:
+                query += f" LIMIT {int(limit)}"
+
+            rows = conn.execute(query, params).fetchall()
+
+        dispatched = []
+        scheduled = []
+        errors = []
+
+        for r in rows:
+            q_id = r["id"]
+            country = r["target_country"]
+            recipient = r["recipient"]
+            domain = recipient.split("@")[-1] if recipient and "@" in recipient else None
+
+            # Check if within local working hours
+            tz_eval = self.scheduler.get_target_local_time(country=country, domain=domain, bypass_window=bypass_window)
+
+            if tz_eval["is_in_send_window"]:
+                # Attempt dispatch
+                try:
+                    res = self.dispatch_approved_outreach(q_id, operator_id=r["operator_id"])
+                    if res.get("success"):
+                        dispatched.append({
+                            "queue_id": q_id,
+                            "recipient": recipient,
+                            "dispatched_via": res.get("dispatched_via")
+                        })
+                    else:
+                        errors.append({
+                            "queue_id": q_id,
+                            "reason": res.get("reason", "DISPATCH_FAILED"),
+                            "message": res.get("message")
+                        })
+                        if res.get("reason") == "ALL_MAILBOXES_AT_CAPACITY":
+                            # Stop attempting remaining dispatches if mailboxes are full
+                            break
+                except Exception as e:
+                    errors.append({"queue_id": q_id, "reason": "EXCEPTION", "message": str(e)})
+            else:
+                # Update scheduled_for to next valid window
+                next_slot = self.scheduler.calculate_next_send_slot(country=country, domain=domain, bypass_window=False)
+                with self.db.get_connection() as conn:
+                    conn.execute("""
+                        UPDATE outreach_queue
+                        SET status = 'SCHEDULED', scheduled_for = ?
+                        WHERE id = ? AND status = 'APPROVED'
+                    """, (next_slot.isoformat(), q_id))
+                    conn.commit()
+                scheduled.append({
+                    "queue_id": q_id,
+                    "recipient": recipient,
+                    "scheduled_for": next_slot.isoformat(),
+                    "target_country": country
+                })
+
+        return {
+            "success": True,
+            "dispatched_count": len(dispatched),
+            "scheduled_count": len(scheduled),
+            "error_count": len(errors),
+            "dispatched_items": dispatched,
+            "scheduled_items": scheduled,
+            "errors": errors,
+            "bypass_window": bypass_window
+        }
+
     def get_pending_approvals(self, operator_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Lists items held in the approval gate, filtered by tenant."""
         with self.db.get_connection() as conn:

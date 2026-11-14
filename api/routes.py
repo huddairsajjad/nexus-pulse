@@ -36,6 +36,7 @@ from auth.user_manager import get_user_manager
 from auth.jwt_handler import decode_access_token
 from core.outreach.approval_gate import get_approval_gate
 from core.outreach.scheduler import get_scheduler
+from core.outreach.dispatcher_worker import get_dispatcher_worker
 from core.outreach.inbox_rotator import get_inbox_rotator
 from core.outreach.reply_listener import get_reply_listener
 from core.outreach.template_manager import get_template_manager
@@ -143,6 +144,16 @@ class DispatchHotReplyRequest(BaseModel):
     reply_id: str
     recipient: str
     response_body: str
+
+
+class ToggleBypassRequest(BaseModel):
+    bypass_window: bool = True
+
+
+class DispatchNowRequest(BaseModel):
+    bypass_window: Optional[bool] = True
+    queue_id: Optional[str] = None
+    limit: Optional[int] = None
 
 
 class SimulateReplyRequest(BaseModel):
@@ -365,6 +376,20 @@ def update_operator_quotas(user_id: str, req: ModifyQuotaRequest, admin_user: Di
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/operators/{user_id}")
+def delete_operator(user_id: str, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Permanently deletes an operator account. Master Administrator only."""
+    um = get_user_manager()
+    try:
+        return um.delete_operator_account(user_id)
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
+    except ValueError as ve:
+        raise HTTPException(status_code=404, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # -------------------------------------------------------------
@@ -762,8 +787,15 @@ def reject_outreach_item(req: RejectOutreachRequest, current_user: Dict[str, Any
 
 
 @router.post("/outreach/dispatch/{queue_id}")
-def dispatch_approved_item(queue_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dispatches approved outreach item using an enrolled mailbox belonging to the operator."""
+def dispatch_approved_item(
+    queue_id: str,
+    bypass_window: Optional[bool] = Query(True),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Dispatches approved outreach item using an enrolled mailbox.
+    Supports bypass_window for immediate manual dispatch outside regional business hours.
+    """
     gate = get_approval_gate()
     target_op = current_user["id"] if current_user.get("role") == "operator" else None
     try:
@@ -772,14 +804,111 @@ def dispatch_approved_item(queue_id: str, current_user: Dict[str, Any] = Depends
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.post("/outreach/dispatch-now")
+def dispatch_now_trigger(
+    req: Optional[DispatchNowRequest] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Manual / Weekend Override Trigger:
+    Forces immediate queue dispatch across all eligible leads, bypassing regional window restrictions.
+    Admin can trigger globally; Operators trigger for their tenant leads.
+    """
+    gate = get_approval_gate()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    effective_bypass = True if req is None or req.bypass_window is None else bool(req.bypass_window)
+    limit = req.limit if req else None
+
+    if req and req.queue_id:
+        try:
+            res = gate.dispatch_approved_outreach(req.queue_id, operator_id=target_op)
+            return {
+                "success": True,
+                "dispatched_count": 1 if res.get("success") else 0,
+                "items": [res],
+                "bypass_window": effective_bypass
+            }
+        except (ValueError, PermissionError) as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    return gate.dispatch_ready_queue(bypass_window=effective_bypass, operator_id=target_op, limit=limit)
+
+
+@router.get("/dispatcher/status")
+def get_dispatcher_status(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Provides live telemetry and status of the background dispatch worker."""
+    worker = get_dispatcher_worker()
+    return worker.get_telemetry()
+
+
+@router.post("/dispatcher/toggle-bypass")
+def toggle_dispatcher_bypass(
+    req: ToggleBypassRequest,
+    admin_user: Dict[str, Any] = Depends(require_admin)
+):
+    """Enables or disables 24/7 bypass window mode for the automated background worker."""
+    worker = get_dispatcher_worker()
+    worker.set_bypass_window(req.bypass_window)
+    return {
+        "success": True,
+        "bypass_window": worker.bypass_window,
+        "message": f"Dispatch engine bypass window set to: {worker.bypass_window}"
+    }
+
+
+@router.post("/dispatcher/run-now")
+async def trigger_dispatcher_run_now(
+    req: Optional[DispatchNowRequest] = None,
+    admin_user: Dict[str, Any] = Depends(require_admin)
+):
+    """Triggers an immediate background dispatcher execution cycle."""
+    worker = get_dispatcher_worker()
+    bypass = True if req is None or req.bypass_window is None else bool(req.bypass_window)
+    res = await worker.execute_cycle(bypass_window=bypass)
+    return res
+
+
 @router.get("/scheduler/timezones")
 def get_target_timezone_preview(
-    country: Optional[str] = Query("Germany"),
-    domain: Optional[str] = Query(None)
+    country: Optional[str] = Query(None),
+    domain: Optional[str] = Query(None),
+    bypass_window: bool = Query(False)
 ):
-    """Regional Working Hours Engine: checks current office window for target."""
+    """
+    Regional Working Hours Engine:
+    If a specific country is queried (and not 'all'), returns target local time for that country.
+    If no country or 'all' is requested, returns multi-hub telemetry for live header clocks.
+    """
     scheduler = get_scheduler()
-    return scheduler.get_target_local_time(country=country, domain=domain)
+    if country and country.strip().lower() not in ("all", "", "none"):
+        return scheduler.get_target_local_time(country=country, domain=domain, bypass_window=bypass_window)
+
+    de = scheduler.get_target_local_time("Germany", domain=domain, bypass_window=bypass_window)
+    uk = scheduler.get_target_local_time("United Kingdom", domain=domain, bypass_window=bypass_window)
+    us = scheduler.get_target_local_time("United States", domain=domain, bypass_window=bypass_window)
+    uae = scheduler.get_target_local_time("United Arab Emirates", domain=domain, bypass_window=bypass_window)
+    sg = scheduler.get_target_local_time("Singapore", domain=domain, bypass_window=bypass_window)
+    au = scheduler.get_target_local_time("Australia", domain=domain, bypass_window=bypass_window)
+
+    return {
+        "germany": de,
+        "united_kingdom": uk,
+        "united_states": us,
+        "uae": uae,
+        "singapore": sg,
+        "australia": au,
+        # Default top-level fields for backward compatibility
+        "country": de["country"],
+        "resolved_country": de["resolved_country"],
+        "timezone_code": de["timezone_code"],
+        "utc_offset_hours": de["utc_offset_hours"],
+        "current_local_time": de["current_local_time"],
+        "current_local_hour": de["current_local_hour"],
+        "is_in_send_window": de["is_in_send_window"],
+        "is_weekday": de["is_weekday"],
+        "window_description": de["window_description"],
+        "global_window": "09:00 - 17:00 Local Recipient Time (Mon-Fri)"
+    }
 
 
 # -------------------------------------------------------------

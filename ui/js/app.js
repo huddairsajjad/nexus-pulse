@@ -249,7 +249,9 @@ function NexusPulseApp() {
   // ---------------------------------------------------------------------------
   // CORE TELEMETRY & PIPELINE STATE
   // ---------------------------------------------------------------------------
-  const [pulseState, setPulseState] = useState("IDLE"); // 'IDLE', 'HUNTING', 'HOT_ALERT'
+  const [pulseState, setPulseState] = useState("RUNNING"); // 'RUNNING', 'DISPATCHING', 'HUNTING', 'HOT_ALERT', 'IDLE'
+  const [dispatcherState, setDispatcherState] = useState({ status: "RUNNING", bypass_window: false });
+  const [isDispatchingNow, setIsDispatchingNow] = useState(false);
   const [systemHealth, setSystemHealth] = useState(null);
   const [kanbanItems, setKanbanItems] = useState([]);
   const [pendingApprovals, setPendingApprovals] = useState([]);
@@ -422,25 +424,36 @@ function NexusPulseApp() {
     try {
       const headers = token ? { Authorization: `Bearer ${token}` } : {};
 
-      const [healthRes, kanbanRes, approvalsRes, hotLeadsRes, mailboxesRes, tzRes] = await Promise.all([
+      const [healthRes, kanbanRes, approvalsRes, hotLeadsRes, mailboxesRes, tzRes, dispRes] = await Promise.all([
         fetch(`${API_BASE}/api/health`, { headers }).then(r => r.json()).catch(() => null),
         fetch(`${API_BASE}/api/kanban/leads`, { headers }).then(r => r.json()).catch(() => []),
         fetch(`${API_BASE}/api/outreach/pending`, { headers }).then(r => r.json()).catch(() => []),
         fetch(`${API_BASE}/api/outreach/hot-leads`, { headers }).then(r => r.json()).catch(() => []),
         fetch(`${API_BASE}/api/outreach/mailboxes`, { headers }).then(r => r.json()).catch(() => []),
-        fetch(`${API_BASE}/api/scheduler/timezones`, { headers }).then(r => r.json()).catch(() => ({}))
+        fetch(`${API_BASE}/api/scheduler/timezones`, { headers }).then(r => r.json()).catch(() => ({})),
+        fetch(`${API_BASE}/api/dispatcher/status`, { headers }).then(r => r.json()).catch(() => null)
       ]);
 
       if (healthRes) setSystemHealth(healthRes);
       if (Array.isArray(kanbanRes)) setKanbanItems(kanbanRes);
       if (Array.isArray(approvalsRes)) setPendingApprovals(approvalsRes);
+      if (dispRes) setDispatcherState(dispRes);
+
       if (Array.isArray(hotLeadsRes)) {
         setHotLeads(hotLeadsRes);
         if (hotLeadsRes.length > 0) {
           setPulseState("HOT_ALERT");
-        } else if (pulseState === "HOT_ALERT") {
-          setPulseState("IDLE");
+        } else if (isDispatchingNow || (dispRes && dispRes.status === "DISPATCHING")) {
+          setPulseState("DISPATCHING");
+        } else if (dispRes && dispRes.status === "RUNNING") {
+          setPulseState("RUNNING");
+        } else if (approvalsRes && approvalsRes.length > 0) {
+          setPulseState("RUNNING");
+        } else {
+          setPulseState("RUNNING");
         }
+      } else if (dispRes && dispRes.status) {
+        setPulseState(dispRes.status === "DISPATCHING" ? "DISPATCHING" : "RUNNING");
       }
       if (Array.isArray(mailboxesRes)) setMailboxes(mailboxesRes);
       if (tzRes) setTimezones(tzRes);
@@ -799,7 +812,7 @@ function NexusPulseApp() {
         setSelectedApproval(null);
         setAlertBanner({
           type: "success",
-          message: `Outreach item approved by ${user.username}! Scheduled for 9:00 - 11:00 AM local window.`
+          message: `Outreach item approved by ${user.username}! Timezone-aware dispatch active (9:00 AM - 5:00 PM local window).`
         });
         fetchData();
       } else {
@@ -807,6 +820,70 @@ function NexusPulseApp() {
       }
     } catch (e) {
       alert("Error approving outreach.");
+    }
+  };
+
+  const handleDispatchQueueNow = async (bypassWindow = true, specificQueueId = null) => {
+    setIsDispatchingNow(true);
+    setPulseState("DISPATCHING");
+    try {
+      const resp = await fetch(`${API_BASE}/api/outreach/dispatch-now`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          bypass_window: bypassWindow,
+          queue_id: specificQueueId
+        })
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setAlertBanner({
+          type: "success",
+          message: `⚡ Dispatch Engine Triggered: ${data.dispatched_count || 0} leads dispatched! (${data.scheduled_count || 0} queued for local business hours)`
+        });
+        fetchData();
+      } else {
+        setAlertBanner({
+          type: "danger",
+          message: data.detail || data.message || "Dispatch queue trigger failed."
+        });
+      }
+    } catch (err) {
+      setAlertBanner({
+        type: "danger",
+        message: "Error executing dispatch trigger."
+      });
+    } finally {
+      setIsDispatchingNow(false);
+    }
+  };
+
+  const handleToggleDispatcherBypass = async (enabled) => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/dispatcher/toggle-bypass`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ bypass_window: enabled })
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setDispatcherState(prev => ({ ...prev, bypass_window: enabled }));
+        setAlertBanner({
+          type: "info",
+          message: enabled
+            ? "⚡ Dispatcher Bypass Window ENABLED: 24/7 immediate dispatch active for testing/weekends."
+            : "🕒 Dispatcher Window RESTORED: Standard 9:00 AM - 5:00 PM local recipient business hours active."
+        });
+        fetchData();
+      }
+    } catch (err) {
+      setAlertBanner({ type: "danger", message: "Failed to toggle dispatcher bypass window." });
     }
   };
 
@@ -1059,6 +1136,50 @@ function NexusPulseApp() {
       setAlertBanner({ type: "danger", message: "Error resetting password." });
     } finally {
       setIsResettingPassword(false);
+    }
+  };
+
+  const handleDeleteOperator = async (op) => {
+    if (!op || op.role === "admin") {
+      setAlertBanner({ type: "danger", message: "Master Administrator accounts cannot be deleted." });
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `⚠️ PERMANENT OPERATOR REMOVAL\n\nAre you sure you want to permanently delete operator "${op.username}" (${op.full_name || "Operator"})?\n\nThis will remove their account and revoke license access. All existing leads and pipeline data will remain preserved.`
+    );
+    if (!confirmed) return;
+
+    try {
+      const resp = await fetch(`${API_BASE}/api/operators/${op.id}`, {
+        method: "DELETE",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        }
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setOperatorsList(prev => prev.filter(item => item.id !== op.id));
+        if (expandedOperatorId === op.id) {
+          setExpandedOperatorId(null);
+        }
+        setAlertBanner({
+          type: "success",
+          message: `Operator "${op.username}" was permanently removed.`
+        });
+        fetchData();
+      } else {
+        setAlertBanner({
+          type: "danger",
+          message: data.detail || data.message || "Failed to delete operator account."
+        });
+      }
+    } catch (err) {
+      setAlertBanner({
+        type: "danger",
+        message: "Network error occurred while deleting operator."
+      });
     }
   };
 
@@ -1660,7 +1781,9 @@ function NexusPulseApp() {
           <div
             className={`np-pulse-icon ${
               pulseState === "HOT_ALERT" ? "np-pulse-hot" :
-              pulseState === "HUNTING" ? "np-pulse-hunting" : "np-pulse-idle"
+              pulseState === "DISPATCHING" ? "np-pulse-dispatching" :
+              pulseState === "HUNTING" ? "np-pulse-hunting" :
+              pulseState === "RUNNING" ? "np-pulse-running" : "np-pulse-idle"
             }`}
             title={`Agent Engine State: ${pulseState}`}
           >
@@ -1677,7 +1800,12 @@ function NexusPulseApp() {
               </span>
             </div>
             <div className="flex items-center gap-2 text-[11px] text-theme-muted font-mono">
-              <span>Status: <strong className={pulseState === 'HOT_ALERT' ? 'text-theme-danger' : pulseState === 'HUNTING' ? 'text-theme-success' : 'text-theme-accent'}>{pulseState}</strong></span>
+              <span>Status: <strong className={
+                pulseState === 'HOT_ALERT' ? 'text-theme-danger animate-pulse' :
+                pulseState === 'DISPATCHING' ? 'text-theme-warning animate-pulse' :
+                pulseState === 'HUNTING' ? 'text-theme-success animate-pulse' :
+                'text-theme-accent'
+              }>{pulseState}</strong></span>
               <span>•</span>
               <span className="hidden sm:inline">ID: {systemHealth?.machine_id || "NEXUS-E727"}</span>
             </div>
@@ -1693,7 +1821,7 @@ function NexusPulseApp() {
               {timezones.germany?.current_local_time?.split(" ")[1] || "09:15:00"}
             </span>
             <span className="text-[10px] text-theme-success">
-              [{timezones.germany?.is_in_send_window ? "9-11 AM WINDOW" : "QUEUED"}]
+              [{timezones.germany?.is_in_send_window ? "9 AM - 5 PM WINDOW" : "QUEUED"}]
             </span>
           </div>
           <span className="text-theme-muted">|</span>
@@ -1701,6 +1829,9 @@ function NexusPulseApp() {
             <span className="text-theme-secondary">London (GMT):</span>
             <span className="font-semibold text-theme-primary">
               {timezones.united_kingdom?.current_local_time?.split(" ")[1] || "08:15:00"}
+            </span>
+            <span className="text-[10px] text-theme-success">
+              [{timezones.united_kingdom?.is_in_send_window ? "9 AM - 5 PM WINDOW" : "QUEUED"}]
             </span>
           </div>
         </div>
@@ -2032,21 +2163,42 @@ function NexusPulseApp() {
                 </p>
               </div>
 
-              {user.role === "admin" && pendingApprovals.length > 0 && (
-                <button
-                  onClick={handleBatchApprove}
-                  className="btn btn-warning btn-sm"
-                >
-                  ✓ Batch Authorize All ({pendingApprovals.length})
-                </button>
-              )}
+              <div className="flex items-center gap-2 flex-wrap justify-end">
+                {user.role === "admin" && (
+                  <button
+                    onClick={() => handleToggleDispatcherBypass(!dispatcherState.bypass_window)}
+                    className={`btn btn-sm ${dispatcherState.bypass_window ? "btn-danger" : "btn-secondary"}`}
+                    title="Toggle immediate dispatch override regardless of timezone window or weekends"
+                  >
+                    <span>{dispatcherState.bypass_window ? "⚡ Bypass: 24/7 FORCED" : "🕒 Window: 9-5 Local"}</span>
+                  </button>
+                )}
+                {user.role === "admin" && (
+                  <button
+                    onClick={() => handleDispatchQueueNow(true)}
+                    disabled={isDispatchingNow}
+                    className="btn btn-primary btn-sm flex items-center gap-1.5"
+                    title="Force immediate dispatch of all authorized leads"
+                  >
+                    <span>{isDispatchingNow ? "Dispatching..." : "⚡ Dispatch Now (Bypass Window)"}</span>
+                  </button>
+                )}
+                {user.role === "admin" && pendingApprovals.length > 0 && (
+                  <button
+                    onClick={handleBatchApprove}
+                    className="btn btn-warning btn-sm"
+                  >
+                    ✓ Batch Authorize All ({pendingApprovals.length})
+                  </button>
+                )}
+              </div>
             </div>
 
             {pendingApprovals.length === 0 ? (
               <div className="np-card p-12 text-center">
                 <span className="text-3xl mb-2 block">✓</span>
                 <h3 className="font-semibold text-sm text-theme-primary">Gate Clear: No Pending Outreach</h3>
-                <p className="text-xs text-theme-secondary mt-1">All leads reviewed or dispatched according to 9-11 AM window.</p>
+                <p className="text-xs text-theme-secondary mt-1">All leads reviewed or dispatched according to dynamic 9:00 AM - 5:00 PM local business window.</p>
               </div>
             ) : (
               <div className="space-y-3">
@@ -2077,6 +2229,18 @@ function NexusPulseApp() {
                             className="btn btn-warning btn-sm"
                           >
                             Authorize
+                          </button>
+                        )}
+                        {user.role === "admin" && (
+                          <button
+                            onClick={async () => {
+                              await handleApproveOutreach(item.id, item.subject, item.message_body);
+                              await handleDispatchQueueNow(true, item.id);
+                            }}
+                            className="btn btn-primary btn-sm"
+                            title="Authorize and dispatch immediately outside business hours"
+                          >
+                            ⚡ Authorize & Send Now
                           </button>
                         )}
                       </div>
@@ -2474,7 +2638,7 @@ function NexusPulseApp() {
                   </div>
                   <div className="flex justify-between py-1 text-theme-secondary">
                     <span>Working Hours Window:</span>
-                    <span className="text-theme-accent font-semibold">9-11 AM & 2-5 PM Local Recipient</span>
+                    <span className="text-theme-accent font-semibold">9:00 AM - 5:00 PM Local Recipient (Mon-Fri)</span>
                   </div>
                 </div>
               </div>
@@ -2647,14 +2811,14 @@ function NexusPulseApp() {
                 <table className="np-table">
                   <thead>
                     <tr>
-                      <th style={{ width: "22%" }}>Operator Identity</th>
+                      <th style={{ width: "20%" }}>Operator Identity</th>
                       <th style={{ width: "8%" }}>Role</th>
-                      <th style={{ width: "11%" }}>Access Status</th>
-                      <th style={{ width: "15%" }}>Device Lock</th>
+                      <th style={{ width: "10%" }}>Access Status</th>
+                      <th style={{ width: "14%" }}>Device Lock</th>
                       <th style={{ width: "12%" }}>Daily Quotas</th>
                       <th style={{ width: "10%" }}>Subscription Expiry</th>
                       <th style={{ width: "10%" }}>Last Login</th>
-                      <th style={{ width: "12%" }} className="text-right">Actions</th>
+                      <th style={{ width: "16%" }} className="text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -2708,7 +2872,7 @@ function NexusPulseApp() {
                           </td>
 
                           <td className="np-table-actions">
-                            <div className="flex items-center justify-end gap-1.5">
+                            <div className="flex items-center justify-end gap-1.5 flex-wrap">
                               <button
                                 onClick={() => handleOpenResetPasswordModal(op)}
                                 className="btn btn-secondary btn-sm"
@@ -2723,6 +2887,15 @@ function NexusPulseApp() {
                               >
                                 {expandedOperatorId === op.id ? 'Close' : 'Adjust'}
                               </button>
+                              {op.role !== "admin" && (
+                                <button
+                                  onClick={() => handleDeleteOperator(op)}
+                                  className="btn btn-danger btn-sm"
+                                  title={`Permanently delete operator account ${op.username}`}
+                                >
+                                  Delete
+                                </button>
+                              )}
                             </div>
                           </td>
                         </tr>
@@ -2824,22 +2997,36 @@ function NexusPulseApp() {
                                   </div>
                                 </div>
 
-                                <div className="pt-2 flex justify-end gap-2 border-t-theme">
-                                  <button
-                                    type="button"
-                                    onClick={() => setExpandedOperatorId(null)}
-                                    className="btn btn-ghost btn-sm"
-                                  >
-                                    Cancel
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleApplyInlineQuotas(op.id, null)}
-                                    disabled={updatingOperatorId === op.id}
-                                    className="btn btn-primary btn-sm"
-                                  >
-                                    {updatingOperatorId === op.id ? "Saving..." : "Apply Changes"}
-                                  </button>
+                                <div className="pt-2 flex items-center justify-between border-t-theme">
+                                  <div>
+                                    {op.role !== "admin" && (
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDeleteOperator(op)}
+                                        className="btn btn-danger btn-sm"
+                                        title="Permanently remove operator account"
+                                      >
+                                        Delete Operator Account
+                                      </button>
+                                    )}
+                                  </div>
+                                  <div className="flex justify-end gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={() => setExpandedOperatorId(null)}
+                                      className="btn btn-ghost btn-sm"
+                                    >
+                                      Cancel
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => handleApplyInlineQuotas(op.id, null)}
+                                      disabled={updatingOperatorId === op.id}
+                                      className="btn btn-primary btn-sm"
+                                    >
+                                      {updatingOperatorId === op.id ? "Saving..." : "Apply Changes"}
+                                    </button>
+                                  </div>
                                 </div>
                               </div>
                             </td>
@@ -3633,7 +3820,7 @@ function NexusPulseApp() {
                   Review & Authorize Outreach: {selectedApproval.company_name}
                 </h3>
                 <p className="text-xs text-theme-secondary mt-0.5">
-                  Scheduled for 9:00 - 11:00 AM local recipient timezone.
+                  Scheduled for dynamic 9:00 AM - 5:00 PM local recipient timezone.
                 </p>
               </div>
               <button
@@ -3684,12 +3871,24 @@ function NexusPulseApp() {
                 Cancel
               </button>
               {user.role === "admin" ? (
-                <button
-                  onClick={() => handleApproveOutreach(selectedApproval.id, approvalSubject, approvalBody)}
-                  className="btn btn-warning btn-sm"
-                >
-                  Authorize & Schedule (9-11 AM)
-                </button>
+                <>
+                  <button
+                    onClick={() => handleApproveOutreach(selectedApproval.id, approvalSubject, approvalBody)}
+                    className="btn btn-warning btn-sm"
+                  >
+                    Authorize & Schedule (9-5 Window)
+                  </button>
+                  <button
+                    onClick={async () => {
+                      await handleApproveOutreach(selectedApproval.id, approvalSubject, approvalBody);
+                      await handleDispatchQueueNow(true, selectedApproval.id);
+                    }}
+                    className="btn btn-primary btn-sm flex items-center gap-1"
+                    title="Authorize and immediately dispatch outside business hours or on weekends"
+                  >
+                    <span>⚡ Authorize & Dispatch Now</span>
+                  </button>
+                </>
               ) : (
                 <span className="text-xs text-theme-danger">
                   Restricted: Only Admin can authorize.

@@ -267,7 +267,7 @@ class TestNexusPulseProductionRefactor(unittest.TestCase):
         self.assertIsNone(picked_overflow, "Should return None when all tenant mailboxes hit daily limits")
 
     def test_06_regional_working_hours_engine(self):
-        """Verifies dual business hours windows (9-11 AM & 2-5 PM local) and timezone mapping."""
+        """Verifies dynamic business hours window (9:00 AM - 5:00 PM local) and timezone mapping."""
         # Germany -> CET (+1)
         tz_de = self.scheduler.get_target_local_time(country="Germany", domain="bau-berlin.de")
         self.assertEqual(tz_de["timezone_code"], "CET")

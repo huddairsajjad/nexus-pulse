@@ -4,6 +4,7 @@ FastAPI Application Entrypoint & Static GUI Server
 Location: Desktop/rabbi/api/app.py
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, Dict, Any
@@ -51,9 +52,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"  Database init notice: {e}")
 
+    # 3. Start Background Dispatcher Worker
+    dispatcher_task = None
+    try:
+        from core.outreach.dispatcher_worker import get_dispatcher_worker
+        worker = get_dispatcher_worker()
+        dispatcher_task = asyncio.create_task(worker.start_background_loop(interval_seconds=30))
+        print("  Dispatch Engine : ACTIVE (Background Worker Loop Initialized - 30s cycle)")
+    except Exception as e:
+        print(f"  Dispatcher startup notice: {e}")
+
     print("  Nexus-Pulse Level 2 Core Engine ONLINE & READY FOR TRAFFIC")
     print("=" * 68)
     yield
+    if dispatcher_task:
+        dispatcher_task.cancel()
     print("  Shutting down Nexus-Pulse Level 2 Core Engine...")
 
 

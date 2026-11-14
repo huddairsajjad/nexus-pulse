@@ -753,6 +753,32 @@ html, body {
   animation: hotPulse 0.9s ease-in-out infinite;
 }
 
+.np-pulse-running,
+.pulse-state-running {
+  background: var(--accent-muted);
+  border-color: var(--accent);
+  color: var(--accent);
+  animation: runningGlow 2.5s ease-in-out infinite;
+}
+
+.np-pulse-dispatching,
+.pulse-state-dispatching {
+  background: var(--warning-muted);
+  border-color: var(--warning);
+  color: var(--warning);
+  animation: dispatchPulse 1s ease-in-out infinite;
+}
+
+@keyframes runningGlow {
+  0%, 100% { box-shadow: 0 0 0 0 var(--accent-muted); }
+  50%      { box-shadow: 0 0 6px 2px var(--accent-muted); }
+}
+
+@keyframes dispatchPulse {
+  0%, 100% { box-shadow: 0 0 0 0 var(--warning-muted); }
+  50%      { box-shadow: 0 0 8px 3px var(--warning-muted); }
+}
+
 @keyframes rotateRing {
   0%   { transform: rotate(0deg); }
   100% { transform: rotate(360deg); }
