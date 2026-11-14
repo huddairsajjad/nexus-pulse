@@ -171,9 +171,17 @@ class InboxRotator:
                     conn.execute("""
                         INSERT INTO mailbox_rotator (
                             id, email_address, display_name, domain, daily_limit, sent_today,
-                            last_reset_date, is_active, operator_id
-                        ) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?)
-                    """, (mb_id, email, name, domain, limit, today_str, operator_id))
+                            last_reset_date, is_active, operator_id,
+                            smtp_host, smtp_port, smtp_username, smtp_password
+                        ) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, 'smtp.gmail.com', 587, ?, 'test-app-password')
+                    """, (mb_id, email, name, domain, limit, today_str, operator_id, email))
+                else:
+                    conn.execute("""
+                        UPDATE mailbox_rotator
+                        SET smtp_host = 'smtp.gmail.com', smtp_port = 587,
+                            smtp_username = ?, smtp_password = 'test-app-password'
+                        WHERE email_address = ?
+                    """, (email, email))
             conn.commit()
 
 

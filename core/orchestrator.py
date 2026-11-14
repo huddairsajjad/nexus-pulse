@@ -22,6 +22,8 @@ from vault.vault_manager import get_vault_manager
 from core.models import Lead, HygieneStatus, EmailTier
 from core.outreach.blacklist_manager import get_blacklist_manager
 from core.outreach.reply_listener import get_reply_listener
+from core.hygiene.lead_validator import LeadValidationFilter
+from database.db_engine import get_db_engine
 
 
 class NexusPulseOrchestrator:
@@ -48,6 +50,7 @@ class NexusPulseOrchestrator:
         self.vault = get_vault_manager()
         self.blacklist = get_blacklist_manager()
         self.reply_listener = get_reply_listener()
+        self.db = get_db_engine()
 
     def get_system_status(self) -> Dict[str, Any]:
         """Provides holistic telemetry on system state, security, and storage."""
@@ -91,7 +94,21 @@ class NexusPulseOrchestrator:
                 "primary_email": raw_lead.primary_email
             }
 
-        # 2. Suppression & DNC Opt-Out Check
+        # 2. Pipeline, Sent History & Blacklist Deduplication Guard
+        with self.db.get_connection() as conn:
+            is_dup_guard, guard_reason = LeadValidationFilter.is_lead_duplicate_or_blacklisted(
+                raw_lead.primary_email, conn, domain=raw_lead.domain
+            )
+            if is_dup_guard:
+                return {
+                    "success": False,
+                    "reason": "DEDUPLICATION_BLOCKED",
+                    "details": guard_reason,
+                    "lead_domain": raw_lead.domain,
+                    "primary_email": raw_lead.primary_email
+                }
+
+        # 3. Suppression & DNC Opt-Out Check
         if self.reply_listener.is_suppressed(raw_lead.primary_email) or self.reply_listener.is_suppressed(raw_lead.domain):
             return {
                 "success": False,

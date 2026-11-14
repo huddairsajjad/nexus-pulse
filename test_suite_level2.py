@@ -16,6 +16,7 @@ import os
 import sys
 import uuid
 import unittest
+import unittest.mock
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -110,10 +111,11 @@ class TestNexusPulseLevel2(unittest.TestCase):
     def test_03_human_approval_gate(self):
         """Tests authorization hold: no outreach dispatched without approval from H.Huddair."""
         mock_lead_id = f"lead-{uuid.uuid4().hex[:6]}"
+        test_email = f"kalkulation-{uuid.uuid4().hex[:6]}@hochbau-test.de"
         q_res = self.gate.queue_outreach(
             lead_id=mock_lead_id,
             company_name="Hochbau Test GmbH",
-            recipient="kalkulation@hochbau-test.de",
+            recipient=test_email,
             country="Germany",
             niche="Commercial Construction",
             channel="EMAIL"
@@ -137,11 +139,14 @@ class TestNexusPulseLevel2(unittest.TestCase):
         self.assertTrue(app_res["success"])
         self.assertEqual(app_res["status"], "APPROVED")
 
-        # Now dispatch succeeds
-        dispatch_res = self.gate.dispatch_approved_outreach(q_id)
-        self.assertTrue(dispatch_res["success"])
-        self.assertEqual(dispatch_res["status"], "SENT")
-        self.assertIn("@", dispatch_res["dispatched_via"])
+        # Now dispatch succeeds (mocking live SMTP network call for unit test environment)
+        with unittest.mock.patch("smtplib.SMTP") as mock_smtp:
+            mock_server = mock_smtp.return_value
+            mock_server.sendmail.return_value = {}
+            dispatch_res = self.gate.dispatch_approved_outreach(q_id)
+            self.assertTrue(dispatch_res["success"])
+            self.assertEqual(dispatch_res["status"], "SENT")
+            self.assertIn("@", dispatch_res["dispatched_via"])
 
     # -------------------------------------------------------------
     # 4. Backup Web-Form Outreach

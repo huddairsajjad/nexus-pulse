@@ -7,7 +7,12 @@ Integrates with Multi-Service Template Pool, Inbox Rotator with auto-switching,
 and Timezone Smart Scheduler.
 """
 
+import re
 import uuid
+import smtplib
+import logging
+from email.mime.text import MIMEText
+from email.utils import formatdate, make_msgid
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 from database.db_engine import get_db_engine
@@ -15,6 +20,9 @@ from .scheduler import get_scheduler
 from .inbox_rotator import get_inbox_rotator
 from .template_manager import get_template_manager
 from .blacklist_manager import get_blacklist_manager
+from core.hygiene.lead_validator import LeadValidationFilter
+
+logger = logging.getLogger("nexus.approval_gate")
 
 
 def generate_personalized_copy(
@@ -71,7 +79,20 @@ class HumanApprovalGate:
         Places a lead into the mandatory Human Approval Gate (status: PENDING_APPROVAL).
         Computes regional working hours and renders custom or matched template copy.
         """
-        # 1. Compliance: Check Blacklist & Suppression
+        # 1. Compliance & Deduplication Guard: Check Pipeline, Sent history, Blacklist & Suppression
+        domain = recipient.split("@")[-1] if "@" in recipient else None
+        with self.db.get_connection() as conn:
+            is_dup_guard, guard_reason = LeadValidationFilter.is_lead_duplicate_or_blacklisted(
+                recipient, conn, domain=domain
+            )
+            if is_dup_guard:
+                return {
+                    "queue_id": None,
+                    "status": "DUPLICATE",
+                    "reason": guard_reason,
+                    "message": f"Recipient '{recipient}' blocked by Deduplication Guard: {guard_reason}"
+                }
+
         is_bl, bl_reason = self.blacklist_manager.is_domain_blacklisted(recipient)
         if is_bl:
             return {
@@ -103,7 +124,7 @@ class HumanApprovalGate:
         tracking_id = str(uuid.uuid4())
         unsub_link = f"/api/unsubscribe?token={tracking_id}&email={recipient}"
 
-        # 3. Dynamic Template Matching (User-defined or parameters)
+        # 3. Dynamic Template & Mailbox Matching
         if custom_subject and custom_body:
             subject = custom_subject.replace("{{unsubscribe_link}}", unsub_link)
             body = custom_body.replace("{{unsubscribe_link}}", unsub_link)
@@ -121,17 +142,21 @@ class HumanApprovalGate:
             subject = rendered["subject"]
             body = rendered["body"]
 
+        # Automatically map lead to matching available mailbox
+        mb = self.rotator.get_next_available_mailbox(operator_id=operator_id)
+        mailbox_assigned = mb["email_address"] if mb else None
+
         with self.db.get_connection() as conn:
             conn.execute("""
                 INSERT INTO outreach_queue (
                     id, lead_id, channel, recipient, company_name, subject, message_body,
                     status, target_country, target_timezone, scheduled_for, operator_id,
-                    tracking_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?, ?, ?, ?)
+                    tracking_id, mailbox_used
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?, ?, ?, ?, ?)
             """, (
                 queue_id, lead_id, channel, recipient, company_name, subject, body,
                 country, tz_info["timezone_code"], scheduled_for, operator_id,
-                tracking_id
+                tracking_id, mailbox_assigned
             ))
             conn.commit()
 
@@ -155,10 +180,13 @@ class HumanApprovalGate:
         approver: str = "operator",
         edited_subject: Optional[str] = None,
         edited_body: Optional[str] = None,
+        edited_recipient: Optional[str] = None,
+        edited_company_name: Optional[str] = None,
         operator_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Manually authorizes an outreach item.
+        Persists updated recipient_email, company_name, subject, and message_body before approving.
         Transitions status from PENDING_APPROVAL to APPROVED.
         """
         with self.db.get_connection() as conn:
@@ -175,6 +203,8 @@ class HumanApprovalGate:
 
             subj = edited_subject if edited_subject is not None else row["subject"]
             body = edited_body if edited_body is not None else row["message_body"]
+            recipient = edited_recipient.strip() if edited_recipient and edited_recipient.strip() else row["recipient"]
+            company = edited_company_name.strip() if edited_company_name and edited_company_name.strip() else row["company_name"]
 
             conn.execute("""
                 UPDATE outreach_queue
@@ -182,9 +212,11 @@ class HumanApprovalGate:
                     approved_by = ?,
                     approved_at = CURRENT_TIMESTAMP,
                     subject = ?,
-                    message_body = ?
+                    message_body = ?,
+                    recipient = ?,
+                    company_name = ?
                 WHERE id = ?
-            """, (approver, subj, body, queue_id))
+            """, (approver, subj, body, recipient, company, queue_id))
             conn.commit()
 
             return {
@@ -192,8 +224,40 @@ class HumanApprovalGate:
                 "queue_id": queue_id,
                 "status": "APPROVED",
                 "approved_by": approver,
-                "recipient": row["recipient"]
+                "recipient": recipient,
+                "company_name": company
             }
+
+    def delete_queue_item(self, queue_id: str, operator_id: Optional[str] = None) -> Dict[str, Any]:
+        """Permanently deletes an individual lead from the outreach queue in 1 click."""
+        with self.db.get_connection() as conn:
+            row = conn.execute("SELECT id, operator_id, recipient, company_name FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
+            if not row:
+                raise ValueError(f"Queue item '{queue_id}' not found.")
+            if operator_id and row["operator_id"] and row["operator_id"] != operator_id:
+                raise PermissionError("Access denied: You cannot delete outreach for another tenant.")
+            conn.execute("DELETE FROM outreach_queue WHERE id = ?", (queue_id,))
+            conn.commit()
+            return {"success": True, "deleted_id": queue_id, "recipient": row["recipient"]}
+
+    def purge_unapproved_items(self, operator_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Bulk Purge ('Clear Unapproved Gate'):
+        Wipes all pending/unapproved leads held in the gate so a fresh hunt can run cleanly.
+        """
+        with self.db.get_connection() as conn:
+            if operator_id:
+                cur = conn.execute("""
+                    DELETE FROM outreach_queue
+                    WHERE status = 'PENDING_APPROVAL' AND (operator_id = ? OR operator_id IS NULL)
+                """, (operator_id,))
+            else:
+                cur = conn.execute("""
+                    DELETE FROM outreach_queue
+                    WHERE status = 'PENDING_APPROVAL'
+                """)
+            conn.commit()
+            return {"success": True, "purged_count": cur.rowcount}
 
     def batch_approve_all(self, approver: str = "operator", operator_id: Optional[str] = None) -> Dict[str, Any]:
         """Approves all currently pending items in the gate for this tenant or globally for admin."""
@@ -233,8 +297,10 @@ class HumanApprovalGate:
 
     def dispatch_approved_outreach(self, queue_id: str, operator_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Dispatches an approved outreach item through the Inbox Rotator.
+        Dispatches an approved outreach item through live SMTP transmission.
         Enforces daily domain caps and auto-switching across active profiles.
+        Performs live SMTP authentication (smtp.gmail.com), appends opt-out footer,
+        and accurately logs delivery only on 250 OK server confirmation.
         """
         with self.db.get_connection() as conn:
             row = conn.execute("SELECT * FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
@@ -257,15 +323,99 @@ class HumanApprovalGate:
                     "message": "All sending inboxes have reached their daily limit (40-50). Queued for next quota reset."
                 }
 
-            # Increment mailbox quota count
+            # Mailbox configuration
+            smtp_host = (mb.get("smtp_host") or "").strip() or "smtp.gmail.com"
+            smtp_port = int(mb.get("smtp_port") or 587)
+            sender_email = (mb.get("email_address") or "").strip()
+            smtp_user = (mb.get("smtp_username") or "").strip() or sender_email
+            raw_pwd = mb.get("smtp_password") or ""
+            # App Password Sanitization: strip all accidental whitespace
+            smtp_pwd = re.sub(r'\s+', '', raw_pwd)
+
+            # Unsubscribe / Opt-Out Compliance Footer
+            opt_out_footer = '\n\n---\nNot interested? Reply "STOP" and we will immediately remove you from our outreach list.'
+            msg_body = row["message_body"] or ""
+            if 'Reply "STOP"' not in msg_body and 'reply "stop"' not in msg_body.lower():
+                msg_body = msg_body.rstrip() + opt_out_footer
+
+            # Build MIME Message
+            msg = MIMEText(msg_body, "plain", "utf-8")
+            display_name = (mb.get("display_name") or "").strip()
+            if display_name:
+                msg["From"] = f"{display_name} <{sender_email}>"
+            else:
+                msg["From"] = sender_email
+            msg["To"] = row["recipient"].strip()
+            msg["Subject"] = row["subject"]
+            msg["Date"] = formatdate(localtime=True)
+            sender_domain = sender_email.split("@")[-1] if "@" in sender_email else "gmail.com"
+            msg["Message-ID"] = make_msgid(domain=sender_domain)
+
+            # Validate real credentials exist
+            if not smtp_user or not smtp_pwd:
+                err_msg = f"Mailbox '{sender_email}' is missing SMTP credentials (username or App Password)."
+                logger.error(f"[SMTP DISPATCH FAILED] {err_msg}")
+                conn.execute("""
+                    UPDATE outreach_queue
+                    SET status = 'FAILED', bounce_reason = ?
+                    WHERE id = ?
+                """, (err_msg, queue_id))
+                conn.commit()
+                return {
+                    "success": False,
+                    "reason": "MISSING_CREDENTIALS",
+                    "message": err_msg,
+                    "recipient": row["recipient"],
+                    "dispatched_via": sender_email
+                }
+
+            # Live SMTP Transmission
+            try:
+                logger.info(f"[SMTP DISPATCH] Connecting securely to {smtp_host}:{smtp_port} for {sender_email} -> {row['recipient']}...")
+                if smtp_port == 465:
+                    server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=25.0)
+                    server.ehlo()
+                else:
+                    server = smtplib.SMTP(smtp_host, smtp_port, timeout=25.0)
+                    server.ehlo()
+                    server.starttls()
+                    server.ehlo()
+
+                server.login(smtp_user, smtp_pwd)
+                send_errs = server.sendmail(sender_email, [row["recipient"].strip()], msg.as_string())
+                server.quit()
+
+                if send_errs:
+                    raise smtplib.SMTPException(f"Recipients refused by server: {send_errs}")
+
+                logger.info(f"[SMTP DISPATCH SUCCESS 250 OK] Email dispatched to {row['recipient']} via {sender_email}.")
+
+            except Exception as smtp_ex:
+                err_details = f"{type(smtp_ex).__name__}: {str(smtp_ex)}"
+                logger.error(f"[SMTP DISPATCH FAILED] Error transmitting to {row['recipient']}: {err_details}", exc_info=True)
+                conn.execute("""
+                    UPDATE outreach_queue
+                    SET status = 'FAILED', bounce_reason = ?
+                    WHERE id = ?
+                """, (f"SMTP Failure: {err_details}", queue_id))
+                conn.commit()
+                return {
+                    "success": False,
+                    "reason": "SMTP_FAILED",
+                    "message": f"SMTP transmission failed: {err_details}",
+                    "recipient": row["recipient"],
+                    "dispatched_via": sender_email
+                }
+
+            # ONLY increment daily send counter and mark status as 'SENT' AFTER smtplib confirms successful 250 OK
             self.rotator.record_email_dispatched(mb["id"])
 
             now_iso = datetime.now(timezone.utc).isoformat()
             conn.execute("""
                 UPDATE outreach_queue
-                SET status = 'SENT', sent_at = CURRENT_TIMESTAMP, mailbox_used = ?
+                SET status = 'SENT', sent_at = CURRENT_TIMESTAMP, mailbox_used = ?, message_body = ?
                 WHERE id = ?
-            """, (mb["email_address"], queue_id))
+            """, (sender_email, msg_body, queue_id))
 
             # Initialize 7-Day Follow-Up Sequence
             followup_id = str(uuid.uuid4())
@@ -284,7 +434,7 @@ class HumanApprovalGate:
                 "status": "SENT",
                 "recipient": row["recipient"],
                 "channel": row["channel"],
-                "dispatched_via": mb["email_address"],
+                "dispatched_via": sender_email,
                 "sent_at": now_iso,
                 "followup_scheduled_for_days": 7
             }

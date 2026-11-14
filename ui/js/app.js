@@ -352,6 +352,9 @@ function NexusPulseApp() {
 
   // Pipeline approval & hot lead review modals
   const [selectedApproval, setSelectedApproval] = useState(null);
+  const [approvalRecipient, setApprovalRecipient] = useState("");
+  const [approvalCompanyName, setApprovalCompanyName] = useState("");
+  const [approvalNiche, setApprovalNiche] = useState("Commercial Construction");
   const [approvalSubject, setApprovalSubject] = useState("");
   const [approvalBody, setApprovalBody] = useState("");
 
@@ -787,15 +790,73 @@ function NexusPulseApp() {
   };
 
   // ---------------------------------------------------------------------------
-  // HUMAN APPROVAL GATE HANDLERS
+  // HUMAN APPROVAL GATE HANDLERS & TEMPLATE POOL
   // ---------------------------------------------------------------------------
+  const NICHE_TEMPLATES = {
+    "Commercial Construction": {
+      subject: "Commercial Subcontracting & Estimating Capacity // {{company_name}}",
+      body: "Dear Estimating & Project Management Team at {{company_name}},\n\nWe are reaching out to submit our credentials and commercial capacity for upcoming commercial construction packages.\n\nOur team delivers high-precision takeoffs, competitive subcontractor pricing, and rapid estimating turnaround.\n\nPlease confirm the right contact or portal to submit our credentials.\n\nBest regards,\nCommercial Estimating Department"
+    },
+    "Enterprise SaaS": {
+      subject: "Strategic SaaS Partnership // {{company_name}}",
+      body: "Hi Team at {{company_name}},\n\nI came across your platform and was impressed by your product architecture. We specialize in B2B SaaS growth, API integrations, and workflow automation that scale pipeline velocity.\n\nWould you be open to a brief 10-minute chat this week to explore collaboration opportunities?\n\nBest regards,\nNexus Enterprise Team"
+    },
+    "Gym Equipment": {
+      subject: "Commercial Fitness Equipment Supply & Distribution // {{company_name}}",
+      body: "Dear Commercial Procurement Team at {{company_name}},\n\nWe are reaching out regarding commercial gym and strength equipment supply, distribution, and facility outfitting.\n\nWe offer high-durability commercial-grade racks, barbells, plate-loaded machinery, and cardio equipment at competitive trade rates.\n\nPlease let us know if you have upcoming facility upgrades or equipment expansion plans.\n\nBest regards,\nCommercial Fitness Outfitting Team"
+    }
+  };
+
   const handleOpenApprovalModal = (item) => {
     setSelectedApproval(item);
+    setApprovalRecipient(item.recipient || item.primary_email || "");
+    setApprovalCompanyName(item.company_name || "");
+    const initialNiche = item.industry_niche || item.niche || "Commercial Construction";
+    setApprovalNiche(initialNiche);
     setApprovalSubject(item.subject || "");
     setApprovalBody(item.message_body || "");
   };
 
-  const handleApproveOutreach = async (queueId, customSubject, customBody) => {
+  const handleTemplateSwitch = (targetNiche) => {
+    setApprovalNiche(targetNiche);
+    const comp = approvalCompanyName || (selectedApproval?.company_name || "Partner");
+    const rec = approvalRecipient || (selectedApproval?.recipient || "contact@target.com");
+
+    const customMatch = templatesList?.find(t => (t.niche || "").toLowerCase() === targetNiche.toLowerCase());
+    let tplSubject = "";
+    let tplBody = "";
+
+    if (customMatch) {
+      tplSubject = customMatch.subject_template;
+      tplBody = customMatch.body_template;
+    } else if (NICHE_TEMPLATES[targetNiche]) {
+      tplSubject = NICHE_TEMPLATES[targetNiche].subject;
+      tplBody = NICHE_TEMPLATES[targetNiche].body;
+    } else {
+      tplSubject = `Strategic Collaboration // {{company_name}} [${targetNiche}]`;
+      tplBody = `Dear Commercial Team at {{company_name}},\n\nWe are reaching out regarding commercial opportunities in the ${targetNiche} sector.\n\nBest regards,\nBusiness Development Team`;
+    }
+
+    const renderedSubj = tplSubject.replace(/\{\{company_name\}\}/g, comp).replace(/\{\{recipient_email\}\}/g, rec);
+    const renderedBody = tplBody.replace(/\{\{company_name\}\}/g, comp).replace(/\{\{recipient_email\}\}/g, rec);
+    setApprovalSubject(renderedSubj);
+    setApprovalBody(renderedBody);
+  };
+
+  const handleCompanyNameChange = (newComp) => {
+    const oldComp = approvalCompanyName;
+    setApprovalCompanyName(newComp);
+    if (oldComp && oldComp.trim()) {
+      if (approvalSubject.includes(oldComp)) {
+        setApprovalSubject(approvalSubject.split(oldComp).join(newComp));
+      }
+      if (approvalBody.includes(oldComp)) {
+        setApprovalBody(approvalBody.split(oldComp).join(newComp));
+      }
+    }
+  };
+
+  const handleApproveOutreach = async (queueId, customSubject, customBody, customRecipient, customCompanyName) => {
     try {
       const resp = await fetch(`${API_BASE}/api/outreach/approve`, {
         method: "POST",
@@ -804,7 +865,9 @@ function NexusPulseApp() {
           queue_id: queueId,
           approver: user.username,
           edited_subject: customSubject,
-          edited_body: customBody
+          edited_body: customBody,
+          edited_recipient: customRecipient || approvalRecipient,
+          edited_company_name: customCompanyName || approvalCompanyName
         })
       });
       const data = await resp.json();
@@ -812,14 +875,79 @@ function NexusPulseApp() {
         setSelectedApproval(null);
         setAlertBanner({
           type: "success",
-          message: `Outreach item approved by ${user.username}! Timezone-aware dispatch active (9:00 AM - 5:00 PM local window).`
+          message: `Outreach item authorized for ${customRecipient || approvalRecipient || "recipient"}! Persisted to database.`
         });
         fetchData();
       } else {
-        alert(data.detail || "Approval failed.");
+        setAlertBanner({
+          type: "danger",
+          message: data.detail || "Approval failed."
+        });
       }
     } catch (e) {
-      alert("Error approving outreach.");
+      setAlertBanner({
+        type: "danger",
+        message: "Error approving outreach."
+      });
+    }
+  };
+
+  const handleDeleteQueueItem = async (queueId, recipientEmail) => {
+    if (!confirm(`Permanently delete lead for '${recipientEmail || "this contact"}' from the queue?`)) return;
+    try {
+      const resp = await fetch(`${API_BASE}/api/outreach/queue/${queueId}`, {
+        method: "DELETE",
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        if (selectedApproval && selectedApproval.id === queueId) {
+          setSelectedApproval(null);
+        }
+        setAlertBanner({
+          type: "info",
+          message: `Lead permanently removed from database.`
+        });
+        fetchData();
+      } else {
+        setAlertBanner({
+          type: "danger",
+          message: data.detail || "Failed to delete lead."
+        });
+      }
+    } catch (err) {
+      setAlertBanner({
+        type: "danger",
+        message: "Error deleting queue item."
+      });
+    }
+  };
+
+  const handlePurgeUnapprovedGate = async () => {
+    if (!confirm("⚠️ Confirm Bulk Purge: Are you sure you want to permanently delete ALL unapproved/pending leads from the Approval Gate?")) return;
+    try {
+      const resp = await fetch(`${API_BASE}/api/outreach/purge-unapproved`, {
+        method: "POST",
+        headers: token ? { Authorization: `Bearer ${token}` } : {}
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setAlertBanner({
+          type: "success",
+          message: `Gate Purged: Removed ${data.purged_count} pending leads. Ready for fresh hunt!`
+        });
+        fetchData();
+      } else {
+        setAlertBanner({
+          type: "danger",
+          message: data.detail || "Purge failed."
+        });
+      }
+    } catch (err) {
+      setAlertBanner({
+        type: "danger",
+        message: "Error executing bulk purge."
+      });
     }
   };
 
@@ -2121,12 +2249,21 @@ function NexusPulseApp() {
 
                               {/* Stage-Specific Actions */}
                               {stage.key === "PENDING_APPROVAL" && (
-                                <button
-                                  onClick={() => handleOpenApprovalModal(lead)}
-                                  className="btn btn-warning btn-sm w-full justify-center mt-1"
-                                >
-                                  Review & Authorize ➔
-                                </button>
+                                <div className="flex items-center gap-1 mt-1">
+                                  <button
+                                    onClick={() => handleOpenApprovalModal(lead)}
+                                    className="btn btn-warning btn-sm flex-1 justify-center"
+                                  >
+                                    Review & Authorize ➔
+                                  </button>
+                                  <button
+                                    onClick={() => handleDeleteQueueItem(lead.id, lead.recipient || lead.primary_email)}
+                                    className="btn btn-danger btn-sm px-2"
+                                    title="Delete Lead"
+                                  >
+                                    🗑️
+                                  </button>
+                                </div>
                               )}
 
                               {stage.key === "HOT_LEAD" && (
@@ -2164,6 +2301,15 @@ function NexusPulseApp() {
               </div>
 
               <div className="flex items-center gap-2 flex-wrap justify-end">
+                {user.role === "admin" && (
+                  <button
+                    onClick={handlePurgeUnapprovedGate}
+                    className="btn btn-danger btn-sm flex items-center gap-1"
+                    title="Clear and permanently wipe all pending unapproved leads in the gate"
+                  >
+                    <span>🗑️ Purge Unapproved Leads</span>
+                  </button>
+                )}
                 {user.role === "admin" && (
                   <button
                     onClick={() => handleToggleDispatcherBypass(!dispatcherState.bypass_window)}
@@ -2223,9 +2369,16 @@ function NexusPulseApp() {
                         >
                           Edit & Review
                         </button>
+                        <button
+                          onClick={() => handleDeleteQueueItem(item.id, item.recipient)}
+                          className="btn btn-danger btn-sm"
+                          title="Permanently delete lead"
+                        >
+                          🗑️ Delete
+                        </button>
                         {user.role === "admin" && (
                           <button
-                            onClick={() => handleApproveOutreach(item.id, item.subject, item.message_body)}
+                            onClick={() => handleApproveOutreach(item.id, item.subject, item.message_body, item.recipient, item.company_name)}
                             className="btn btn-warning btn-sm"
                           >
                             Authorize
@@ -2234,7 +2387,7 @@ function NexusPulseApp() {
                         {user.role === "admin" && (
                           <button
                             onClick={async () => {
-                              await handleApproveOutreach(item.id, item.subject, item.message_body);
+                              await handleApproveOutreach(item.id, item.subject, item.message_body, item.recipient, item.company_name);
                               await handleDispatchQueueNow(true, item.id);
                             }}
                             className="btn btn-primary btn-sm"
@@ -3833,11 +3986,36 @@ function NexusPulseApp() {
 
             <div className="np-modal-body space-y-3">
               <div>
-                <label className="np-label">Recipient Destination</label>
+                <label className="np-label">Campaign Niche & Template Switcher</label>
+                <select
+                  value={approvalNiche}
+                  onChange={(e) => handleTemplateSwitch(e.target.value)}
+                  className="np-input font-mono bg-elevated"
+                >
+                  <option value="Commercial Construction">Commercial Construction</option>
+                  <option value="Enterprise SaaS">Enterprise SaaS</option>
+                  <option value="Gym Equipment">Gym Equipment</option>
+                </select>
+              </div>
+
+              <div>
+                <label className="np-label">Company / Brand Name</label>
                 <input
                   type="text"
-                  readOnly
-                  value={selectedApproval.recipient}
+                  value={approvalCompanyName}
+                  onChange={(e) => handleCompanyNameChange(e.target.value)}
+                  placeholder="e.g. Zeus Fitness or Acme Corp"
+                  className="np-input font-mono"
+                />
+              </div>
+
+              <div>
+                <label className="np-label">Recipient Destination</label>
+                <input
+                  type="email"
+                  value={approvalRecipient}
+                  onChange={(e) => setApprovalRecipient(e.target.value)}
+                  placeholder="recipient@domain.com"
                   className="np-input font-mono"
                 />
               </div>
@@ -3863,37 +4041,47 @@ function NexusPulseApp() {
               </div>
             </div>
 
-            <div className="np-modal-footer">
+            <div className="np-modal-footer flex items-center justify-between">
               <button
-                onClick={() => setSelectedApproval(null)}
-                className="btn btn-ghost btn-sm"
+                onClick={() => handleDeleteQueueItem(selectedApproval.id, approvalRecipient)}
+                className="btn btn-danger btn-sm flex items-center gap-1"
+                title="Permanently remove this lead from the gate"
               >
-                Cancel
+                <span>🗑️ Delete Lead</span>
               </button>
-              {user.role === "admin" ? (
-                <>
-                  <button
-                    onClick={() => handleApproveOutreach(selectedApproval.id, approvalSubject, approvalBody)}
-                    className="btn btn-warning btn-sm"
-                  >
-                    Authorize & Schedule (9-5 Window)
-                  </button>
-                  <button
-                    onClick={async () => {
-                      await handleApproveOutreach(selectedApproval.id, approvalSubject, approvalBody);
-                      await handleDispatchQueueNow(true, selectedApproval.id);
-                    }}
-                    className="btn btn-primary btn-sm flex items-center gap-1"
-                    title="Authorize and immediately dispatch outside business hours or on weekends"
-                  >
-                    <span>⚡ Authorize & Dispatch Now</span>
-                  </button>
-                </>
-              ) : (
-                <span className="text-xs text-theme-danger">
-                  Restricted: Only Admin can authorize.
-                </span>
-              )}
+
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setSelectedApproval(null)}
+                  className="btn btn-ghost btn-sm"
+                >
+                  Cancel
+                </button>
+                {user.role === "admin" ? (
+                  <>
+                    <button
+                      onClick={() => handleApproveOutreach(selectedApproval.id, approvalSubject, approvalBody, approvalRecipient, approvalCompanyName)}
+                      className="btn btn-warning btn-sm"
+                    >
+                      Authorize & Schedule (9-5 Window)
+                    </button>
+                    <button
+                      onClick={async () => {
+                        await handleApproveOutreach(selectedApproval.id, approvalSubject, approvalBody, approvalRecipient, approvalCompanyName);
+                        await handleDispatchQueueNow(true, selectedApproval.id);
+                      }}
+                      className="btn btn-primary btn-sm flex items-center gap-1"
+                      title="Authorize and immediately dispatch outside business hours or on weekends"
+                    >
+                      <span>⚡ Authorize & Dispatch Now</span>
+                    </button>
+                  </>
+                ) : (
+                  <span className="text-xs text-theme-danger">
+                    Restricted: Only Admin can authorize.
+                  </span>
+                )}
+              </div>
             </div>
           </div>
         </div>

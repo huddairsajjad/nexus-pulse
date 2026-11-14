@@ -17,6 +17,7 @@ import httpx
 
 from ..models import Lead, TechStack, EmailTier, ScrapedEmail
 from .priority_finder import PriorityEmailFinder
+from core.hygiene.lead_validator import LeadValidationFilter
 
 logger = logging.getLogger("nexus.scraper")
 
@@ -150,7 +151,8 @@ class SearchDiscoveryAgent:
         "facebook.", "instagram.", "twitter.", "x.com", "linkedin.",
         "youtube.", "wikipedia.", "reddit.", "amazon.", "apple.",
         "github.", "pinterest.", "tiktok.", "medium.", "quora.",
-        "tripadvisor.", "yelp.", "w3schools.", "stackoverflow.", "t.me"
+        "tripadvisor.", "yelp.", "w3schools.", "stackoverflow.", "t.me",
+        "wixpress.com", "lexisnexis.com", "m-w.com", "f6s.com"
     }
 
     def __init__(self, timeout_seconds: float = 10.0):
@@ -179,8 +181,13 @@ class SearchDiscoveryAgent:
             return None
 
         parsed = urlparse(raw_url)
-        domain = parsed.netloc.lower().replace("www.", "")
+        domain = parsed.netloc.lower().replace("www.", "").split(":")[0]
         if not domain or any(d in domain for d in cls.DISCARD_DOMAINS):
+            return None
+
+        # Block .gov, .edu, .mil and tracker domains via Layer 2 filter
+        is_allowed, _ = LeadValidationFilter.check_role_and_domain_blocker("check@" + domain, domain)
+        if not is_allowed:
             return None
 
         # Return root domain website URL
@@ -303,10 +310,15 @@ class DeepScraperAgent:
         country: str = "Germany",
         city: str = "Berlin",
         niche: str = "Commercial Construction",
-        headers: Optional[Dict[str, str]] = None
+        headers: Optional[Dict[str, str]] = None,
+        inherited_niche_score: Optional[int] = None
     ) -> Optional[Lead]:
         """
-        Parses raw HTML string to extract company lead, tech stack, and prioritized emails.
+        Parses raw HTML string through 4-Layer Validation & Sanitization:
+        Layer 1: Strips HTML entities, rejects malformed/truncated local-parts.
+        Layer 2: Rejects role-based, .gov/.edu/.mil, and tracker domains.
+        Layer 3: Rejects bot-shield/junk titles; extracts brand name from generic navigation.
+        Layer 4: Scores niche relevance (0-100), enforcing >= 70 threshold.
         """
         if not html_content or len(html_content.strip()) < 50:
             return None
@@ -315,7 +327,58 @@ class DeepScraperAgent:
         raw_text = html.unescape(html_content)
         soup = BeautifulSoup(raw_text, "html.parser")
 
-        # 1. Extract Emails from mailto: links and page text
+        parsed_url = urlparse(source_url)
+        domain = parsed_url.netloc.replace("www.", "").lower().split(":")[0]
+
+        # -------------------------------------------------------------
+        # LAYER 2 CHECK: Domain Level Role & System Blocker
+        # -------------------------------------------------------------
+        is_dom_ok, dom_reason = LeadValidationFilter.check_role_and_domain_blocker("check@" + domain, domain)
+        if not is_dom_ok:
+            logger.info(f"[LAYER-2 FILTER] Discarding {source_url}: {dom_reason}")
+            return None
+
+        # -------------------------------------------------------------
+        # LAYER 3 CHECK: Junk Title, Bot-Shield & Brand Extractor
+        # -------------------------------------------------------------
+        raw_title = ""
+        title_tag = soup.find("title")
+        if title_tag and title_tag.text:
+            raw_title = title_tag.text.strip()
+
+        is_title_valid, company_name, title_reason = LeadValidationFilter.evaluate_page_title(raw_title, domain)
+        if not is_title_valid:
+            logger.info(f"[LAYER-3 FILTER] Discarding {source_url}: {title_reason}")
+            return None
+
+        # -------------------------------------------------------------
+        # LAYER 4 CHECK: Niche Relevance Scoring (>= 70 required)
+        # -------------------------------------------------------------
+        if inherited_niche_score is not None:
+            niche_score = inherited_niche_score
+            score_summary = f"Inherited from root domain: {niche_score}/100"
+        else:
+            meta_desc = ""
+            desc_tag = soup.find("meta", attrs={"name": re.compile(r"description", re.I)})
+            if desc_tag and desc_tag.get("content"):
+                meta_desc = desc_tag["content"].strip()
+
+            page_text = soup.get_text(separator=" ", strip=True)
+            niche_score, score_summary = LeadValidationFilter.calculate_niche_score(
+                niche=niche,
+                page_title=raw_title,
+                page_content=page_text,
+                meta_description=meta_desc,
+                domain=domain
+            )
+
+        if niche_score < 70:
+            logger.info(f"[LAYER-4 FILTER] Discarding {source_url}: Niche relevance score {niche_score}/100 < 70 for '{niche}' ({score_summary})")
+            return None
+
+        # -------------------------------------------------------------
+        # LAYER 1 & LAYER 2: Extract & Sanitize Emails
+        # -------------------------------------------------------------
         emails_found: Set[str] = set()
         context_map: Dict[str, str] = {}
 
@@ -323,24 +386,28 @@ class DeepScraperAgent:
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"].strip()
             if href.lower().startswith("mailto:"):
-                clean_mail = href[7:].split("?")[0].strip()
-                if "@" in clean_mail:
-                    emails_found.add(clean_mail)
-                    context_map[clean_mail.lower()] = a_tag.get_text(strip=True) or "mailto anchor"
+                raw_mail = href[7:].split("?")[0].strip()
+                is_valid, clean_mail, _ = LeadValidationFilter.sanitize_and_validate_email(raw_mail, domain)
+                if is_valid and clean_mail:
+                    is_allowed, _ = LeadValidationFilter.check_role_and_domain_blocker(clean_mail, domain)
+                    if is_allowed:
+                        emails_found.add(clean_mail)
+                        context_map[clean_mail.lower()] = a_tag.get_text(strip=True) or "mailto anchor"
 
         # Regex search through raw text
         for match in EMAIL_REGEX.findall(raw_text):
-            clean_match = match.replace("[at]", "@").replace("(at)", "@").replace(" ", "").strip()
-            # Basic hygiene
-            if "@" in clean_match and "." in clean_match.split("@")[-1]:
+            is_valid, clean_mail, _ = LeadValidationFilter.sanitize_and_validate_email(match, domain)
+            if is_valid and clean_mail:
                 # Exclude image/asset false positives
-                if not any(clean_match.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".css", ".js"]):
-                    emails_found.add(clean_match)
+                if not any(clean_mail.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".css", ".js"]):
+                    is_allowed, _ = LeadValidationFilter.check_role_and_domain_blocker(clean_mail, domain)
+                    if is_allowed:
+                        emails_found.add(clean_mail)
 
         if not emails_found:
             return None
 
-        # 2. Prioritize emails
+        # Prioritize emails
         ranked_emails: List[ScrapedEmail] = PriorityEmailFinder.rank_emails(
             raw_emails=list(emails_found),
             page_source=source_url,
@@ -351,23 +418,11 @@ class DeepScraperAgent:
         if not primary:
             return None
 
-        # 3. Extract Company Name
-        company_name = ""
-        title_tag = soup.find("title")
-        if title_tag and title_tag.text:
-            raw_title = title_tag.text.strip()
-            split_parts = re.split(r'[\|\-\–\:\•]', raw_title)
-            company_name = split_parts[0].strip()
-
+        # Fallback company name resolution if still empty
         if not company_name or len(company_name) < 2:
-            h1 = soup.find("h1")
-            if h1 and h1.text:
-                company_name = h1.text.strip()[:40]
-            else:
-                domain_part = urlparse(source_url).netloc.replace("www.", "")
-                company_name = domain_part.split(".")[0].capitalize()
+            company_name = LeadValidationFilter.extract_brand_name_from_domain(domain)
 
-        # 4. Extract Phone Numbers
+        # Extract Phone Numbers
         phones: Set[str] = set()
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"].strip()
@@ -376,13 +431,8 @@ class DeepScraperAgent:
                 if len(phone_num) >= 7:
                     phones.add(phone_num)
 
-        # 5. Extract Tech Stack
+        # Extract Tech Stack
         tech_stack = TechStackDetector.detect(raw_text, headers)
-
-        # 6. Build parsed Domain
-        domain = urlparse(source_url).netloc.replace("www.", "")
-        if not domain:
-            domain = primary.domain
 
         # Determine quality tag based on primary email tier
         tier_tag_map = {
@@ -403,11 +453,12 @@ class DeepScraperAgent:
             industry_niche=niche,
             primary_email=primary.email,
             primary_email_tier=primary.tier,
-            priority_score=primary.priority_score,
+            priority_score=max(primary.priority_score, niche_score),
             all_emails=ranked_emails,
             phone_numbers=list(phones),
             tech_stack=tech_stack,
-            quality_tag=quality_tag
+            quality_tag=quality_tag,
+            metadata={"niche_score": niche_score, "niche_summary": score_summary}
         )
 
         return lead
@@ -500,6 +551,21 @@ class DeepScraperAgent:
 
                 logger.info(f"[SCRAPER] Discovered {len(candidate_subpages)} contact subpages for {base_domain}: {candidate_subpages[:3]}")
 
+                # Calculate root niche score to pass to contact subpages if root had no direct emails
+                root_score = None
+                try:
+                    meta_desc = ""
+                    desc_tag = soup.find("meta", attrs={"name": re.compile(r"description", re.I)})
+                    if desc_tag and desc_tag.get("content"):
+                        meta_desc = desc_tag["content"].strip()
+                    page_text = soup.get_text(separator=" ", strip=True)
+                    raw_title = soup.find("title").text.strip() if soup.find("title") and soup.find("title").text else ""
+                    sc, _ = LeadValidationFilter.calculate_niche_score(niche, raw_title, page_text, meta_desc, base_domain)
+                    if sc >= 70:
+                        root_score = sc
+                except Exception:
+                    pass
+
                 # Crawl top 3 subpages for business contacts
                 for sub_url in candidate_subpages[:3]:
                     try:
@@ -511,7 +577,8 @@ class DeepScraperAgent:
                                 country=country,
                                 city=city,
                                 niche=niche,
-                                headers=dict(sub_resp.headers)
+                                headers=dict(sub_resp.headers),
+                                inherited_niche_score=root_score
                             )
                             if sub_lead and sub_lead.all_emails:
                                 logger.info(f"[SCRAPER] Contact subpage {sub_url} resolved {len(sub_lead.all_emails)} email(s) for {base_domain} (Primary: {sub_lead.primary_email})")

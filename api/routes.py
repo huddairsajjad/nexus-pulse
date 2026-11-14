@@ -129,6 +129,8 @@ class ApproveOutreachRequest(BaseModel):
     approver: Optional[str] = None
     edited_subject: Optional[str] = None
     edited_body: Optional[str] = None
+    edited_recipient: Optional[str] = None
+    edited_company_name: Optional[str] = None
 
 
 class BatchApproveRequest(BaseModel):
@@ -759,10 +761,36 @@ def approve_outreach_item(req: ApproveOutreachRequest, current_user: Dict[str, A
             approver=approver_name,
             edited_subject=req.edited_subject,
             edited_body=req.edited_body,
+            edited_recipient=req.edited_recipient,
+            edited_company_name=req.edited_company_name,
             operator_id=target_op
         )
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.delete("/outreach/queue/{queue_id}")
+@router.delete("/outreach/{queue_id}")
+def delete_outreach_item(queue_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Permanently deletes a single lead item from the Approval Gate queue in 1 click."""
+    gate = get_approval_gate()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    try:
+        return gate.delete_queue_item(queue_id, operator_id=target_op)
+    except (ValueError, PermissionError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/outreach/purge-unapproved")
+@router.delete("/outreach/purge-unapproved")
+def purge_unapproved_gate(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Clear Unapproved Gate:
+    Wipes all pending/unapproved leads held in the Approval Gate in 1 click so admin can run a fresh hunt.
+    """
+    gate = get_approval_gate()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    return gate.purge_unapproved_items(operator_id=target_op)
 
 
 @router.post("/outreach/batch-approve")
@@ -799,7 +827,10 @@ def dispatch_approved_item(
     gate = get_approval_gate()
     target_op = current_user["id"] if current_user.get("role") == "operator" else None
     try:
-        return gate.dispatch_approved_outreach(queue_id, operator_id=target_op)
+        res = gate.dispatch_approved_outreach(queue_id, operator_id=target_op)
+        if not res.get("success"):
+            raise HTTPException(status_code=400, detail=res.get("message", "Dispatch failed."))
+        return res
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -822,9 +853,11 @@ def dispatch_now_trigger(
     if req and req.queue_id:
         try:
             res = gate.dispatch_approved_outreach(req.queue_id, operator_id=target_op)
+            if not res.get("success"):
+                raise HTTPException(status_code=400, detail=res.get("message", "Dispatch failed."))
             return {
                 "success": True,
-                "dispatched_count": 1 if res.get("success") else 0,
+                "dispatched_count": 1,
                 "items": [res],
                 "bypass_window": effective_bypass
             }
@@ -1299,9 +1332,8 @@ async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any
         pres = orchestrator.process_and_preserve_lead(lead, operator_id=op_id)
         if pres["success"]:
             logger.info(f"[HUNT] Lead verified and preserved: {pres['company_name']} ({pres['primary_email']})")
-            verified_leads.append(pres)
-            # Queue in Approval Gate
-            gate.queue_outreach(
+            # Queue in Approval Gate with Deduplication Guard
+            q_res = gate.queue_outreach(
                 lead_id=pres["lead_id"],
                 company_name=pres["company_name"],
                 recipient=pres["primary_email"],
@@ -1312,6 +1344,17 @@ async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any
                 operator_id=op_id,
                 city=city_override
             )
+            if q_res.get("queue_id"):
+                verified_leads.append(pres)
+            else:
+                logger.info(f"[HUNT] Lead blocked from gate by Deduplication Guard: {pres['primary_email']} ({q_res.get('reason')})")
+                rejected_leads.append({
+                    "domain": lead.domain,
+                    "email": lead.primary_email,
+                    "reason": q_res.get("status", "GATE_REJECTED"),
+                    "diagnostic": q_res.get("reason", "Lead blocked by Deduplication Guard"),
+                    "status": q_res.get("status", "DUPLICATE")
+                })
         else:
             logger.warning(f"[HUNT] Lead preservation rejected for {lead.domain}: {pres.get('reason')} - {pres.get('diagnostic', '')}")
             rejected_leads.append({

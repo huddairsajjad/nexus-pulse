@@ -31,7 +31,9 @@ HOT_LEAD_PATTERNS = [
 
 # DNC / GDPR Opt-out signals
 UNSUBSCRIBE_PATTERNS = [
-    r"unsubscribe",
+    r"\bunsubscribe\b",
+    r"\bstop\b",
+    r"^stop\b",
     r"remove (?:me|us|this email)",
     r"do not (?:contact|email|reach out)",
     r"\bdnc\b",
@@ -271,6 +273,17 @@ class IMAPReplyListener:
                 self.suppress_entity(clean_sender, reason="UNSUBSCRIBE", operator_id=operator_id, conn=conn)
                 self.suppress_entity(domain_part, reason="UNSUBSCRIBE", operator_id=operator_id, conn=conn)
 
+                # Automatically add to Blacklist table (blacklist_rules)
+                try:
+                    existing_bl = conn.execute("SELECT id FROM blacklist_rules WHERE lower(pattern) = ?", (clean_sender,)).fetchone()
+                    if not existing_bl:
+                        conn.execute("""
+                            INSERT INTO blacklist_rules (pattern, entity_type, reason, created_by)
+                            VALUES (?, 'email', ?, 'IMAP_POLLER')
+                        """, (clean_sender, f"Opt-Out / STOP Reply: {subject[:60]}"))
+                except Exception as bl_ex:
+                    pass
+
                 conn.execute("""
                     UPDATE outreach_queue
                     SET status = 'SUPPRESSED'
@@ -338,8 +351,7 @@ class IMAPReplyListener:
     def poll_enrolled_inboxes(self) -> Dict[str, Any]:
         """
         Background polling service monitoring active enrolled IMAP inboxes.
-        Connects safely, inspects recent messages for bounces and responses,
-        and triggers classification.
+        Connects via imap.gmail.com:993 with sanitized credentials without silent errors.
         """
         results: List[Dict[str, Any]] = []
         errors: List[str] = []
@@ -348,16 +360,31 @@ class IMAPReplyListener:
             mailboxes = conn.execute("""
                 SELECT id, email_address, imap_host, imap_port, imap_username, imap_password, operator_id
                 FROM mailbox_rotator
-                WHERE is_active = 1 AND imap_host != '' AND imap_username != ''
+                WHERE is_active = 1
             """).fetchall()
+
+        if not mailboxes:
+            return {
+                "success": True,
+                "processed_count": 0,
+                "processed": [],
+                "errors": ["No active mailboxes enrolled in rotator."],
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
 
         for mb in mailboxes:
             mb_email = mb["email_address"]
-            host = mb["imap_host"]
-            port = mb["imap_port"] or 993
-            user = mb["imap_username"]
-            pwd = mb["imap_password"]
+            host = (mb["imap_host"] or "").strip() or "imap.gmail.com"
+            port = int(mb["imap_port"] or 993)
+            user = (mb["imap_username"] or mb["email_address"] or "").strip()
+            raw_pwd = mb["imap_password"] or ""
+            pwd = re.sub(r'\s+', '', raw_pwd)
             op_id = mb["operator_id"]
+
+            if not user or not pwd:
+                err_msg = f"{mb_email}: Missing IMAP credentials (username or App Password)"
+                errors.append(err_msg)
+                continue
 
             try:
                 mail = imaplib.IMAP4_SSL(host, port)
@@ -393,9 +420,11 @@ class IMAPReplyListener:
                                 results.append(proc)
                 mail.logout()
             except Exception as e:
-                errors.append(f"{mb_email}: {str(e)}")
+                err_msg = f"{mb_email} ({host}:{port}): {type(e).__name__} - {str(e)}"
+                errors.append(err_msg)
 
         return {
+            "success": len(errors) == 0,
             "processed_count": len(results),
             "processed": results,
             "errors": errors,
