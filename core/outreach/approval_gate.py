@@ -7,6 +7,7 @@ Integrates with Multi-Service Template Pool, Inbox Rotator with auto-switching,
 and Timezone Smart Scheduler.
 """
 
+import os
 import re
 import uuid
 import smtplib
@@ -23,6 +24,35 @@ from .blacklist_manager import get_blacklist_manager
 from core.hygiene.lead_validator import LeadValidationFilter
 
 logger = logging.getLogger("nexus.approval_gate")
+
+
+def _send_webhook_request(webhook_url: str, payload: dict) -> dict:
+    """Sends HTTPS POST request to Google Apps Script Webhook relay with redirect following."""
+    try:
+        import httpx
+        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+            resp = client.post(webhook_url, json=payload)
+            return resp.json()
+    except ImportError:
+        pass
+
+    try:
+        import requests
+        resp = requests.post(webhook_url, json=payload, allow_redirects=True, timeout=20.0)
+        return resp.json()
+    except ImportError:
+        pass
+
+    import urllib.request
+    import json
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        webhook_url,
+        data=data,
+        headers={"Content-Type": "application/json"}
+    )
+    with urllib.request.urlopen(req, timeout=20.0) as response:
+        return json.loads(response.read().decode("utf-8"))
 
 
 def generate_personalized_copy(
@@ -317,10 +347,11 @@ class HumanApprovalGate:
 
     def dispatch_approved_outreach(self, queue_id: str, operator_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Dispatches an approved outreach item through live SMTP transmission.
+        Dispatches an approved outreach item.
+        Uses Google Apps Script HTTPS Webhook relay if configured (bypassing Railway SMTP port block),
+        or falls back to live SMTP transmission.
         Enforces daily domain caps and auto-switching across active profiles.
-        Performs live SMTP authentication (smtp.gmail.com), appends opt-out footer,
-        and accurately logs delivery only on 250 OK server confirmation.
+        Accurately logs delivery only on confirmed dispatch.
         """
         with self.db.get_connection() as conn:
             row = conn.execute("SELECT * FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
@@ -339,7 +370,8 @@ class HumanApprovalGate:
             if row["mailbox_used"]:
                 mb_record = conn.execute("""
                     SELECT id, email_address, display_name, domain, daily_limit, sent_today,
-                           operator_id, smtp_host, smtp_port, smtp_username, smtp_password
+                           operator_id, smtp_host, smtp_port, smtp_username, smtp_password,
+                           COALESCE(webhook_url, '') as webhook_url
                     FROM mailbox_rotator
                     WHERE (email_address = ? OR id = ?) AND is_active = 1 AND sent_today < daily_limit
                 """, (row["mailbox_used"], row["mailbox_used"])).fetchone()
@@ -349,7 +381,8 @@ class HumanApprovalGate:
                 if mb_dyn:
                     mb_record = conn.execute("""
                         SELECT id, email_address, display_name, domain, daily_limit, sent_today,
-                               operator_id, smtp_host, smtp_port, smtp_username, smtp_password
+                               operator_id, smtp_host, smtp_port, smtp_username, smtp_password,
+                               COALESCE(webhook_url, '') as webhook_url
                         FROM mailbox_rotator
                         WHERE id = ? AND is_active = 1 AND sent_today < daily_limit
                     """, (mb_dyn["id"],)).fetchone()
@@ -379,6 +412,7 @@ class HumanApprovalGate:
             raw_pwd = mb.get("smtp_password") or ""
             # App Password Sanitization: strip all accidental whitespace
             smtp_pwd = re.sub(r'\s+', '', raw_pwd)
+            display_name = (mb.get("display_name") or "").strip()
 
             # Unsubscribe / Opt-Out Compliance Footer
             opt_out_footer = '\n\n---\nNot interested? Reply "STOP" and we will immediately remove you from our outreach list.'
@@ -386,9 +420,8 @@ class HumanApprovalGate:
             if 'Reply "STOP"' not in msg_body and 'reply "stop"' not in msg_body.lower():
                 msg_body = msg_body.rstrip() + opt_out_footer
 
-            # Build MIME Message
+            # Build MIME Message (used for message ID and SMTP fallback)
             msg = MIMEText(msg_body, "plain", "utf-8")
-            display_name = (mb.get("display_name") or "").strip()
             if display_name:
                 msg["From"] = f"{display_name} <{sender_email}>"
             else:
@@ -401,63 +434,101 @@ class HumanApprovalGate:
             msg_id_val = f"<{tracking_id}@{sender_domain}>"
             msg["Message-ID"] = msg_id_val
 
-            # Validate real credentials exist
-            if not smtp_user or not smtp_pwd:
-                err_msg = f"Mailbox '{sender_email}' is missing SMTP credentials (username or App Password)."
-                logger.error(f"[SMTP DISPATCH FAILED] {err_msg}")
-                conn.execute("""
-                    UPDATE outreach_queue
-                    SET status = 'FAILED', bounce_reason = ?
-                    WHERE id = ?
-                """, (err_msg, queue_id))
-                conn.commit()
-                return {
-                    "success": False,
-                    "reason": "MISSING_CREDENTIALS",
-                    "message": err_msg,
-                    "recipient": row["recipient"],
-                    "dispatched_via": sender_email
+            # Priority 1: Check if Mailbox has its own Webhook URL, or fall back to GMAIL_WEBHOOK_URL env
+            mailbox_webhook = (mb.get("webhook_url") or "").strip()
+            env_webhook = os.getenv("GMAIL_WEBHOOK_URL", "").strip()
+            active_webhook = mailbox_webhook or env_webhook
+
+            dispatched_successfully = False
+            dispatch_method = "SMTP"
+            webhook_err_msg = None
+
+            if active_webhook:
+                webhook_secret = os.getenv("GMAIL_WEBHOOK_SECRET", "NEXUS_PULSE_2026")
+                payload = {
+                    "secret": webhook_secret,
+                    "to": row["recipient"].strip(),
+                    "subject": row["subject"],
+                    "body": msg_body,
+                    "sender_name": display_name or "H.Huddair"
                 }
+                try:
+                    logger.info(f"[WEBHOOK DISPATCH] Posting to Apps Script relay for {sender_email} -> {row['recipient']}...")
+                    resp_json = _send_webhook_request(active_webhook, payload)
+                    if isinstance(resp_json, dict) and resp_json.get("status") == "success":
+                        dispatched_successfully = True
+                        dispatch_method = "WEBHOOK"
+                        logger.info(f"[WEBHOOK DISPATCH SUCCESS] Email relayed via Google Apps Script for {sender_email} -> {row['recipient']}.")
+                    else:
+                        webhook_err_msg = resp_json.get("message") or resp_json.get("error") if isinstance(resp_json, dict) else str(resp_json)
+                        logger.warning(f"[WEBHOOK DISPATCH NON-SUCCESS] Status not success: {webhook_err_msg}. Falling back to SMTP...")
+                except Exception as wh_ex:
+                    webhook_err_msg = f"{type(wh_ex).__name__}: {str(wh_ex)}"
+                    logger.warning(f"[WEBHOOK DISPATCH ERROR] {webhook_err_msg}. Falling back to SMTP...")
 
-            # Live SMTP Transmission
-            try:
-                logger.info(f"[SMTP DISPATCH] Connecting securely to {smtp_host}:{smtp_port} for {sender_email} -> {row['recipient']}...")
-                if smtp_port == 465:
-                    server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=25.0)
-                    server.ehlo()
-                else:
-                    server = smtplib.SMTP(smtp_host, smtp_port, timeout=25.0)
-                    server.ehlo()
-                    server.starttls()
-                    server.ehlo()
+            # Priority 2: Fallback to SMTP transmission if webhook was not active or failed
+            if not dispatched_successfully:
+                if not smtp_user or not smtp_pwd:
+                    err_msg = f"Mailbox '{sender_email}' is missing SMTP credentials (username or App Password)."
+                    if webhook_err_msg:
+                        err_msg += f" (Webhook attempt also failed: {webhook_err_msg})"
+                    logger.error(f"[DISPATCH FAILED] {err_msg}")
+                    conn.execute("""
+                        UPDATE outreach_queue
+                        SET status = 'FAILED', bounce_reason = ?
+                        WHERE id = ?
+                    """, (err_msg, queue_id))
+                    conn.commit()
+                    return {
+                        "success": False,
+                        "reason": "MISSING_CREDENTIALS",
+                        "message": err_msg,
+                        "recipient": row["recipient"],
+                        "dispatched_via": sender_email
+                    }
 
-                server.login(smtp_user, smtp_pwd)
-                send_errs = server.sendmail(sender_email, [row["recipient"].strip()], msg.as_string())
-                server.quit()
+                try:
+                    logger.info(f"[SMTP DISPATCH] Connecting securely to {smtp_host}:{smtp_port} for {sender_email} -> {row['recipient']}...")
+                    if smtp_port == 465:
+                        server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=25.0)
+                        server.ehlo()
+                    else:
+                        server = smtplib.SMTP(smtp_host, smtp_port, timeout=25.0)
+                        server.ehlo()
+                        server.starttls()
+                        server.ehlo()
 
-                if send_errs:
-                    raise smtplib.SMTPException(f"Recipients refused by server: {send_errs}")
+                    server.login(smtp_user, smtp_pwd)
+                    send_errs = server.sendmail(sender_email, [row["recipient"].strip()], msg.as_string())
+                    server.quit()
 
-                logger.info(f"[SMTP DISPATCH SUCCESS 250 OK] Email dispatched to {row['recipient']} via {sender_email}.")
+                    if send_errs:
+                        raise smtplib.SMTPException(f"Recipients refused by server: {send_errs}")
 
-            except Exception as smtp_ex:
-                err_details = f"{type(smtp_ex).__name__}: {str(smtp_ex)}"
-                logger.error(f"[SMTP DISPATCH FAILED] Error transmitting to {row['recipient']}: {err_details}", exc_info=True)
-                conn.execute("""
-                    UPDATE outreach_queue
-                    SET status = 'FAILED', bounce_reason = ?
-                    WHERE id = ?
-                """, (f"SMTP Failure: {err_details}", queue_id))
-                conn.commit()
-                return {
-                    "success": False,
-                    "reason": "SMTP_FAILED",
-                    "message": f"SMTP transmission failed: {err_details}",
-                    "recipient": row["recipient"],
-                    "dispatched_via": sender_email
-                }
+                    dispatched_successfully = True
+                    dispatch_method = "SMTP"
+                    logger.info(f"[SMTP DISPATCH SUCCESS 250 OK] Email dispatched to {row['recipient']} via {sender_email}.")
 
-            # ONLY increment daily send counter and mark status as 'SENT' AFTER smtplib confirms successful 250 OK
+                except Exception as smtp_ex:
+                    err_details = f"{type(smtp_ex).__name__}: {str(smtp_ex)}"
+                    if webhook_err_msg:
+                        err_details += f" (Webhook also failed: {webhook_err_msg})"
+                    logger.error(f"[SMTP DISPATCH FAILED] Error transmitting to {row['recipient']}: {err_details}", exc_info=True)
+                    conn.execute("""
+                        UPDATE outreach_queue
+                        SET status = 'FAILED', bounce_reason = ?
+                        WHERE id = ?
+                    """, (f"Dispatch Failure: {err_details}", queue_id))
+                    conn.commit()
+                    return {
+                        "success": False,
+                        "reason": "DISPATCH_FAILED",
+                        "message": f"Dispatch failed: {err_details}",
+                        "recipient": row["recipient"],
+                        "dispatched_via": sender_email
+                    }
+
+            # Increment daily send counter for this mailbox
             self.rotator.record_email_dispatched(mb["id"])
 
             now_iso = datetime.now(timezone.utc).isoformat()
@@ -486,7 +557,8 @@ class HumanApprovalGate:
                 "channel": row["channel"],
                 "dispatched_via": sender_email,
                 "sent_at": now_iso,
-                "followup_scheduled_for_days": 7
+                "followup_scheduled_for_days": 7,
+                "delivery_method": dispatch_method
             }
 
     def dispatch_ready_queue(

@@ -153,3 +153,23 @@ class AuthResponse(BaseModel):
     token: str
     user: UserProfile
 
+
+class MailboxModel(BaseModel):
+    id: str
+    email_address: str
+    display_name: str
+    domain: str
+    daily_limit: int = 45
+    sent_today: int = 0
+    is_active: bool = True
+    operator_id: Optional[str] = None
+    smtp_host: Optional[str] = ""
+    smtp_port: Optional[int] = 587
+    smtp_username: Optional[str] = ""
+    smtp_password: Optional[str] = ""
+    imap_host: Optional[str] = ""
+    imap_port: Optional[int] = 993
+    imap_username: Optional[str] = ""
+    imap_password: Optional[str] = ""
+    webhook_url: Optional[str] = ""
+

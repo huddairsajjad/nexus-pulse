@@ -46,6 +46,14 @@ class TestProductionFixes(unittest.TestCase):
         self.app = create_app()
         self.client = TestClient(self.app)
 
+    def tearDown(self):
+        with self.db.get_connection() as conn:
+            conn.execute("DELETE FROM outreach_queue WHERE recipient LIKE '%client-firm%' OR recipient LIKE '%facade-systems%' OR company_name IN ('Client Firm GmbH', 'Facade Systems GmbH')")
+            conn.execute("DELETE FROM mailbox_rotator WHERE email_address LIKE '%outreach-test.io%'")
+            conn.execute("DELETE FROM inbox_replies WHERE sender_email LIKE '%facade-systems%' OR company_name IN ('Client Firm GmbH', 'Facade Systems GmbH')")
+            conn.execute("DELETE FROM followup_sequences WHERE recipient_email LIKE '%client-firm%' OR recipient_email LIKE '%facade-systems%'")
+            conn.commit()
+
     # =========================================================================
     # 1. RAILWAY IPV4 SOCKET ENFORCEMENT
     # =========================================================================

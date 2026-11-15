@@ -45,7 +45,8 @@ class InboxRotator:
             query = """
                 SELECT id, email_address, display_name, domain, daily_limit, sent_today,
                        operator_id, smtp_host, smtp_port, smtp_username, smtp_password,
-                       imap_host, imap_port, imap_username, imap_password
+                       imap_host, imap_port, imap_username, imap_password,
+                       COALESCE(webhook_url, '') as webhook_url
                 FROM mailbox_rotator
                 WHERE is_active = 1 AND sent_today < daily_limit
             """
@@ -90,7 +91,8 @@ class InboxRotator:
                        COALESCE(imap_host, '') as imap_host,
                        COALESCE(imap_port, 993) as imap_port,
                        COALESCE(imap_username, '') as imap_username,
-                       COALESCE(imap_password, '') as imap_password
+                       COALESCE(imap_password, '') as imap_password,
+                       COALESCE(webhook_url, '') as webhook_url
                 FROM mailbox_rotator
             """
             params: List[Any] = []
@@ -116,7 +118,8 @@ class InboxRotator:
         imap_host: str = "",
         imap_port: int = 993,
         imap_username: str = "",
-        imap_password: str = ""
+        imap_password: str = "",
+        webhook_url: str = ""
     ) -> Dict[str, Any]:
         """Enrolls a new SMTP/IMAP mailbox profile bound to an operator."""
         email = email_address.strip().lower()
@@ -137,13 +140,15 @@ class InboxRotator:
                     id, email_address, display_name, domain, daily_limit, sent_today,
                     last_reset_date, is_active, operator_id,
                     smtp_host, smtp_port, smtp_username, smtp_password,
-                    imap_host, imap_port, imap_username, imap_password
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    imap_host, imap_port, imap_username, imap_password,
+                    webhook_url
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 mb_id, email, display_name.strip(), dom, daily_limit, today_str,
                 operator_id,
                 smtp_host.strip(), smtp_port, smtp_username.strip(), smtp_password,
-                imap_host.strip(), imap_port, imap_username.strip(), imap_password
+                imap_host.strip(), imap_port, imap_username.strip(), imap_password,
+                webhook_url.strip()
             ))
             conn.commit()
 
@@ -153,7 +158,8 @@ class InboxRotator:
             "display_name": display_name.strip(),
             "domain": dom,
             "daily_limit": daily_limit,
-            "operator_id": operator_id
+            "operator_id": operator_id,
+            "webhook_url": webhook_url.strip()
         }
 
     def seed_test_mailboxes_for_tests(self, operator_id: Optional[str] = None) -> None:

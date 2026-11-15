@@ -242,7 +242,8 @@ class DatabaseEngine:
                     imap_host TEXT DEFAULT '',
                     imap_port INTEGER DEFAULT 993,
                     imap_username TEXT DEFAULT '',
-                    imap_password TEXT DEFAULT ''
+                    imap_password TEXT DEFAULT '',
+                    webhook_url TEXT DEFAULT ''
                 );
             """)
 
@@ -257,7 +258,8 @@ class DatabaseEngine:
                 ("imap_host", "TEXT DEFAULT ''"),
                 ("imap_port", "INTEGER DEFAULT 993"),
                 ("imap_username", "TEXT DEFAULT ''"),
-                ("imap_password", "TEXT DEFAULT ''")
+                ("imap_password", "TEXT DEFAULT ''"),
+                ("webhook_url", "TEXT DEFAULT ''")
             ]
             for col_name, col_def in mb_migrations:
                 if col_name not in existing_mb_cols:

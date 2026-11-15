@@ -370,6 +370,7 @@ function NexusPulseApp() {
   const [newMbUsername, setNewMbUsername] = useState("");
   const [newMbPassword, setNewMbPassword] = useState("");
   const [newMbDailyLimit, setNewMbDailyLimit] = useState("45");
+  const [newMbWebhookUrl, setNewMbWebhookUrl] = useState("");
 
   const [selectedMailboxForEdit, setSelectedMailboxForEdit] = useState(null);
   const [editMbDisplayName, setEditMbDisplayName] = useState("");
@@ -379,6 +380,7 @@ function NexusPulseApp() {
   const [editMbUsername, setEditMbUsername] = useState("");
   const [editMbPassword, setEditMbPassword] = useState("");
   const [editMbDailyLimit, setEditMbDailyLimit] = useState("45");
+  const [editMbWebhookUrl, setEditMbWebhookUrl] = useState("");
 
   // ---------------------------------------------------------------------------
   // SAAS EXPANSION STATE: TEMPLATES, BILLING, BLACKLIST & ANALYTICS
@@ -1080,7 +1082,8 @@ function NexusPulseApp() {
           smtp_port: parseInt(newMbPort, 10) || 587,
           smtp_username: newMbUsername,
           smtp_password: newMbPassword,
-          daily_limit: parseInt(newMbDailyLimit, 10) || 45
+          daily_limit: parseInt(newMbDailyLimit, 10) || 45,
+          webhook_url: newMbWebhookUrl || ""
         })
       });
       const data = await resp.json();
@@ -1093,6 +1096,7 @@ function NexusPulseApp() {
         setNewMbUsername("");
         setNewMbPassword("");
         setNewMbDailyLimit("45");
+        setNewMbWebhookUrl("");
         setAlertBanner({ type: "success", message: `Mailbox '${data.email_address}' enrolled into rotator!` });
         fetchData();
       } else {
@@ -1112,6 +1116,7 @@ function NexusPulseApp() {
     setEditMbUsername(mb.smtp_username || "");
     setEditMbPassword(mb.smtp_password || "");
     setEditMbDailyLimit(String(mb.daily_limit || 45));
+    setEditMbWebhookUrl(mb.webhook_url || "");
   };
 
   const handleUpdateMailbox = async (e) => {
@@ -1131,7 +1136,8 @@ function NexusPulseApp() {
           smtp_port: parseInt(editMbPort, 10) || 587,
           smtp_username: editMbUsername,
           smtp_password: editMbPassword || undefined,
-          daily_limit: parseInt(editMbDailyLimit, 10) || 45
+          daily_limit: parseInt(editMbDailyLimit, 10) || 45,
+          webhook_url: editMbWebhookUrl !== undefined ? editMbWebhookUrl : undefined
         })
       });
       const data = await resp.json();
@@ -2533,6 +2539,16 @@ function NexusPulseApp() {
                         <div className="flex justify-between text-theme-secondary">
                           <span>Username:</span>
                           <span className="text-theme-primary truncate max-w-[160px]">{mb.smtp_username || mb.email_address}</span>
+                        </div>
+                        <div className="flex justify-between text-theme-secondary items-center pt-0.5 border-t border-theme/50">
+                          <span>Relay Mode:</span>
+                          <span>
+                            {mb.webhook_url ? (
+                              <span className="badge badge-accent text-[9px] py-0.5 px-1.5" title={mb.webhook_url}>⚡ HTTPS Webhook</span>
+                            ) : (
+                              <span className="text-theme-muted text-[10px]">Direct SMTP</span>
+                            )}
+                          </span>
                         </div>
                       </div>
 
@@ -4248,6 +4264,20 @@ function NexusPulseApp() {
                     required
                   />
                 </div>
+
+                <div>
+                  <label className="np-label">Google Apps Script Webhook URL <span className="text-theme-muted font-normal">(Optional — Bypasses SMTP Port Block)</span></label>
+                  <input
+                    type="url"
+                    value={newMbWebhookUrl}
+                    onChange={(e) => setNewMbWebhookUrl(e.target.value)}
+                    placeholder="https://script.google.com/macros/s/.../exec"
+                    className="np-input font-mono"
+                  />
+                  <span className="text-[10px] text-theme-muted mt-0.5 block">
+                    Optional: If set, outbound emails for this mailbox are relayed via HTTPS Webhook, completely bypassing cloud host / Railway SMTP port blocks.
+                  </span>
+                </div>
               </div>
 
               <div className="np-modal-footer">
@@ -4367,6 +4397,20 @@ function NexusPulseApp() {
                     max="100"
                     required
                   />
+                </div>
+
+                <div>
+                  <label className="np-label">Google Apps Script Webhook URL <span className="text-theme-muted font-normal">(Optional — Bypasses SMTP Port Block)</span></label>
+                  <input
+                    type="url"
+                    value={editMbWebhookUrl}
+                    onChange={(e) => setEditMbWebhookUrl(e.target.value)}
+                    placeholder="https://script.google.com/macros/s/.../exec"
+                    className="np-input font-mono"
+                  />
+                  <span className="text-[10px] text-theme-muted mt-0.5 block">
+                    Optional: If set, outbound emails for this mailbox are relayed via HTTPS Webhook, completely bypassing cloud host / Railway SMTP port blocks.
+                  </span>
                 </div>
               </div>
 

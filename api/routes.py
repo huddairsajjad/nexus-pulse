@@ -195,6 +195,7 @@ class MailboxCreateRequest(BaseModel):
     imap_port: Optional[int] = 993
     imap_username: Optional[str] = ""
     imap_password: Optional[str] = ""
+    webhook_url: Optional[str] = ""
 
 
 class MailboxUpdateRequest(BaseModel):
@@ -210,6 +211,7 @@ class MailboxUpdateRequest(BaseModel):
     imap_port: Optional[int] = None
     imap_username: Optional[str] = None
     imap_password: Optional[str] = None
+    webhook_url: Optional[str] = None
 
 
 class AdminProfileUpdateRequest(BaseModel):
@@ -958,7 +960,7 @@ def list_enrolled_mailboxes(current_user: Dict[str, Any] = Depends(get_current_u
 
 @router.post("/mailboxes")
 def enroll_mailbox(req: MailboxCreateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Enrolls an active SMTP profile with per-mailbox daily sending cap."""
+    """Enrolls an active SMTP profile with per-mailbox daily sending cap and optional webhook relay."""
     rotator = get_inbox_rotator()
     op_id = current_user["id"]
     try:
@@ -975,7 +977,8 @@ def enroll_mailbox(req: MailboxCreateRequest, current_user: Dict[str, Any] = Dep
             imap_host=req.imap_host or "",
             imap_port=req.imap_port or 993,
             imap_username=req.imap_username or req.email_address,
-            imap_password=req.imap_password or ""
+            imap_password=req.imap_password or "",
+            webhook_url=req.webhook_url or ""
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1019,6 +1022,8 @@ def update_mailbox(mailbox_id: str, req: MailboxUpdateRequest, current_user: Dic
             fields.append("imap_username = ?"); values.append(req.imap_username.strip())
         if req.imap_password is not None:
             fields.append("imap_password = ?"); values.append(req.imap_password)
+        if req.webhook_url is not None:
+            fields.append("webhook_url = ?"); values.append(req.webhook_url.strip())
 
         if not fields:
             raise HTTPException(status_code=400, detail="No fields provided to update.")
@@ -1077,7 +1082,8 @@ def send_hot_reply(req: DispatchHotReplyRequest, current_user: Dict[str, Any] = 
         if mb_avail:
             mb_row = conn.execute("""
                 SELECT id, email_address, display_name, domain, daily_limit, sent_today,
-                       operator_id, smtp_host, smtp_port, smtp_username, smtp_password
+                       operator_id, smtp_host, smtp_port, smtp_username, smtp_password,
+                       COALESCE(webhook_url, '') as webhook_url
                 FROM mailbox_rotator
                 WHERE id = ? AND is_active = 1 AND sent_today < daily_limit
             """, (mb_avail["id"],)).fetchone()
@@ -1093,43 +1099,80 @@ def send_hot_reply(req: DispatchHotReplyRequest, current_user: Dict[str, Any] = 
     raw_pwd = mb.get("smtp_password") or ""
     smtp_pwd = re.sub(r'\s+', '', raw_pwd)
 
-    if not smtp_user or not smtp_pwd:
-        raise HTTPException(status_code=400, detail=f"Mailbox '{sender}' is missing SMTP credentials (username or App Password).")
-
     with db.get_connection() as conn:
         rep_row = conn.execute("SELECT subject FROM inbox_replies WHERE id = ?", (req.reply_id,)).fetchone()
         orig_subj = rep_row["subject"] if rep_row else "Response to your inquiry"
 
     subject = orig_subj if orig_subj.lower().startswith("re:") else f"Re: {orig_subj}"
 
-    msg = MIMEText(req.response_body, "plain", "utf-8")
     display_name = (mb.get("display_name") or "").strip()
-    msg["From"] = f"{display_name} <{sender}>" if display_name else sender
-    msg["To"] = req.recipient.strip()
-    msg["Subject"] = subject
-    msg["Date"] = formatdate(localtime=True)
-    sender_domain = sender.split("@")[-1] if "@" in sender else "gmail.com"
-    msg["Message-ID"] = make_msgid(domain=sender_domain)
 
-    # Live SMTP Transmission
-    try:
-        if smtp_port == 465:
-            server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=25.0)
-            server.ehlo()
-        else:
-            server = smtplib.SMTP(smtp_host, smtp_port, timeout=25.0)
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
+    # Webhook Relay Check
+    mailbox_webhook = (mb.get("webhook_url") or "").strip()
+    env_webhook = os.getenv("GMAIL_WEBHOOK_URL", "").strip()
+    active_webhook = mailbox_webhook or env_webhook
 
-        server.login(smtp_user, smtp_pwd)
-        send_errs = server.sendmail(sender, [req.recipient.strip()], msg.as_string())
-        server.quit()
-        if send_errs:
-            raise smtplib.SMTPException(f"Recipients refused by server: {send_errs}")
-    except Exception as e:
-        logger.error(f"[HOT REPLY SMTP FAILED] Error transmitting to {req.recipient}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"SMTP transmission failed: {type(e).__name__} - {str(e)}")
+    dispatched = False
+    webhook_err = None
+
+    if active_webhook:
+        from core.outreach.approval_gate import _send_webhook_request
+        payload = {
+            "secret": os.getenv("GMAIL_WEBHOOK_SECRET", "NEXUS_PULSE_2026"),
+            "to": req.recipient.strip(),
+            "subject": subject,
+            "body": req.response_body,
+            "sender_name": display_name or "H.Huddair"
+        }
+        try:
+            resp_json = _send_webhook_request(active_webhook, payload)
+            if isinstance(resp_json, dict) and resp_json.get("status") == "success":
+                dispatched = True
+                logger.info(f"[HOT REPLY WEBHOOK SUCCESS] Response sent via webhook to {req.recipient}")
+            else:
+                webhook_err = resp_json.get("message") or resp_json.get("error") if isinstance(resp_json, dict) else str(resp_json)
+                logger.warning(f"[HOT REPLY WEBHOOK NON-SUCCESS] {webhook_err}. Falling back to SMTP...")
+        except Exception as wh_e:
+            webhook_err = str(wh_e)
+            logger.warning(f"[HOT REPLY WEBHOOK ERROR] {webhook_err}. Falling back to SMTP...")
+
+    if not dispatched:
+        if not smtp_user or not smtp_pwd:
+            err_detail = f"Mailbox '{sender}' is missing SMTP credentials (username or App Password)."
+            if webhook_err:
+                err_detail += f" (Webhook attempt also failed: {webhook_err})"
+            raise HTTPException(status_code=400, detail=err_detail)
+
+        msg = MIMEText(req.response_body, "plain", "utf-8")
+        msg["From"] = f"{display_name} <{sender}>" if display_name else sender
+        msg["To"] = req.recipient.strip()
+        msg["Subject"] = subject
+        msg["Date"] = formatdate(localtime=True)
+        sender_domain = sender.split("@")[-1] if "@" in sender else "gmail.com"
+        msg["Message-ID"] = make_msgid(domain=sender_domain)
+
+        # Live SMTP Transmission
+        try:
+            if smtp_port == 465:
+                server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=25.0)
+                server.ehlo()
+            else:
+                server = smtplib.SMTP(smtp_host, smtp_port, timeout=25.0)
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+
+            server.login(smtp_user, smtp_pwd)
+            send_errs = server.sendmail(sender, [req.recipient.strip()], msg.as_string())
+            server.quit()
+            if send_errs:
+                raise smtplib.SMTPException(f"Recipients refused by server: {send_errs}")
+        except Exception as e:
+            err_msg = f"{type(e).__name__}: {str(e)}"
+            if webhook_err:
+                err_msg += f" (Webhook attempt also failed: {webhook_err})"
+            logger.error(f"[HOT REPLY SMTP FAILED] Error transmitting to {req.recipient}: {err_msg}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Dispatch failed: {err_msg}")
 
     rotator.record_email_dispatched(mb["id"])
 
