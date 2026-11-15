@@ -152,7 +152,8 @@ class SearchDiscoveryAgent:
         "youtube.", "wikipedia.", "reddit.", "amazon.", "apple.",
         "github.", "pinterest.", "tiktok.", "medium.", "quora.",
         "tripadvisor.", "yelp.", "w3schools.", "stackoverflow.", "t.me",
-        "wixpress.com", "lexisnexis.com", "m-w.com", "f6s.com"
+        "wixpress.com", "sentry-next.wixpress.com", "sentry.io",
+        "lexisnexis.com", "m-w.com", "f6s.com"
     }
 
     def __init__(self, timeout_seconds: float = 10.0):

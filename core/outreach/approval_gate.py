@@ -79,8 +79,28 @@ class HumanApprovalGate:
         Places a lead into the mandatory Human Approval Gate (status: PENDING_APPROVAL).
         Computes regional working hours and renders custom or matched template copy.
         """
-        # 1. Compliance & Deduplication Guard: Check Pipeline, Sent history, Blacklist & Suppression
         domain = recipient.split("@")[-1] if "@" in recipient else None
+
+        # 0. Drop junk domains & invalid system prefixes
+        if domain and LeadValidationFilter.is_junk_domain(domain):
+            return {
+                "queue_id": None,
+                "status": "DROPPED",
+                "reason": "JUNK_DOMAIN",
+                "message": f"Recipient domain '{domain}' dropped as junk/tracker domain."
+            }
+        is_em_valid, clean_recip, em_reason = LeadValidationFilter.sanitize_and_validate_email(recipient, domain)
+        if not is_em_valid:
+            return {
+                "queue_id": None,
+                "status": "DROPPED",
+                "reason": "INVALID_EMAIL_PREFIX",
+                "message": f"Recipient '{recipient}' dropped: {em_reason}"
+            }
+        recipient = clean_recip
+        company_name = LeadValidationFilter.clean_company_name(company_name, domain or "")
+
+        # 1. Compliance & Deduplication Guard: Check Pipeline, Sent history, Blacklist & Suppression
         with self.db.get_connection() as conn:
             is_dup_guard, guard_reason = LeadValidationFilter.is_lead_duplicate_or_blacklisted(
                 recipient, conn, domain=domain
@@ -311,17 +331,45 @@ class HumanApprovalGate:
             if operator_id and row["operator_id"] and row["operator_id"] != operator_id:
                 raise PermissionError("Access denied: You cannot dispatch outreach for another tenant.")
 
-            if row["status"] not in ("APPROVED", "SCHEDULED"):
+            if row["status"] not in ("APPROVED", "SCHEDULED", "FAILED"):
                 raise PermissionError(f"CANNOT DISPATCH: Item is in '{row['status']}' state. Manual approval required.")
 
-            # Select available sending mailbox with auto-switching
-            mb = self.rotator.get_next_available_mailbox(operator_id=target_op)
-            if not mb:
-                return {
-                    "success": False,
-                    "reason": "ALL_MAILBOXES_AT_CAPACITY",
-                    "message": "All sending inboxes have reached their daily limit (40-50). Queued for next quota reset."
-                }
+            # Dynamic Mailbox Credential Lookup: Reads live credentials directly from database at execution time
+            mb_record = None
+            if row["mailbox_used"]:
+                mb_record = conn.execute("""
+                    SELECT id, email_address, display_name, domain, daily_limit, sent_today,
+                           operator_id, smtp_host, smtp_port, smtp_username, smtp_password
+                    FROM mailbox_rotator
+                    WHERE (email_address = ? OR id = ?) AND is_active = 1 AND sent_today < daily_limit
+                """, (row["mailbox_used"], row["mailbox_used"])).fetchone()
+
+            if not mb_record:
+                mb_dyn = self.rotator.get_next_available_mailbox(operator_id=target_op)
+                if mb_dyn:
+                    mb_record = conn.execute("""
+                        SELECT id, email_address, display_name, domain, daily_limit, sent_today,
+                               operator_id, smtp_host, smtp_port, smtp_username, smtp_password
+                        FROM mailbox_rotator
+                        WHERE id = ? AND is_active = 1 AND sent_today < daily_limit
+                    """, (mb_dyn["id"],)).fetchone()
+
+            if not mb_record:
+                any_mb = conn.execute("SELECT count(*) as cnt FROM mailbox_rotator WHERE is_active = 1").fetchone()
+                if any_mb and any_mb["cnt"] > 0:
+                    return {
+                        "success": False,
+                        "reason": "ALL_MAILBOXES_AT_CAPACITY",
+                        "message": "All sending inboxes have reached their daily limit (40-50). Queued for next quota reset."
+                    }
+                else:
+                    return {
+                        "success": False,
+                        "reason": "NO_ACTIVE_MAILBOX",
+                        "message": "No active mailbox enrolled in rotator. Please add an active mailbox with SMTP credentials."
+                    }
+
+            mb = dict(mb_record)
 
             # Mailbox configuration
             smtp_host = (mb.get("smtp_host") or "").strip() or "smtp.gmail.com"
@@ -349,7 +397,9 @@ class HumanApprovalGate:
             msg["Subject"] = row["subject"]
             msg["Date"] = formatdate(localtime=True)
             sender_domain = sender_email.split("@")[-1] if "@" in sender_email else "gmail.com"
-            msg["Message-ID"] = make_msgid(domain=sender_domain)
+            tracking_id = row["tracking_id"] or str(uuid.uuid4())
+            msg_id_val = f"<{tracking_id}@{sender_domain}>"
+            msg["Message-ID"] = msg_id_val
 
             # Validate real credentials exist
             if not smtp_user or not smtp_pwd:
@@ -413,9 +463,9 @@ class HumanApprovalGate:
             now_iso = datetime.now(timezone.utc).isoformat()
             conn.execute("""
                 UPDATE outreach_queue
-                SET status = 'SENT', sent_at = CURRENT_TIMESTAMP, mailbox_used = ?, message_body = ?
+                SET status = 'SENT', sent_at = CURRENT_TIMESTAMP, mailbox_used = ?, message_body = ?, bounce_reason = NULL, message_id = ?
                 WHERE id = ?
-            """, (sender_email, msg_body, queue_id))
+            """, (sender_email, msg_body, msg_id_val, queue_id))
 
             # Initialize 7-Day Follow-Up Sequence
             followup_id = str(uuid.uuid4())
@@ -453,7 +503,7 @@ class HumanApprovalGate:
             query = """
                 SELECT id, target_country, recipient, status, operator_id, scheduled_for
                 FROM outreach_queue
-                WHERE status IN ('APPROVED', 'SCHEDULED')
+                WHERE status IN ('APPROVED', 'SCHEDULED', 'FAILED')
             """
             params: List[Any] = []
             if operator_id:

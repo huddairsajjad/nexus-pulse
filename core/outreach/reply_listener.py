@@ -60,6 +60,22 @@ BOUNCE_PATTERNS = [
 ]
 
 
+def decode_mime_header(header_val: Optional[str]) -> str:
+    """Decodes MIME encoded header strings into clean UTF-8 text."""
+    if not header_val:
+        return ""
+    try:
+        decoded_parts = []
+        for fragment, encoding in decode_header(header_val):
+            if isinstance(fragment, bytes):
+                decoded_parts.append(fragment.decode(encoding or "utf-8", errors="ignore"))
+            else:
+                decoded_parts.append(str(fragment))
+        return "".join(decoded_parts).strip()
+    except Exception:
+        return str(header_val).strip()
+
+
 class ReplyClassifier:
     """Classifies incoming business responses and drafts contextual 1-click responses."""
 
@@ -208,38 +224,87 @@ class IMAPReplyListener:
         body: str,
         lead_id: Optional[str] = None,
         company_name: Optional[str] = None,
-        operator_id: Optional[str] = None
+        operator_id: Optional[str] = None,
+        in_reply_to: Optional[str] = None,
+        references: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Processes an incoming response:
+        - Resolves originating lead & queue item via recipient email, In-Reply-To, or Re: subjects.
         - Detects bounces -> flags lead as BOUNCED and suppresses email/domain
         - Detects unsubscribes -> flags as SUPPRESSED and adds to suppressed_entities
-        - Detects hot leads -> routes to Hot Leads with 1-click draft
+        - Detects hot leads -> updates outreach_queue to HOT_LEAD, routes to Hot Leads with 1-click draft
+        - Detects neutral replies -> updates outreach_queue to REPLIED
+        - Updates live dashboard counters (Sent, Replies, Hot Leads)
         """
         clean_sender = sender_email.strip().lower()
         domain_part = clean_sender.split("@")[-1] if "@" in clean_sender else clean_sender
         comp = company_name or domain_part.capitalize()
+        clean_subject = re.sub(r'^(?:(?:re|aw|wg|fwd|fw|antwort)\s*:\s*)+', '', subject, flags=re.IGNORECASE).strip()
 
         classification, is_hot = ReplyClassifier.classify(subject, body, clean_sender)
-        ai_reply = ReplyClassifier.draft_1click_response(clean_sender, comp, body) if is_hot else ""
-
         reply_id = str(uuid.uuid4())
 
         with self.db.get_connection() as conn:
-            # Detect associated operator if not provided
-            if not operator_id:
+            # 1. Multi-vector match against outreach_queue (In-Reply-To, recipient email, or Re: subject)
+            matching_q = None
+
+            # Vector A: In-Reply-To or References matching tracking_id or message_id
+            if in_reply_to:
+                clean_irt = in_reply_to.strip().strip("<>")
                 matching_q = conn.execute("""
-                    SELECT operator_id FROM outreach_queue
-                    WHERE lower(recipient) = ? ORDER BY created_at DESC LIMIT 1
+                    SELECT * FROM outreach_queue
+                    WHERE tracking_id = ?
+                       OR (message_id IS NOT NULL AND (message_id = ? OR message_id = ?))
+                       OR ? LIKE '%' || tracking_id || '%'
+                    ORDER BY created_at DESC LIMIT 1
+                """, (clean_irt, in_reply_to.strip(), f"<{clean_irt}>", in_reply_to)).fetchone()
+
+            if not matching_q and references:
+                clean_ref = references.strip().strip("<>")
+                matching_q = conn.execute("""
+                    SELECT * FROM outreach_queue
+                    WHERE tracking_id = ?
+                       OR (message_id IS NOT NULL AND message_id LIKE ?)
+                       OR ? LIKE '%' || tracking_id || '%'
+                    ORDER BY created_at DESC LIMIT 1
+                """, (clean_ref, f"%{clean_ref}%", references)).fetchone()
+
+            # Vector B: Recipient email match (case-insensitive)
+            if not matching_q and clean_sender:
+                matching_q = conn.execute("""
+                    SELECT * FROM outreach_queue
+                    WHERE lower(recipient) = ?
+                    ORDER BY created_at DESC LIMIT 1
                 """, (clean_sender,)).fetchone()
-                if matching_q and matching_q["operator_id"]:
+
+            # Vector C: Normalized Re: subject match
+            if not matching_q and clean_subject and len(clean_subject) >= 3:
+                matching_q = conn.execute("""
+                    SELECT * FROM outreach_queue
+                    WHERE lower(trim(subject)) = lower(?)
+                       OR lower(trim(subject)) LIKE lower(?)
+                       OR lower(?) LIKE '%' || lower(trim(subject)) || '%'
+                    ORDER BY created_at DESC LIMIT 1
+                """, (clean_subject, f"%{clean_subject}%", clean_subject)).fetchone()
+
+            if matching_q:
+                if not lead_id:
+                    lead_id = matching_q["lead_id"]
+                if not company_name and matching_q["company_name"]:
+                    comp = matching_q["company_name"]
+                if not operator_id and matching_q["operator_id"]:
                     operator_id = matching_q["operator_id"]
+                matching_qid = matching_q["id"]
+            else:
+                matching_qid = None
+
+            ai_reply = ReplyClassifier.draft_1click_response(clean_sender, comp, body) if is_hot else ""
 
             # Case 1: BOUNCE
             if classification == "BOUNCE":
                 # Extract bounced recipient from body if present
                 found_emails_raw = re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', body)
-                # Strip trailing dots/punctuation that get captured from sentence endings
                 found_emails = [e.rstrip('.') for e in found_emails_raw]
                 bounced_recipients = [
                     e.lower() for e in found_emails 
@@ -260,6 +325,13 @@ class IMAPReplyListener:
                 self.suppress_entity(clean_sender, reason="BOUNCE", operator_id=operator_id, conn=conn)
                 self.suppress_entity(domain_part, reason="BOUNCE", operator_id=operator_id, conn=conn)
 
+                if matching_qid:
+                    conn.execute("""
+                        UPDATE outreach_queue
+                        SET status = 'BOUNCED', bounced_at = CURRENT_TIMESTAMP, bounce_reason = ?
+                        WHERE id = ?
+                    """, (subject[:100], matching_qid))
+
                 conn.execute("""
                     UPDATE outreach_queue
                     SET status = 'BOUNCED',
@@ -273,7 +345,6 @@ class IMAPReplyListener:
                 self.suppress_entity(clean_sender, reason="UNSUBSCRIBE", operator_id=operator_id, conn=conn)
                 self.suppress_entity(domain_part, reason="UNSUBSCRIBE", operator_id=operator_id, conn=conn)
 
-                # Automatically add to Blacklist table (blacklist_rules)
                 try:
                     existing_bl = conn.execute("SELECT id FROM blacklist_rules WHERE lower(pattern) = ?", (clean_sender,)).fetchone()
                     if not existing_bl:
@@ -281,8 +352,15 @@ class IMAPReplyListener:
                             INSERT INTO blacklist_rules (pattern, entity_type, reason, created_by)
                             VALUES (?, 'email', ?, 'IMAP_POLLER')
                         """, (clean_sender, f"Opt-Out / STOP Reply: {subject[:60]}"))
-                except Exception as bl_ex:
+                except Exception:
                     pass
+
+                if matching_qid:
+                    conn.execute("""
+                        UPDATE outreach_queue
+                        SET status = 'SUPPRESSED'
+                        WHERE id = ?
+                    """, (matching_qid,))
 
                 conn.execute("""
                     UPDATE outreach_queue
@@ -292,18 +370,32 @@ class IMAPReplyListener:
 
             # Case 3: HOT LEAD
             elif is_hot:
+                if matching_qid:
+                    conn.execute("""
+                        UPDATE outreach_queue
+                        SET status = 'HOT_LEAD'
+                        WHERE id = ?
+                    """, (matching_qid,))
+
                 conn.execute("""
                     UPDATE outreach_queue
                     SET status = 'HOT_LEAD'
                     WHERE lower(recipient) = ?
                 """, (clean_sender,))
 
-            # Case 4: NEUTRAL REPLY
+            # Case 4: NEUTRAL / STANDARD REPLY
             else:
+                if matching_qid:
+                    conn.execute("""
+                        UPDATE outreach_queue
+                        SET status = 'REPLIED'
+                        WHERE id = ?
+                    """, (matching_qid,))
+
                 conn.execute("""
                     UPDATE outreach_queue
                     SET status = 'REPLIED'
-                    WHERE lower(recipient) = ? AND status = 'SENT'
+                    WHERE lower(recipient) = ? AND status IN ('SENT', 'APPROVED', 'SCHEDULED')
                 """, (clean_sender,))
 
             # Log into inbox_replies
@@ -398,14 +490,20 @@ class IMAPReplyListener:
                             if isinstance(response_part, tuple):
                                 msg = email.message_from_bytes(response_part[1])
                                 sender = msg.get("From", "")
-                                subject_raw = msg.get("Subject", "")
+                                subject_raw = decode_mime_header(msg.get("Subject", ""))
+                                in_reply_to = msg.get("In-Reply-To", "")
+                                references = msg.get("References", "")
                                 body_text = ""
                                 if msg.is_multipart():
                                     for part in msg.walk():
                                         if part.get_content_type() == "text/plain":
-                                            body_text += part.get_payload(decode=True).decode("utf-8", errors="ignore")
+                                            payload = part.get_payload(decode=True)
+                                            if payload:
+                                                body_text += payload.decode("utf-8", errors="ignore")
                                 else:
-                                    body_text = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
+                                    payload = msg.get_payload(decode=True)
+                                    if payload:
+                                        body_text = payload.decode("utf-8", errors="ignore")
 
                                 # Extract email from sender string
                                 sender_match = re.search(r'[\w\.-]+@[\w\.-]+', sender)
@@ -415,9 +513,16 @@ class IMAPReplyListener:
                                     sender_email=clean_sender,
                                     subject=subject_raw,
                                     body=body_text,
-                                    operator_id=op_id
+                                    operator_id=op_id,
+                                    in_reply_to=in_reply_to,
+                                    references=references
                                 )
                                 results.append(proc)
+                        # Mark email as read/seen in mailbox
+                        try:
+                            mail.store(msg_id, "+FLAGS", "\\Seen")
+                        except Exception:
+                            pass
                 mail.logout()
             except Exception as e:
                 err_msg = f"{mb_email} ({host}:{port}): {type(e).__name__} - {str(e)}"

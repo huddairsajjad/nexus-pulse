@@ -4,6 +4,26 @@ FastAPI Application Entrypoint & Static GUI Server
 Location: Desktop/rabbi/api/app.py
 """
 
+# =====================================================================
+# Railway IPv4 Socket Enforcement
+# =====================================================================
+import socket
+
+if not getattr(socket, "_nexus_ipv4_enforced", False):
+    _orig_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_getaddrinfo(host, port, *args, **kwargs):
+        kwargs.pop("family", None)
+        rem = list(args)
+        if rem:
+            rem[0] = socket.AF_INET
+            return _orig_getaddrinfo(host, port, *rem, **kwargs)
+        return _orig_getaddrinfo(host, port, socket.AF_INET, **kwargs)
+
+    socket.getaddrinfo = _ipv4_getaddrinfo
+    socket._nexus_ipv4_enforced = True
+# =====================================================================
+
 import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path

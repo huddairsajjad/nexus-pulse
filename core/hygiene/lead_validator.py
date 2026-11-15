@@ -24,33 +24,56 @@ TRUNCATED_LOCAL_PARTS = {
     "nquiries", "nquiry", "billing", "eneral", "ommercial", "rocurement"
 }
 
-# Layer 2: Role-based addresses to auto-reject
-ROLE_BASED_PREFIXES = (
-    "careers", "press", "investorrelations", "no-reply", "noreply",
-    "admin", "encompassadmin", "bug-reporting", "sentry"
+# Layer 2: Invalid / system / role-based prefixes to auto-reject
+INVALID_SYSTEM_PREFIXES = (
+    "nosub_", "nosub", "no-reply", "noreply", "bounce",
+    "careers", "press", "investorrelations", "admin", "encompassadmin",
+    "bug-reporting", "sentry", "donotreply", "do-not-reply", "mailer-daemon"
+)
+ROLE_BASED_PREFIXES = INVALID_SYSTEM_PREFIXES
+
+# Layer 2: Suffixes and system / tracker / junk domains
+RESTRICTED_GOV_EDU_TLDS = (".gov", ".edu", ".mil")
+SYSTEM_TRACKER_DOMAINS = {
+    "wixpress.com", "sentry-next.wixpress.com", "sentry.io",
+    "lexisnexis.com", "m-w.com", "f6s.com"
+}
+
+# Layer 3: Junk, HTTP error, and bot-shield page title phrases (case-insensitive)
+HTTP_ERROR_AND_BOT_SHIELD_PATTERNS = [
+    r"\b404\b",
+    r"\b403\b",
+    r"\b500\b",
+    r"\b502\b",
+    r"\b503\b",
+    r"not found",
+    r"page not found",
+    r"access denied",
+    r"forbidden",
+    r"internal server error",
+    r"bad gateway",
+    r"service unavailable",
+    r"attention required",
+    r"checking your browser",
+    r"security check",
+    r"cloudflare",
+    r"robot or human",
+    r"just a moment",
+    r"ddos protection",
+    r"ray id",
+    r"get help with",
+    r"new & used"
+]
+BOT_SHIELD_TITLES = HTTP_ERROR_AND_BOT_SHIELD_PATTERNS
+
+# Regex for stripping generic words from company names/titles
+GENERIC_WORDS_PATTERN = re.compile(
+    r'\b(?:welcome\s+to|official\s+site|official\s+website|home\s*page|home|welcome|main\s+page)\b',
+    re.IGNORECASE
 )
 
-# Layer 2: Suffixes and system / tracker domains
-RESTRICTED_GOV_EDU_TLDS = (".gov", ".edu", ".mil")
-SYSTEM_TRACKER_DOMAINS = {"wixpress.com", "lexisnexis.com", "m-w.com", "f6s.com"}
-
-# Layer 3: Junk and bot-shield page title phrases (case-insensitive)
-BOT_SHIELD_TITLES = [
-    "checking your browser",
-    "attention required",
-    "access denied",
-    "security check",
-    "cloudflare",
-    "robot or human",
-    "just a moment",
-    "ddos protection",
-    "ray id",
-    "404",
-    "not found",
-    "page not found",
-    "get help with",
-    "new & used"
-]
+# Regex for HTML title separators: |, -, –, —, :, •
+TITLE_SEPARATORS_PATTERN = re.compile(r'[\|\-\–\—\:\•]')
 
 # Generic navigation titles that should trigger brand name extraction from domain
 GENERIC_NAV_TITLES = {
@@ -121,6 +144,20 @@ class LeadValidationFilter:
     Guarantees low-quality, malformed, system, or irrelevant leads never enter the Approval Gate.
     """
 
+    @classmethod
+    def is_junk_domain(cls, domain: str) -> bool:
+        """Checks if domain is a known junk, tracker, or sentry domain."""
+        if not domain:
+            return True
+        clean = domain.strip().lower()
+        clean = re.sub(r'^https?://', '', clean)
+        clean = re.sub(r'^www\.', '', clean)
+        clean = clean.split('/')[0].split(':')[0]
+        for tracker in SYSTEM_TRACKER_DOMAINS:
+            if clean == tracker or clean.endswith("." + tracker) or tracker in clean:
+                return True
+        return False
+
     # -------------------------------------------------------------------------
     # LAYER 1: Regex & Entity Sanitization + Truncated Local-Part Blocker
     # -------------------------------------------------------------------------
@@ -133,6 +170,8 @@ class LeadValidationFilter:
         """
         Strips HTML entities (e.g. \u003e, >, %20, whitespace) from scraped emails before validation.
         Rejects malformed, clipped, or truncated local-parts (e.g. upport@ instead of support@).
+        Rejects invalid/system prefixes (nosub_, no-reply@, noreply@, bounce@).
+        Drops junk tracker domains (wixpress.com, sentry-next.wixpress.com, sentry.io).
         Returns: (is_valid: bool, sanitized_email: Optional[str], reason: str)
         """
         if not raw_email or not isinstance(raw_email, str):
@@ -155,11 +194,20 @@ class LeadValidationFilter:
         domain_part = email_match.group(2).lower().strip()
         sanitized = f"{local_part}@{domain_part}"
 
-        # 4. Check for truncated local-part (e.g. 'upport' instead of 'support')
+        # 4. Check for invalid or system prefixes (nosub_, no-reply, noreply, bounce, etc.)
+        for prefix in INVALID_SYSTEM_PREFIXES:
+            if local_part == prefix or local_part.startswith(prefix):
+                return False, None, f"Auto-rejected invalid/system email prefix: '{local_part}@'"
+
+        # 5. Check for junk/tracker domains (wixpress.com, sentry-next.wixpress.com, sentry.io)
+        if cls.is_junk_domain(domain_part):
+            return False, None, f"Auto-rejected junk/tracker domain in email: '{domain_part}'"
+
+        # 6. Check for truncated local-part (e.g. 'upport' instead of 'support')
         if local_part in TRUNCATED_LOCAL_PARTS:
             return False, None, f"Rejected truncated/clipped local-part: '{local_part}@'"
 
-        # 5. Check syntax constraints on local-part
+        # 7. Check syntax constraints on local-part
         if len(local_part) < 2:
             return False, None, f"Local-part too short: '{local_part}'"
         if local_part.startswith((".", "-", "_", "+")) or local_part.endswith((".", "-", "_", "+")):
@@ -167,7 +215,7 @@ class LeadValidationFilter:
         if ".." in local_part or "--" in local_part:
             return False, None, f"Consecutive separator characters in local-part: '{local_part}'"
 
-        # 6. Ensure domain has valid TLD
+        # 8. Ensure domain has valid TLD
         tld = domain_part.split(".")[-1]
         if len(tld) < 2 or tld.isdigit():
             return False, None, f"Invalid top-level domain: .{tld}"
@@ -180,23 +228,22 @@ class LeadValidationFilter:
     @classmethod
     def check_role_and_domain_blocker(cls, email: str, domain: str) -> Tuple[bool, str]:
         """
-        Auto-rejects emails starting with:
-        careers@, press@, investorrelations@, no-reply@, noreply@, admin@, encompassadmin@, bug-reporting, sentry.
-        Auto-rejects domains ending in .gov, .edu, .mil, or system/tracker domains.
+        Auto-rejects emails with invalid/system prefixes:
+        nosub_, no-reply@, noreply@, bounce@, careers@, press@, admin@, etc.
+        Auto-rejects domains ending in .gov, .edu, .mil, or junk tracker domains
+        (wixpress.com, sentry-next.wixpress.com, sentry.io, etc.).
         Returns: (is_allowed: bool, reason: str)
         """
         clean_email = email.strip().lower()
         clean_domain = domain.strip().lower()
 
         local_part = clean_email.split("@")[0] if "@" in clean_email else clean_email
+        email_dom = clean_email.split("@")[-1] if "@" in clean_email else ""
 
-        # 1. Role-based prefix rejection
-        for role in ROLE_BASED_PREFIXES:
-            if local_part == role or local_part.startswith(role + ".") or local_part.startswith(role + "-") or local_part.startswith(role + "_"):
-                return False, f"Auto-rejected role-based email prefix: '{role}@'"
-            # Check if local-part begins directly with role pattern
-            if local_part.startswith(role):
-                return False, f"Auto-rejected role-based prefix: '{local_part}@'"
+        # 1. Invalid / system prefix rejection (nosub_, no-reply@, noreply@, bounce@, etc.)
+        for role in INVALID_SYSTEM_PREFIXES:
+            if local_part == role or local_part.startswith(role + ".") or local_part.startswith(role + "-") or local_part.startswith(role + "_") or local_part.startswith(role):
+                return False, f"Auto-rejected invalid/system email prefix: '{local_part}@'"
 
         # 2. Governmental, Educational, and Military domains rejection
         if any(clean_domain.endswith(suffix) for suffix in RESTRICTED_GOV_EDU_TLDS):
@@ -204,10 +251,11 @@ class LeadValidationFilter:
         if re.search(r'\.(?:gov|edu|mil)(?:\.[a-z]{2})?$', clean_domain):
             return False, f"Auto-rejected governmental/educational TLD in '{clean_domain}'"
 
-        # 3. System and Tracker domains rejection
-        for tracker in SYSTEM_TRACKER_DOMAINS:
-            if clean_domain == tracker or clean_domain.endswith("." + tracker):
-                return False, f"Auto-rejected system/tracker domain: '{clean_domain}'"
+        # 3. System, tracker, and junk domains rejection (wixpress.com, sentry-next.wixpress.com, sentry.io)
+        if cls.is_junk_domain(clean_domain):
+            return False, f"Auto-rejected system/tracker junk domain: '{clean_domain}'"
+        if email_dom and cls.is_junk_domain(email_dom):
+            return False, f"Auto-rejected system/tracker email domain: '{email_dom}'"
 
         return True, "Passed Layer 2 blocker checks"
 
@@ -217,42 +265,60 @@ class LeadValidationFilter:
     @classmethod
     def evaluate_page_title(cls, raw_title: str, domain: str) -> Tuple[bool, str, str]:
         """
-        Checks if page title indicates bot-protection, 404 error, or generic navigation.
-        If bot-shield or junk error: rejects page (is_valid=False).
-        If generic navigation (e.g. 'Contact Us'): extracts clean brand name from domain.
+        Evaluates page title:
+        - Rejects HTTP error titles (404, Access Denied, 403, 500) and bot-shield pages.
+        - Removes HTML title separators (|, -, –, —, :, •) and generic words ('Home', 'Welcome to', 'Official Site').
+        - Extracts clean company name, with intelligent domain brand fallback for purely generic navigation.
         Returns: (is_valid: bool, company_name: str, reason: str)
         """
         title = (raw_title or "").strip()
         title_lower = title.lower()
 
-        # 1. Bot-shield & Junk Page check
-        for bot_term in BOT_SHIELD_TITLES:
-            if bot_term in title_lower:
-                return False, "", f"Bot-shield or junk page detected in title: '{bot_term}'"
+        # 1. Reject HTTP error titles (404, Access Denied, etc.) and bot-shield/DDoS pages
+        for pat in HTTP_ERROR_AND_BOT_SHIELD_PATTERNS:
+            if re.search(pat, title_lower):
+                return False, "", f"HTTP error or bot-shield detected in title: '{title}'"
 
         # 2. Check if title is purely generic navigation
-        is_generic_nav = False
-        if not title or len(title) < 3:
-            is_generic_nav = True
-        else:
-            # Check exact match or title consisting only of generic words
-            cleaned_title = re.sub(r'[^a-z\s]', '', title_lower).strip()
-            if cleaned_title in GENERIC_NAV_TITLES:
-                is_generic_nav = True
-            elif any(cleaned_title == nav for nav in GENERIC_NAV_TITLES):
-                is_generic_nav = True
-
-        if is_generic_nav:
+        cleaned_for_nav = re.sub(r'[^a-z\s]', '', title_lower).strip()
+        if not title or len(title) < 2 or cleaned_for_nav in GENERIC_NAV_TITLES:
             extracted_brand = cls.extract_brand_name_from_domain(domain)
             return True, extracted_brand, f"Generic navigation title replaced with domain brand: '{extracted_brand}'"
 
-        # 3. Clean extracted title by stripping separators
-        split_parts = re.split(r'[\|\-\–\:\•]', title)
-        candidate_name = split_parts[0].strip()
-        if len(candidate_name) < 2 or candidate_name.lower() in GENERIC_NAV_TITLES:
-            candidate_name = cls.extract_brand_name_from_domain(domain)
+        # 3. Clean extracted company names using regex to remove HTML title separators
+        # (|, -, –, —, :, •) and generic words ("Home", "Welcome to", "Official Site")
+        segments = TITLE_SEPARATORS_PATTERN.split(title)
+        valid_candidates = []
+        for seg in segments:
+            # Remove generic words using regex
+            cleaned = GENERIC_WORDS_PATTERN.sub('', seg)
+            # Remove leftover title separators and strip punctuation/whitespace
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip(' -–—:|•.,\t\r\n"\'')
+            if len(cleaned) >= 2 and cleaned.lower() not in GENERIC_NAV_TITLES:
+                valid_candidates.append(cleaned)
 
-        return True, candidate_name, "Extracted valid company title"
+        if valid_candidates:
+            candidate_name = valid_candidates[0]
+            return True, candidate_name, "Extracted valid company title"
+
+        # Fallback to domain-based brand name extraction
+        candidate_name = cls.extract_brand_name_from_domain(domain)
+        return True, candidate_name, f"Title contained only generic terms; brand extracted from domain: '{candidate_name}'"
+
+    @classmethod
+    def clean_company_name(cls, name: str, domain: str = "") -> str:
+        """
+        Cleans an extracted company name by removing HTML title separators (|, -, –, :)
+        and generic words ('Home', 'Welcome to', 'Official Site').
+        """
+        if not name or not isinstance(name, str):
+            return cls.extract_brand_name_from_domain(domain) if domain else ""
+        cleaned = TITLE_SEPARATORS_PATTERN.split(name)[0]
+        cleaned = GENERIC_WORDS_PATTERN.sub('', cleaned)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip(' -–—:|•.,\t\r\n"\'')
+        if len(cleaned) < 2 and domain:
+            return cls.extract_brand_name_from_domain(domain)
+        return cleaned or (cls.extract_brand_name_from_domain(domain) if domain else name)
 
     @classmethod
     def extract_brand_name_from_domain(cls, domain: str) -> str:

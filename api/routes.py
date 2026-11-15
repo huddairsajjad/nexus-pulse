@@ -1061,12 +1061,77 @@ def get_hot_leads(current_user: Dict[str, Any] = Depends(get_current_user)):
 
 @router.post("/outreach/send-hot-reply")
 def send_hot_reply(req: DispatchHotReplyRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Dispatches a rapid response to a Hot Lead inquiry."""
+    """Dispatches a live response to a Hot Lead inquiry via live Gmail / SMTP server."""
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.utils import formatdate, make_msgid
+
     db = get_db_engine()
     rotator = get_inbox_rotator()
     target_op = current_user["id"] if current_user.get("role") == "operator" else None
-    mb = rotator.get_next_available_mailbox(operator_id=target_op)
-    sender = mb["email_address"] if mb else "outreach@enterprise.io"
+
+    # Retrieve live mailbox credentials dynamically from database at execution time
+    with db.get_connection() as conn:
+        mb_row = None
+        mb_avail = rotator.get_next_available_mailbox(operator_id=target_op)
+        if mb_avail:
+            mb_row = conn.execute("""
+                SELECT id, email_address, display_name, domain, daily_limit, sent_today,
+                       operator_id, smtp_host, smtp_port, smtp_username, smtp_password
+                FROM mailbox_rotator
+                WHERE id = ? AND is_active = 1 AND sent_today < daily_limit
+            """, (mb_avail["id"],)).fetchone()
+
+    if not mb_row:
+        raise HTTPException(status_code=400, detail="No active sending mailbox with remaining quota available.")
+
+    mb = dict(mb_row)
+    sender = mb["email_address"].strip()
+    smtp_host = (mb.get("smtp_host") or "").strip() or "smtp.gmail.com"
+    smtp_port = int(mb.get("smtp_port") or 587)
+    smtp_user = (mb.get("smtp_username") or sender).strip()
+    raw_pwd = mb.get("smtp_password") or ""
+    smtp_pwd = re.sub(r'\s+', '', raw_pwd)
+
+    if not smtp_user or not smtp_pwd:
+        raise HTTPException(status_code=400, detail=f"Mailbox '{sender}' is missing SMTP credentials (username or App Password).")
+
+    with db.get_connection() as conn:
+        rep_row = conn.execute("SELECT subject FROM inbox_replies WHERE id = ?", (req.reply_id,)).fetchone()
+        orig_subj = rep_row["subject"] if rep_row else "Response to your inquiry"
+
+    subject = orig_subj if orig_subj.lower().startswith("re:") else f"Re: {orig_subj}"
+
+    msg = MIMEText(req.response_body, "plain", "utf-8")
+    display_name = (mb.get("display_name") or "").strip()
+    msg["From"] = f"{display_name} <{sender}>" if display_name else sender
+    msg["To"] = req.recipient.strip()
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+    sender_domain = sender.split("@")[-1] if "@" in sender else "gmail.com"
+    msg["Message-ID"] = make_msgid(domain=sender_domain)
+
+    # Live SMTP Transmission
+    try:
+        if smtp_port == 465:
+            server = smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=25.0)
+            server.ehlo()
+        else:
+            server = smtplib.SMTP(smtp_host, smtp_port, timeout=25.0)
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+
+        server.login(smtp_user, smtp_pwd)
+        send_errs = server.sendmail(sender, [req.recipient.strip()], msg.as_string())
+        server.quit()
+        if send_errs:
+            raise smtplib.SMTPException(f"Recipients refused by server: {send_errs}")
+    except Exception as e:
+        logger.error(f"[HOT REPLY SMTP FAILED] Error transmitting to {req.recipient}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"SMTP transmission failed: {type(e).__name__} - {str(e)}")
+
+    rotator.record_email_dispatched(mb["id"])
 
     with db.get_connection() as conn:
         conn.execute("""
@@ -1132,8 +1197,15 @@ def get_deliverability_analytics(current_user: Dict[str, Any] = Depends(get_curr
         total_sent = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status IN ('SENT', 'HOT_LEAD', 'REPLIED')", q_params).fetchone()[0]
         total_opened = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} opened_at IS NOT NULL", q_params).fetchone()[0]
         total_bounced = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} (status = 'BOUNCED' OR bounced_at IS NOT NULL)", q_params).fetchone()[0]
-        total_replied = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status IN ('REPLIED', 'HOT_LEAD')", q_params).fetchone()[0]
-        total_hot = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status = 'HOT_LEAD'", q_params).fetchone()[0]
+        
+        queue_replied = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status IN ('REPLIED', 'HOT_LEAD')", q_params).fetchone()[0]
+        inbox_replied = conn.execute(f"SELECT count(*) FROM inbox_replies {q_filter}", q_params).fetchone()[0]
+        total_replied = max(queue_replied, inbox_replied)
+
+        queue_hot = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status = 'HOT_LEAD'", q_params).fetchone()[0]
+        inbox_hot = conn.execute(f"SELECT count(*) FROM inbox_replies {q_filter} {'AND' if q_filter else 'WHERE'} is_hot_lead = 1", q_params).fetchone()[0]
+        total_hot = max(queue_hot, inbox_hot)
+
         total_queued = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status = 'PENDING_APPROVAL'", q_params).fetchone()[0]
         total_suppressed = conn.execute("SELECT count(*) FROM suppressed_entities").fetchone()[0]
 

@@ -210,7 +210,8 @@ class DatabaseEngine:
                 ("tracking_id", "TEXT"),
                 ("opened_at", "TIMESTAMP"),
                 ("bounced_at", "TIMESTAMP"),
-                ("bounce_reason", "TEXT")
+                ("bounce_reason", "TEXT"),
+                ("message_id", "TEXT")
             ]
             for col_name, col_def in oq_migrations:
                 if col_name not in existing_oq_cols:
@@ -219,6 +220,8 @@ class DatabaseEngine:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_status ON outreach_queue(status);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_lead ON outreach_queue(lead_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_operator ON outreach_queue(operator_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_msgid ON outreach_queue(message_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_tracking ON outreach_queue(tracking_id);")
 
             # 6. Mailbox Rotator (Domain & Daily Limits)
             conn.execute("""

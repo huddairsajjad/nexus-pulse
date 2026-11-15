@@ -80,9 +80,38 @@ class NexusPulseOrchestrator:
     def process_and_preserve_lead(self, raw_lead: Lead, operator_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Takes a raw scraped Lead, applies Blacklist and Suppression checks,
+        drops junk domains (wixpress.com, sentry-next.wixpress.com, sentry.io) and invalid prefixes,
         applies Deduplication Shield, runs Zero-Bounce Hygiene Shield,
         and archives to Category Vault with tenant operator_id.
         """
+        # 0. Junk Domain & System Prefix Hygiene Drop
+        if LeadValidationFilter.is_junk_domain(raw_lead.domain):
+            return {
+                "success": False,
+                "reason": "JUNK_DOMAIN_DROPPED",
+                "details": f"Lead domain '{raw_lead.domain}' dropped as junk/tracker domain",
+                "lead_domain": raw_lead.domain,
+                "primary_email": raw_lead.primary_email
+            }
+
+        is_em_valid, clean_em, em_reason = LeadValidationFilter.sanitize_and_validate_email(
+            raw_lead.primary_email, raw_lead.domain
+        )
+        if not is_em_valid:
+            return {
+                "success": False,
+                "reason": "INVALID_EMAIL_PREFIX",
+                "details": em_reason,
+                "lead_domain": raw_lead.domain,
+                "primary_email": raw_lead.primary_email
+            }
+        raw_lead.primary_email = clean_em
+
+        # Clean company name
+        raw_lead.company_name = LeadValidationFilter.clean_company_name(
+            raw_lead.company_name, raw_lead.domain
+        )
+
         # 1. Global Blacklist Check
         is_bl, bl_reason = self.blacklist.is_domain_blacklisted(raw_lead.domain)
         if is_bl:

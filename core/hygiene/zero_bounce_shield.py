@@ -27,18 +27,22 @@ EMAIL_SYNTAX_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# Known Disposable & Temporary Email Domains
+# Known Disposable, Junk & Temporary Email / Tracker Domains
 DISPOSABLE_DOMAINS: Set[str] = {
     "mailinator.com", "guerrillamail.com", "guerrillamail.net", "guerrillamail.org",
     "sharklasers.com", "grr.la", "tempmail.com", "temp-mail.org", "10minutemail.com",
     "throwawaymail.com", "trashmail.com", "trashmail.net", "yopmail.com", "yopmail.fr",
     "dispostable.com", "getairmail.com", "fakeinbox.com", "mytemp.email", "mohmal.com",
     "burnermail.io", "maildrop.cc", "crazymailing.com", "nada.ltd", "dropmail.me",
-    "tempr.email", "discard.email", "spambox.us", "fake-box.com", "inboxkitten.com"
+    "tempr.email", "discard.email", "spambox.us", "fake-box.com", "inboxkitten.com",
+    "wixpress.com", "sentry-next.wixpress.com", "sentry.io", "sentry.wixpress.com"
 }
 
-# Role addresses that reject automated communication
-DO_NOT_REPLY_PREFIXES = {"noreply", "no-reply", "donotreply", "do-not-reply", "mailer-daemon"}
+# Role and system addresses that reject automated communication or represent dead-end / system trackers
+DO_NOT_REPLY_PREFIXES = {
+    "noreply", "no-reply", "nosub_", "nosub", "bounce",
+    "donotreply", "do-not-reply", "mailer-daemon"
+}
 
 
 class ZeroBounceHygieneShield:
@@ -120,11 +124,12 @@ class ZeroBounceHygieneShield:
 
         prefix, domain = clean.split("@", 1)
 
-        if prefix in DO_NOT_REPLY_PREFIXES:
-            return False, False, f"Automated dead-end role prefix detected: {prefix}@"
+        for p in DO_NOT_REPLY_PREFIXES:
+            if prefix == p or prefix.startswith(p):
+                return False, False, f"Automated dead-end or invalid system prefix detected: {prefix}@"
 
-        if domain in DISPOSABLE_DOMAINS:
-            return True, True, f"Disposable temporary email provider detected: {domain}"
+        if domain in DISPOSABLE_DOMAINS or any(domain == d or domain.endswith("." + d) for d in ("wixpress.com", "sentry.io", "sentry-next.wixpress.com")):
+            return True, True, f"Disposable or junk tracker domain detected: {domain}"
 
         # Ensure TLD is at least 2 chars and not purely digits
         tld = domain.split(".")[-1]

@@ -4,9 +4,31 @@ Production Application Entrypoint for Railway & Cloud Containers
 Configured with dynamic port binding (0.0.0.0 and $PORT), auxiliary proxy forwarders, /health telemetry, CORS, and PWA assets.
 """
 
+# =====================================================================
+# Railway IPv4 Socket Enforcement (Mandatory Network Fix)
+# At the absolute top of the entrypoint, before any network, HTTP, or
+# SMTP libraries initialize, patch socket.getaddrinfo to explicitly force
+# socket.AF_INET (IPv4 only). Eliminates OSError: [Errno 101] Network is unreachable.
+# =====================================================================
+import socket
+
+if not getattr(socket, "_nexus_ipv4_enforced", False):
+    _orig_getaddrinfo = socket.getaddrinfo
+
+    def _ipv4_getaddrinfo(host, port, *args, **kwargs):
+        kwargs.pop("family", None)
+        rem = list(args)
+        if rem:
+            rem[0] = socket.AF_INET
+            return _orig_getaddrinfo(host, port, *rem, **kwargs)
+        return _orig_getaddrinfo(host, port, socket.AF_INET, **kwargs)
+
+    socket.getaddrinfo = _ipv4_getaddrinfo
+    socket._nexus_ipv4_enforced = True
+# =====================================================================
+
 import os
 import sys
-import socket
 import threading
 from pathlib import Path
 
