@@ -318,12 +318,12 @@ function NexusPulseApp() {
   // ---------------------------------------------------------------------------
   const [isHuntModalOpen, setIsHuntModalOpen] = useState(false);
   const [huntRegion, setHuntRegion] = useState("Europe");
-  const [huntCountry, setHuntCountry] = useState("Germany");
-  const [huntCity, setHuntCity] = useState("Berlin");
+  const [huntCountry, setHuntCountry] = useState("UK");
+  const [huntCity, setHuntCity] = useState("London");
   const [isCustomCity, setIsCustomCity] = useState(false);
   const [huntCustomCity, setHuntCustomCity] = useState("");
   const [huntNiche, setHuntNiche] = useState("Commercial Construction");
-  const [huntMaxResults, setHuntMaxResults] = useState(20);
+  const [huntMaxResults, setHuntMaxResults] = useState(10);
   const [isHunting, setIsHunting] = useState(false);
 
   const availableCountries = useMemo(() => {

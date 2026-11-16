@@ -175,10 +175,10 @@ class WebFormFormatRequest(BaseModel):
 
 class ScrapeRequest(BaseModel):
     region: Optional[str] = "Europe"
-    country: str = "Germany"
-    city: Optional[str] = None
+    country: str = "United Kingdom"
+    city: Optional[str] = "London"
     niche: str = "Commercial Construction"
-    max_results: Optional[int] = 20
+    max_results: Optional[int] = 10
     target_urls: Optional[List[str]] = None
 
 
@@ -1370,7 +1370,7 @@ async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any
 
     country = req.country.strip()
     niche = req.niche.strip()
-    city_override = (req.city or "").strip() or "Metropolis"
+    city_override = (req.city or "").strip() or "London"
     limit = max(1, min(req.max_results or 20, 100))
     op_id = current_user["id"]
 

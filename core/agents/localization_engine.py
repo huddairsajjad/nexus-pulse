@@ -177,6 +177,16 @@ class LocalizationEngine:
         clean_city = city.strip()
         clean_niche = niche.strip().lower()
 
+        # Normalise short aliases used by the UI's GEO_REGIONS dropdown
+        _COUNTRY_ALIASES = {
+            "uk": "united kingdom",
+            "usa": "united states",
+            "us": "united states",
+            "uae": "united arab emirates",
+            "ksa": "saudi arabia",
+        }
+        clean_country = _COUNTRY_ALIASES.get(clean_country, clean_country)
+
         # Find matching locale or fallback to English
         locale = LOCALIZATION_MATRIX.get(clean_country)
         if not locale:

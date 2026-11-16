@@ -13,3 +13,6 @@ bcrypt>=4.1.2
 beautifulsoup4>=4.12.3
 aiosqlite>=0.20.0
 python-multipart>=0.0.9
+# Multi-source search discovery engine (Railway cloud-resilient)
+ddgs>=9.0.0
+lxml>=5.3.0

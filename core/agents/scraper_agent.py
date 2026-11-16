@@ -1,14 +1,24 @@
 """
-H.Huddair's Nexus-Pulse - Level 1
+H.Huddair's Nexus-Pulse - Production Build
 Agent Module: Deep Scraper & Tech-Stack Detector
-Extracts contact emails, phones, addresses, and full tech-stack footprints from target domains.
-Prioritizes high-value estimating & tender contacts over generic mailboxes.
-Supports autonomous multi-engine search discovery and deep subpage contact extraction.
+
+Extracts real B2B contact emails, phones, and tech-stack from target domains.
+Prioritises high-value estimating & tender contacts over generic mailboxes.
+
+Search Discovery: Cascading multi-provider pipeline that is Railway cloud-resilient:
+  Provider 1 — ddgs / duckduckgo-search Python library (DDGS().text, backend='lite' then 'html')
+  Provider 2 — Bing Web Search HTML scraping (base64 URL unpack)
+  Provider 3 — DuckDuckGo Lite HTTP POST (legacy fallback)
+
+Zero-Seed Policy: Never returns hardcoded or fake lead data.
 """
 
+import asyncio
+import base64
 import html
 import logging
 import re
+import time
 import urllib.parse
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import urlparse, urljoin
@@ -21,47 +31,114 @@ from core.hygiene.lead_validator import LeadValidationFilter
 
 logger = logging.getLogger("nexus.scraper")
 
-# Regex for email detection including mailto: and obfuscation
+# ---------------------------------------------------------------------------
+# Try modern `ddgs` package first, fall back to legacy `duckduckgo_search`
+# ---------------------------------------------------------------------------
+_DDGS = None
+try:
+    from ddgs import DDGS as _DDGS_import  # type: ignore
+    _DDGS = _DDGS_import
+    logger.info("[DDGS] Loaded via `ddgs` package (v9+)")
+except ImportError:
+    try:
+        from duckduckgo_search import DDGS as _DDGS_import  # type: ignore
+        _DDGS = _DDGS_import
+        logger.info("[DDGS] Loaded via legacy `duckduckgo_search` package")
+    except ImportError:
+        logger.warning("[DDGS] Neither `ddgs` nor `duckduckgo_search` available — Provider 1 disabled")
+
+
+# ---------------------------------------------------------------------------
+# Regexes
+# ---------------------------------------------------------------------------
 EMAIL_REGEX = re.compile(
     r'[a-zA-Z0-9_.+-]+(?:\s*\[at\]\s*|\s*\(at\)\s*|@)[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+'
 )
-
-# Regex for phone numbers
 PHONE_REGEX = re.compile(
-    r'(?:\+?\d{1,4}[-.\s]?)?(?:\(?\d{2,5}\)?[-.\s]?)?\d{3,5}[-.\s]?\d{3,5}'
+    r'(?:\+?\d{1,4}[-.\\s]?)?(?:\(\d{2,5}\)[-.\\s]?)?\d{3,5}[-.\\s]?\d{3,5}'
 )
 
-# Realistic modern browser headers preventing cloud bot blocks
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-    "Accept-Language": "en-US,en;q=0.9,de;q=0.8,fr;q=0.7,es;q=0.6",
-    "Accept-Encoding": "gzip, deflate",
-    "DNT": "1",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Ch-Ua": '"Chromium";v="128", "Not;A=Brand";v="24", "Google Chrome";v="128"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1"
+# ---------------------------------------------------------------------------
+# Domains that are search engines, social networks, or aggregate directories
+# (never valid B2B leads)
+# ---------------------------------------------------------------------------
+DISCARD_DOMAINS = {
+    "google.", "duckduckgo.", "bing.", "yahoo.", "microsoft.",
+    "facebook.", "instagram.", "twitter.", "x.com", "linkedin.",
+    "youtube.", "wikipedia.", "reddit.", "amazon.", "apple.",
+    "github.", "pinterest.", "tiktok.", "medium.", "quora.",
+    "tripadvisor.", "yelp.", "w3schools.", "stackoverflow.", "t.me",
+    "wixpress.com", "sentry-next.wixpress.com", "sentry.io",
+    "lexisnexis.com", "m-w.com", "f6s.com",
+    "yellowpages.", "houzz.", "checkatrade.", "bark.com",
+    "clutch.co", "trustpilot.", "glassdoor.", "indeed.", "example.com",
+    "aeroleads.", "hunter.io", "apollo.io",
 }
 
-# Subpage anchor keywords to crawl when landing page has no emails
+# Junk email domains / prefixes handled by LeadValidationFilter but also
+# enforced explicitly here as a fast path:
+JUNK_EMAIL_PREFIXES = (
+    "noreply", "no-reply", "support", "privacy", "webmaster",
+    "sentry", "mailer-daemon", "donotreply", "do-not-reply",
+    "bounce", "admin", "careers", "press",
+)
+JUNK_EMAIL_DOMAINS = {
+    "example.com", "facebook.com", "linkedin.com", "yelp.com",
+    "yellowpages.com", "houzz.com", "checkatrade.com", "bark.com",
+}
+
+# ---------------------------------------------------------------------------
+# Realistic desktop browser headers for all outbound HTTP requests
+# ---------------------------------------------------------------------------
+_UA_POOL = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0",
+]
+_ua_index = 0
+
+def _rotated_headers(accept_language: str = "en-US,en;q=0.9") -> Dict[str, str]:
+    global _ua_index
+    ua = _UA_POOL[_ua_index % len(_UA_POOL)]
+    _ua_index += 1
+    return {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": accept_language,
+        "Accept-Encoding": "gzip, deflate",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Ch-Ua": '"Chromium";v="130", "Not?A_Brand";v="99"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+    }
+
+DEFAULT_HEADERS = _rotated_headers()
+
+# ---------------------------------------------------------------------------
+# Contact subpage discovery keywords
+# ---------------------------------------------------------------------------
 CONTACT_SUBPAGE_KEYWORDS = [
     "kontakt", "contact", "impressum", "about", "ueber-uns", "uber-uns",
     "ansprechpartner", "team", "mentions", "mentions-legales", "legal",
     "contacto", "contatti", "contacts", "direction", "firmensitz", "standort"
 ]
-
 COMMON_SUBPATHS = [
+    "/contact", "/contact/", "/contact-us", "/contact-us/",
+    "/about", "/about-us", "/about/",
     "/kontakt", "/kontakt/", "/impressum", "/impressum/",
-    "/contact", "/contact/", "/about", "/about-us", "/ueber-uns"
 ]
 
 
+# ===========================================================================
+# Tech-Stack Detector (unchanged)
+# ===========================================================================
 class TechStackDetector:
     """Detects website CMS, frameworks, analytics, CDN, and marketing stacks."""
 
@@ -111,10 +188,8 @@ class TechStackDetector:
         headers = headers or {}
         header_str = " ".join(f"{k}: {v}" for k, v in headers.items())
         combined_text = f"{header_str}\n{html_text}"
-
         stack = TechStack()
         raw_detected: Set[str] = set()
-
         for category, signatures in cls.SIGNATURES.items():
             for tech_name, patterns in signatures.items():
                 for pat in patterns:
@@ -122,8 +197,6 @@ class TechStackDetector:
                         getattr(stack, category).append(tech_name)
                         raw_detected.add(tech_name)
                         break
-
-        # Check server header directly
         server_header = headers.get("server", "").lower()
         if "cloudflare" in server_header and "Cloudflare" not in stack.web_server_and_cdn:
             stack.web_server_and_cdn.append("Cloudflare")
@@ -134,47 +207,52 @@ class TechStackDetector:
         if "apache" in server_header and "Apache" not in stack.web_server_and_cdn:
             stack.web_server_and_cdn.append("Apache")
             raw_detected.add("Apache")
-
         stack.raw_technologies = sorted(list(raw_detected))
         return stack
 
 
+# ===========================================================================
+# SearchDiscoveryAgent — Multi-Provider, Cloud-Resilient
+# ===========================================================================
 class SearchDiscoveryAgent:
     """
-    Autonomous B2B Search Discovery Engine.
-    Discovers candidate target domains and URLs across search engines
-    (DuckDuckGo Lite, DuckDuckGo HTML, and Bing fallback) using localized native queries.
-    """
+    Autonomous B2B Search Discovery Engine with cascading 3-provider fallback.
 
-    DISCARD_DOMAINS = {
-        "google.", "duckduckgo.", "bing.", "yahoo.", "microsoft.",
-        "facebook.", "instagram.", "twitter.", "x.com", "linkedin.",
-        "youtube.", "wikipedia.", "reddit.", "amazon.", "apple.",
-        "github.", "pinterest.", "tiktok.", "medium.", "quora.",
-        "tripadvisor.", "yelp.", "w3schools.", "stackoverflow.", "t.me",
-        "wixpress.com", "sentry-next.wixpress.com", "sentry.io",
-        "lexisnexis.com", "m-w.com", "f6s.com"
-    }
+    Provider 1 (Primary):   ddgs / duckduckgo-search Python library
+                            Uses DDGS().text() with backend='lite', then 'html'.
+                            Works well from Railway datacenters — library handles
+                            cookies and anti-bot measures internally.
+    Provider 2 (Secondary): Bing HTML scraper with base64 redirect unpack.
+    Provider 3 (Tertiary):  DuckDuckGo Lite HTTP POST (legacy, unchanged).
+
+    Each provider is tried per query; we stop once we have enough unique URLs.
+    All providers share the same sanitization and discard logic.
+    Full logging is emitted at every step for Railway Deploy Log visibility.
+    """
 
     def __init__(self, timeout_seconds: float = 10.0):
         self.timeout = timeout_seconds
 
+    # ------------------------------------------------------------------
+    # URL cleaning & validation helpers
+    # ------------------------------------------------------------------
     @classmethod
     def clean_candidate_url(cls, raw_url: str) -> Optional[str]:
-        """Validates and unpacks wrapped search result links."""
+        """Validates, unpacks, and normalises a raw search result URL."""
         if not raw_url:
             return None
 
-        # Handle DDG redirect /uddg=
+        # DuckDuckGo redirect /uddg=
         if "uddg=" in raw_url:
             raw_url = urllib.parse.unquote(raw_url.split("uddg=")[1].split("&")[0])
 
-        # Handle Bing redirect /ck/a?!...&u=a1<base64>
+        # Bing redirect /ck/a?!...&u=a1<base64>
         if "bing.com/ck/a" in raw_url and "u=a1" in raw_url:
             try:
-                import base64
                 u_param = raw_url.split("u=a1")[1].split("&")[0]
-                raw_url = base64.urlsafe_b64decode(u_param + "==").decode("utf-8", errors="ignore")
+                # Proper base64 padding
+                u_param += "=" * ((4 - len(u_param) % 4) % 4)
+                raw_url = base64.urlsafe_b64decode(u_param).decode("utf-8", errors="ignore")
             except Exception:
                 pass
 
@@ -183,178 +261,394 @@ class SearchDiscoveryAgent:
 
         parsed = urlparse(raw_url)
         domain = parsed.netloc.lower().replace("www.", "").split(":")[0]
-        if not domain or any(d in domain for d in cls.DISCARD_DOMAINS):
+        if not domain or any(d in domain for d in DISCARD_DOMAINS):
             return None
 
-        # Block .gov, .edu, .mil and tracker domains via Layer 2 filter
-        is_allowed, _ = LeadValidationFilter.check_role_and_domain_blocker("check@" + domain, domain)
-        if not is_allowed:
-            return None
+        # Delegate .gov/.edu/.mil and system tracker blocks to LeadValidationFilter
+        try:
+            is_allowed, _ = LeadValidationFilter.check_role_and_domain_blocker("check@" + domain, domain)
+            if not is_allowed:
+                return None
+        except Exception:
+            pass
 
-        # Return root domain website URL
         return f"{parsed.scheme}://{parsed.netloc}"
 
     @classmethod
     def sanitize_search_query(cls, query: str) -> str:
-        """Strips nested quotes, boolean OR, and site: operators that cause search engines to return 0 results."""
-        cleaned = re.sub(r'[\(\)"]', '', query)
+        """
+        Sanitises query for direct HTTP search engines.
+        Strips nested quotes, boolean OR, and site: operators that
+        cause many search engines to return 0 results.
+        DDGS library handles these operators natively, so we only sanitise
+        for Bing/DDG-Lite HTTP paths.
+        """
+        cleaned = re.sub(r'["()]', '', query)
         cleaned = re.sub(r'\bOR\b', '', cleaned)
         cleaned = re.sub(r'site:\S+', '', cleaned)
         cleaned = " ".join(cleaned.split())
         return cleaned
 
+    # ------------------------------------------------------------------
+    # Provider 1: DDGS library (ddgs / duckduckgo-search)
+    # ------------------------------------------------------------------
+    def _ddgs_search(self, query: str, max_results: int = 10) -> List[str]:
+        """
+        Runs a synchronous DDGS text search with lite→html backend fallback.
+        Returns list of raw result URLs (before clean_candidate_url).
+        """
+        if _DDGS is None:
+            logger.warning("[PROVIDER-1 DDGS] Library not installed — skipping")
+            return []
+
+        urls: List[str] = []
+        for backend in ("lite", "html"):
+            try:
+                logger.info(f"[PROVIDER-1 DDGS] backend='{backend}' query='{query}'")
+                with _DDGS(timeout=int(self.timeout)) as ddgs_client:
+                    results = list(ddgs_client.text(query, max_results=max_results, backend=backend))
+                logger.info(f"[PROVIDER-1 DDGS] backend='{backend}' returned {len(results)} raw results")
+                for r in results:
+                    href = r.get("href") or r.get("link") or ""
+                    if href:
+                        urls.append(href)
+                if urls:
+                    logger.info(f"[PROVIDER-1 DDGS] backend='{backend}' succeeded: {len(urls)} candidate URLs")
+                    return urls
+            except Exception as ex:
+                logger.warning(f"[PROVIDER-1 DDGS] backend='{backend}' exception: {ex}")
+
+        logger.warning("[PROVIDER-1 DDGS] All backends exhausted — no results")
+        return []
+
+    # ------------------------------------------------------------------
+    # Provider 2: Bing HTML Scraper (async)
+    # ------------------------------------------------------------------
+    async def _bing_search(self, query: str, client: httpx.AsyncClient, max_results: int = 10) -> List[str]:
+        """
+        Performs a Bing web search and extracts organic result URLs.
+        Handles Bing's base64-encoded redirect links (/ck/a?!).
+        """
+        clean_q = self.sanitize_search_query(query)
+        urls: List[str] = []
+        try:
+            logger.info(f"[PROVIDER-2 BING] query='{clean_q}'")
+            resp = await client.get(
+                "https://www.bing.com/search",
+                params={"q": clean_q, "count": str(max_results)},
+            )
+            if resp.status_code != 200:
+                logger.warning(f"[PROVIDER-2 BING] HTTP {resp.status_code} for '{clean_q}'")
+                return []
+
+            soup = BeautifulSoup(resp.text, "html.parser")
+            # Multiple selectors to handle Bing layout variations
+            selectors = [
+                "li.b_algo h2 a",
+                "li.b_algo .b_title a",
+                "h2 a[href^='http']",
+            ]
+            anchors = []
+            for sel in selectors:
+                anchors = soup.select(sel)
+                if anchors:
+                    break
+
+            for a in anchors:
+                href = a.get("href", "")
+                if href:
+                    urls.append(href)
+
+            logger.info(f"[PROVIDER-2 BING] Extracted {len(urls)} raw anchors for '{clean_q}'")
+        except Exception as ex:
+            logger.warning(f"[PROVIDER-2 BING] Exception for '{clean_q}': {ex}")
+
+        return urls
+
+    # ------------------------------------------------------------------
+    # Provider 3: DuckDuckGo Lite HTTP POST (legacy, async)
+    # ------------------------------------------------------------------
+    async def _ddg_lite_post(self, query: str, client: httpx.AsyncClient) -> List[str]:
+        """Legacy DDG Lite POST fallback (rate-limited from datacenters, but useful as tertiary)."""
+        clean_q = self.sanitize_search_query(query)
+        urls: List[str] = []
+        try:
+            logger.info(f"[PROVIDER-3 DDG-LITE] POST query='{clean_q}'")
+            resp = await client.post("https://lite.duckduckgo.com/lite/", data={"q": clean_q})
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                for a_tag in soup.select(".result-link"):
+                    href = a_tag.get("href", "")
+                    if href:
+                        urls.append(href)
+                logger.info(f"[PROVIDER-3 DDG-LITE] Returned {len(urls)} raw links for '{clean_q}'")
+            else:
+                logger.warning(f"[PROVIDER-3 DDG-LITE] HTTP {resp.status_code} for '{clean_q}'")
+        except Exception as ex:
+            logger.warning(f"[PROVIDER-3 DDG-LITE] Exception for '{clean_q}': {ex}")
+        return urls
+
+    # ------------------------------------------------------------------
+    # Query variation generator for a niche+city pair
+    # ------------------------------------------------------------------
+    @staticmethod
+    def build_query_variations(niche: str, city: str, country: str) -> List[str]:
+        """
+        Generates 4 query variations designed to surface real B2B company
+        contact pages rather than directories or social networks.
+        """
+        n = niche.strip()
+        c = city.strip()
+        return [
+            # Variation 1: direct intent with estimating/tenders signal
+            f'"{n}" "{c}" "estimating" OR "tenders" contact email',
+            # Variation 2: contractor + @ symbol (surfaces mailto: pages)
+            f'"{n}" contractor "{c}" "@"',
+            # Variation 3: simple unquoted — broadest fallback
+            f'{n} general contractors {c} contact email',
+            # Variation 4: "contact us" page targeting
+            f'{n} {c} "contact us" email site:.co.uk OR site:.com',
+        ]
+
+    # ------------------------------------------------------------------
+    # Main discovery entry point
+    # ------------------------------------------------------------------
     async def discover_candidate_urls(
         self,
         queries: List[Dict[str, str]],
         limit: int = 20,
-        country: str = "Germany",
-        city: str = "Berlin",
-        niche: str = "Commercial Construction"
+        country: str = "United Kingdom",
+        city: str = "London",
+        niche: str = "Commercial Construction",
     ) -> List[str]:
         """
-        Queries search engines using localized query matrices and returns unique candidate website URLs.
+        Runs the cascading 3-provider search pipeline and returns
+        up to `limit` unique company root-domain URLs.
+
+        Logging is comprehensive so Railway Deploy Logs show:
+        - which provider ran
+        - how many candidate URLs were found
+        - which domains were discarded and why
         """
         discovered_urls: List[str] = []
         seen_domains: Set[str] = set()
 
+        # Build the full query list: existing localised queries first, then
+        # add our own commercial intent variations as extra fallback queries.
+        all_queries: List[str] = []
+        for q_item in queries:
+            raw_q = q_item.get("query", "")
+            if raw_q:
+                all_queries.append(raw_q)
+
+        variation_queries = self.build_query_variations(niche, city, country)
+        for vq in variation_queries:
+            if vq not in all_queries:
+                all_queries.append(vq)
+
+        logger.info(
+            f"[DISCOVERY] Starting multi-provider search | niche='{niche}' | city='{city}' "
+            f"| country='{country}' | queries={len(all_queries)} | limit={limit}"
+        )
+
+        def _register_urls(raw_list: List[str], provider_name: str) -> int:
+            """Cleans and deduplicates raw URLs; returns count of new additions."""
+            added = 0
+            for raw_url in raw_list:
+                u = self.clean_candidate_url(raw_url)
+                if not u:
+                    continue
+                domain = urlparse(u).netloc.replace("www.", "").lower()
+                if domain and domain not in seen_domains:
+                    seen_domains.add(domain)
+                    discovered_urls.append(u)
+                    added += 1
+                    logger.info(f"[DISCOVERY] ✓ Accepted [{provider_name}] {u}")
+                    if len(discovered_urls) >= limit:
+                        break
+            return added
+
         async with httpx.AsyncClient(
-            headers=DEFAULT_HEADERS,
+            headers=_rotated_headers(),
             timeout=self.timeout,
             follow_redirects=True,
-            verify=False
+            verify=False,
         ) as client:
-            for q_item in queries:
-                raw_q = q_item.get("query", "")
-                q_type = q_item.get("type", "GENERAL")
-                clean_q = self.sanitize_search_query(raw_q)
-                if not clean_q:
-                    continue
 
-                logger.info(f"[DISCOVERY] Executing search query [{q_type}]: '{clean_q}'")
-                found_links: List[str] = []
+            for query_str in all_queries:
+                if len(discovered_urls) >= limit:
+                    break
 
-                # Strategy 1: DuckDuckGo Lite (POST)
+                logger.info(f"[DISCOVERY] ━━ Processing query: '{query_str[:80]}...' ━━")
+
+                # ── Provider 1: DDGS library (synchronous, run in thread pool) ──
                 try:
-                    resp = await client.post("https://lite.duckduckgo.com/lite/", data={"q": clean_q})
-                    if resp.status_code == 200:
-                        soup = BeautifulSoup(resp.text, "html.parser")
-                        for a_tag in soup.select(".result-link"):
-                            href = a_tag.get("href", "")
-                            u = self.clean_candidate_url(href)
-                            if u:
-                                found_links.append(u)
-                        logger.info(f"[DISCOVERY] DDG Lite returned {len(found_links)} candidate links for '{clean_q}'")
-                    else:
-                        logger.warning(f"[DISCOVERY] DDG Lite returned status {resp.status_code} for '{clean_q}'")
+                    p1_raw = await asyncio.get_event_loop().run_in_executor(
+                        None, self._ddgs_search, query_str, limit
+                    )
                 except Exception as ex:
-                    logger.warning(f"[DISCOVERY] DDG Lite request error for '{clean_q}': {ex}")
+                    p1_raw = []
+                    logger.warning(f"[PROVIDER-1 DDGS] run_in_executor error: {ex}")
 
-                # Strategy 2: DuckDuckGo HTML Fallback (GET/POST)
-                if not found_links:
-                    try:
-                        resp = await client.get("https://html.duckduckgo.com/html/", params={"q": clean_q})
-                        if resp.status_code == 200:
-                            soup = BeautifulSoup(resp.text, "html.parser")
-                            for a_tag in soup.select("h2.result__title a, a.result__url"):
-                                href = a_tag.get("href", "")
-                                u = self.clean_candidate_url(href)
-                                if u:
-                                    found_links.append(u)
-                            logger.info(f"[DISCOVERY] DDG HTML returned {len(found_links)} candidate links for '{clean_q}'")
-                        else:
-                            logger.warning(f"[DISCOVERY] DDG HTML returned status {resp.status_code} for '{clean_q}'")
-                    except Exception as ex:
-                        logger.warning(f"[DISCOVERY] DDG HTML request error for '{clean_q}': {ex}")
-
-                # Strategy 3: Bing Search Fallback
-                if not found_links:
-                    try:
-                        resp = await client.get("https://www.bing.com/search", params={"q": clean_q})
-                        if resp.status_code == 200:
-                            soup = BeautifulSoup(resp.text, "html.parser")
-                            for a_tag in soup.select("li.b_algo h2 a"):
-                                href = a_tag.get("href", "")
-                                u = self.clean_candidate_url(href)
-                                if u:
-                                    found_links.append(u)
-                            logger.info(f"[DISCOVERY] Bing fallback returned {len(found_links)} candidate links for '{clean_q}'")
-                    except Exception as ex:
-                        logger.warning(f"[DISCOVERY] Bing fallback request error for '{clean_q}': {ex}")
-
-                # Deduplicate and register found domains
-                for u in found_links:
-                    domain = urlparse(u).netloc.replace("www.", "").lower()
-                    if domain and domain not in seen_domains:
-                        seen_domains.add(domain)
-                        discovered_urls.append(u)
+                p1_added = _register_urls(p1_raw, "DDGS")
+                logger.info(f"[PROVIDER-1 DDGS] Added {p1_added} new unique domains from query")
 
                 if len(discovered_urls) >= limit:
                     break
 
-        logger.info(f"[DISCOVERY] Finished discovery run: {len(discovered_urls)} unique candidate domains found.")
+                # ── Provider 2: Bing HTML (only if DDGS returned nothing useful) ──
+                if p1_added == 0:
+                    p2_raw = await self._bing_search(query_str, client, max_results=limit)
+                    p2_added = _register_urls(p2_raw, "BING")
+                    logger.info(f"[PROVIDER-2 BING] Added {p2_added} new unique domains from query")
+
+                    # ── Provider 3: DDG Lite POST (only if Bing also returned nothing) ──
+                    if p2_added == 0 and len(discovered_urls) < limit:
+                        p3_raw = await self._ddg_lite_post(query_str, client)
+                        p3_added = _register_urls(p3_raw, "DDG-LITE")
+                        logger.info(f"[PROVIDER-3 DDG-LITE] Added {p3_added} new unique domains from query")
+
+        total = len(discovered_urls)
+        logger.info(
+            f"[DISCOVERY] ✅ Pipeline complete — {total} unique candidate domains discovered "
+            f"(limit={limit})"
+        )
+        if total == 0:
+            logger.warning(
+                "[DISCOVERY] ⚠ Zero domains found across all providers. "
+                "No seed data injected — returning empty list as per Zero-Seed Policy."
+            )
+
         return discovered_urls[:limit]
 
 
+# ===========================================================================
+# DeepScraperAgent — scrapes individual company websites
+# ===========================================================================
 class DeepScraperAgent:
     """
-    Scraper Agent equipped with Tech-Stack Detection, Priority Contact Extraction,
+    Scraper Agent with Tech-Stack Detection, Priority Contact Extraction,
     and Deep Contact Subpage Crawling.
+    Crawls root page + up to 2 contact/about subpages per domain.
+    Applies strict email hygiene: rejects noreply, support, privacy,
+    webmaster, sentry, example.com, .png/.jpg and social media addresses.
     """
 
-    def __init__(self, timeout_seconds: float = 12.0):
+    def __init__(self, timeout_seconds: float = 6.0):
         self.timeout = timeout_seconds
 
+    # ------------------------------------------------------------------
+    # Static email hygiene guard (fast path before LeadValidationFilter)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _is_junk_email(email: str) -> bool:
+        """Returns True if the email is a known junk/role/system address."""
+        if not email or "@" not in email:
+            return True
+        local, domain = email.lower().split("@", 1)
+        # Junk domains
+        if any(domain == jd or domain.endswith("." + jd) for jd in JUNK_EMAIL_DOMAINS):
+            return True
+        # Junk prefixes
+        for prefix in JUNK_EMAIL_PREFIXES:
+            if local == prefix or local.startswith(prefix + ".") or local.startswith(prefix + "-") or local.startswith(prefix + "_"):
+                return True
+        # Asset false positives (.png, .jpg, etc.)
+        if any(email.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".css", ".js")):
+            return True
+        return False
+
+    # ------------------------------------------------------------------
+    # Company name cleaner: strips SEO suffixes from <title>
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _clean_company_name(raw_title: str, domain: str) -> str:
+        """
+        Derives a clean company name from the page <title> by stripping
+        common SEO suffixes: '| Home', '- Contact Us', '– Official Site', etc.
+        Falls back to LeadValidationFilter domain extractor if title is generic.
+        """
+        if not raw_title:
+            return LeadValidationFilter.extract_brand_name_from_domain(domain)
+
+        # Split on common separators and take the longest meaningful segment
+        SEO_SUFFIXES = re.compile(
+            r'\s*[\|\-\–\—]\s*(?:'
+            r'home\s*page?|home|welcome|contact\s+us|contact|about\s+us|about|'
+            r'official\s+site|official\s+website|main\s+page|our\s+services|'
+            r'services|solutions|get\s+a\s+quote|quote|estimating|construction|'
+            r'contractors?|builders?|group|ltd|limited|inc|llc|plc'
+            r')$',
+            re.IGNORECASE,
+        )
+        cleaned = SEO_SUFFIXES.sub("", raw_title).strip()
+        # Also split on first separator if the right part is a generic single word
+        parts = re.split(r'[\|\-\–\—]', cleaned)
+        candidates = [p.strip() for p in parts if p.strip() and len(p.strip()) >= 2]
+        if candidates:
+            # Prefer the longest candidate as it's usually the brand name
+            best = max(candidates, key=len)
+            if len(best) >= 2:
+                return best
+
+        return LeadValidationFilter.extract_brand_name_from_domain(domain)
+
+    # ------------------------------------------------------------------
+    # HTML parser (single page → Lead or None)
+    # ------------------------------------------------------------------
     def parse_html_content(
         self,
         html_content: str,
         source_url: str,
-        country: str = "Germany",
-        city: str = "Berlin",
+        country: str = "United Kingdom",
+        city: str = "London",
         niche: str = "Commercial Construction",
         headers: Optional[Dict[str, str]] = None,
-        inherited_niche_score: Optional[int] = None
+        inherited_niche_score: Optional[int] = None,
     ) -> Optional[Lead]:
         """
-        Parses raw HTML string through 4-Layer Validation & Sanitization:
-        Layer 1: Strips HTML entities, rejects malformed/truncated local-parts.
-        Layer 2: Rejects role-based, .gov/.edu/.mil, and tracker domains.
-        Layer 3: Rejects bot-shield/junk titles; extracts brand name from generic navigation.
-        Layer 4: Scores niche relevance (0-100), enforcing >= 70 threshold.
+        Parses raw HTML through the 4-Layer validation pipeline:
+        Layer 1: HTML entity sanitisation + email regex extraction + junk email rejection
+        Layer 2: Role-based / .gov/.edu/.mil / system tracker domain blocker
+        Layer 3: Junk title / bot-shield filter + clean brand name extraction
+        Layer 4: Niche relevance scoring (0–100); requires ≥ 70 to pass
         """
         if not html_content or len(html_content.strip()) < 50:
             return None
 
-        # Clean HTML unescaping
         raw_text = html.unescape(html_content)
         soup = BeautifulSoup(raw_text, "html.parser")
 
         parsed_url = urlparse(source_url)
         domain = parsed_url.netloc.replace("www.", "").lower().split(":")[0]
 
-        # -------------------------------------------------------------
-        # LAYER 2 CHECK: Domain Level Role & System Blocker
-        # -------------------------------------------------------------
-        is_dom_ok, dom_reason = LeadValidationFilter.check_role_and_domain_blocker("check@" + domain, domain)
-        if not is_dom_ok:
-            logger.info(f"[LAYER-2 FILTER] Discarding {source_url}: {dom_reason}")
-            return None
+        # ── Layer 2: Domain-level blocker ──────────────────────────────
+        try:
+            is_dom_ok, dom_reason = LeadValidationFilter.check_role_and_domain_blocker("check@" + domain, domain)
+            if not is_dom_ok:
+                logger.info(f"[LAYER-2 FILTER] Rejecting {source_url}: {dom_reason}")
+                return None
+        except Exception:
+            pass
 
-        # -------------------------------------------------------------
-        # LAYER 3 CHECK: Junk Title, Bot-Shield & Brand Extractor
-        # -------------------------------------------------------------
+        # ── Layer 3: Title / Bot-Shield filter ─────────────────────────
         raw_title = ""
         title_tag = soup.find("title")
         if title_tag and title_tag.text:
             raw_title = title_tag.text.strip()
 
-        is_title_valid, company_name, title_reason = LeadValidationFilter.evaluate_page_title(raw_title, domain)
-        if not is_title_valid:
-            logger.info(f"[LAYER-3 FILTER] Discarding {source_url}: {title_reason}")
-            return None
+        try:
+            is_title_valid, lv_company_name, title_reason = LeadValidationFilter.evaluate_page_title(raw_title, domain)
+            if not is_title_valid:
+                logger.info(f"[LAYER-3 FILTER] Rejecting {source_url}: {title_reason}")
+                return None
+        except Exception:
+            lv_company_name = ""
 
-        # -------------------------------------------------------------
-        # LAYER 4 CHECK: Niche Relevance Scoring (>= 70 required)
-        # -------------------------------------------------------------
+        # Clean company name using our SEO-suffix stripper
+        company_name = self._clean_company_name(raw_title, domain) or lv_company_name
+
+        # ── Layer 4: Niche relevance scoring ───────────────────────────
         if inherited_niche_score is not None:
             niche_score = inherited_niche_score
             score_summary = f"Inherited from root domain: {niche_score}/100"
@@ -363,67 +657,98 @@ class DeepScraperAgent:
             desc_tag = soup.find("meta", attrs={"name": re.compile(r"description", re.I)})
             if desc_tag and desc_tag.get("content"):
                 meta_desc = desc_tag["content"].strip()
-
             page_text = soup.get_text(separator=" ", strip=True)
-            niche_score, score_summary = LeadValidationFilter.calculate_niche_score(
-                niche=niche,
-                page_title=raw_title,
-                page_content=page_text,
-                meta_description=meta_desc,
-                domain=domain
-            )
+            try:
+                niche_score, score_summary = LeadValidationFilter.calculate_niche_score(
+                    niche=niche,
+                    page_title=raw_title,
+                    page_content=page_text,
+                    meta_description=meta_desc,
+                    domain=domain,
+                )
+            except Exception:
+                niche_score, score_summary = 0, "niche_score_error"
 
         if niche_score < 70:
-            logger.info(f"[LAYER-4 FILTER] Discarding {source_url}: Niche relevance score {niche_score}/100 < 70 for '{niche}' ({score_summary})")
+            logger.info(
+                f"[LAYER-4 FILTER] Rejecting {source_url}: "
+                f"Niche score {niche_score}/100 < 70 for '{niche}' ({score_summary})"
+            )
             return None
 
-        # -------------------------------------------------------------
-        # LAYER 1 & LAYER 2: Extract & Sanitize Emails
-        # -------------------------------------------------------------
+        # ── Layer 1: Extract & sanitise emails ─────────────────────────
         emails_found: Set[str] = set()
         context_map: Dict[str, str] = {}
 
-        # Look in mailto links
+        # mailto: links (highest fidelity)
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"].strip()
             if href.lower().startswith("mailto:"):
                 raw_mail = href[7:].split("?")[0].strip()
-                is_valid, clean_mail, _ = LeadValidationFilter.sanitize_and_validate_email(raw_mail, domain)
+                if self._is_junk_email(raw_mail):
+                    logger.info(f"[EMAIL-FILTER] Rejected junk mailto: {raw_mail} on {source_url}")
+                    continue
+                try:
+                    is_valid, clean_mail, reason = LeadValidationFilter.sanitize_and_validate_email(raw_mail, domain)
+                except Exception:
+                    is_valid, clean_mail = False, None
                 if is_valid and clean_mail:
-                    is_allowed, _ = LeadValidationFilter.check_role_and_domain_blocker(clean_mail, domain)
+                    try:
+                        is_allowed, _ = LeadValidationFilter.check_role_and_domain_blocker(clean_mail, domain)
+                    except Exception:
+                        is_allowed = True
                     if is_allowed:
                         emails_found.add(clean_mail)
                         context_map[clean_mail.lower()] = a_tag.get_text(strip=True) or "mailto anchor"
+                        logger.info(f"[EMAIL] ✓ Accepted (mailto): {clean_mail} on {source_url}")
+                    else:
+                        logger.info(f"[EMAIL-FILTER] Rejected (Layer-2 role block): {clean_mail}")
 
-        # Regex search through raw text
+        # Regex full-text sweep
         for match in EMAIL_REGEX.findall(raw_text):
-            is_valid, clean_mail, _ = LeadValidationFilter.sanitize_and_validate_email(match, domain)
+            # Normalise obfuscated [at]/(at)
+            normalised = re.sub(r'\s*[\[\(]at[\]\)]\s*', '@', match, flags=re.IGNORECASE).replace(" ", "")
+            if self._is_junk_email(normalised):
+                logger.info(f"[EMAIL-FILTER] Rejected junk regex match: {normalised}")
+                continue
+            try:
+                is_valid, clean_mail, reason = LeadValidationFilter.sanitize_and_validate_email(normalised, domain)
+            except Exception:
+                is_valid, clean_mail = False, None
             if is_valid and clean_mail:
-                # Exclude image/asset false positives
-                if not any(clean_mail.lower().endswith(ext) for ext in [".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".css", ".js"]):
+                try:
                     is_allowed, _ = LeadValidationFilter.check_role_and_domain_blocker(clean_mail, domain)
-                    if is_allowed:
-                        emails_found.add(clean_mail)
+                except Exception:
+                    is_allowed = True
+                if is_allowed:
+                    emails_found.add(clean_mail)
+                    logger.info(f"[EMAIL] ✓ Accepted (regex): {clean_mail} on {source_url}")
+                else:
+                    logger.info(f"[EMAIL-FILTER] Rejected (Layer-2 role block): {clean_mail}")
 
         if not emails_found:
+            logger.info(f"[SCRAPER] No valid emails after hygiene pass on {source_url}")
             return None
 
-        # Prioritize emails
-        ranked_emails: List[ScrapedEmail] = PriorityEmailFinder.rank_emails(
-            raw_emails=list(emails_found),
-            page_source=source_url,
-            context_map=context_map
-        )
+        # Prioritise emails
+        try:
+            ranked_emails: List[ScrapedEmail] = PriorityEmailFinder.rank_emails(
+                raw_emails=list(emails_found),
+                page_source=source_url,
+                context_map=context_map,
+            )
+            primary = PriorityEmailFinder.pick_primary_email(ranked_emails)
+        except Exception:
+            ranked_emails = []
+            primary = None
 
-        primary = PriorityEmailFinder.pick_primary_email(ranked_emails)
         if not primary:
             return None
 
-        # Fallback company name resolution if still empty
         if not company_name or len(company_name) < 2:
             company_name = LeadValidationFilter.extract_brand_name_from_domain(domain)
 
-        # Extract Phone Numbers
+        # Extract phone numbers from tel: links
         phones: Set[str] = set()
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"].strip()
@@ -432,20 +757,18 @@ class DeepScraperAgent:
                 if len(phone_num) >= 7:
                     phones.add(phone_num)
 
-        # Extract Tech Stack
         tech_stack = TechStackDetector.detect(raw_text, headers)
 
-        # Determine quality tag based on primary email tier
         tier_tag_map = {
             EmailTier.TIER_1_ESTIMATING: "TIER-1-ESTIMATING",
             EmailTier.TIER_2_EXECUTIVE: "TIER-2-EXECUTIVE",
             EmailTier.TIER_3_OPERATIONAL: "TIER-3-OPERATIONAL",
             EmailTier.TIER_GENERIC: "TIER-GENERIC",
-            EmailTier.UNKNOWN: "TIER-UNRATED"
+            EmailTier.UNKNOWN: "TIER-UNRATED",
         }
         quality_tag = tier_tag_map.get(primary.tier, "TIER-GENERIC")
 
-        lead = Lead(
+        return Lead(
             company_name=company_name,
             domain=domain,
             website_url=source_url,
@@ -459,116 +782,134 @@ class DeepScraperAgent:
             phone_numbers=list(phones),
             tech_stack=tech_stack,
             quality_tag=quality_tag,
-            metadata={"niche_score": niche_score, "niche_summary": score_summary}
+            metadata={"niche_score": niche_score, "niche_summary": score_summary},
         )
 
-        return lead
-
+    # ------------------------------------------------------------------
+    # Main URL scraper (crawls root + up to 2 contact subpages)
+    # ------------------------------------------------------------------
     async def scrape_url(
         self,
         url: str,
-        country: str = "Germany",
-        city: str = "Berlin",
-        niche: str = "Commercial Construction"
+        country: str = "United Kingdom",
+        city: str = "London",
+        niche: str = "Commercial Construction",
     ) -> Optional[Lead]:
         """
-        Asynchronously scrapes target live URL with modern browser headers, SSL fallback,
-        and automatic contact/impressum subpage crawling.
+        Asynchronously scrapes a target company URL.
+        Crawl strategy:
+          1. Fetch root page → parse for emails
+          2. If no emails: discover contact/about/impressum subpages via DOM anchors
+          3. Also try up to 2 common subpath guesses (/contact, /about-us, etc.)
+          4. Crawl up to 3 subpages; return first successful Lead
         """
         target_url = url.strip()
         if not target_url.startswith("http://") and not target_url.startswith("https://"):
             target_url = f"https://{target_url}"
 
-        logger.info(f"[SCRAPER] Target URL initiated: {target_url}")
+        logger.info(f"[SCRAPER] ▶ Crawling {target_url}")
 
         try:
             async with httpx.AsyncClient(
-                headers=DEFAULT_HEADERS,
+                headers=_rotated_headers(),
                 timeout=self.timeout,
                 follow_redirects=True,
-                verify=False
+                verify=False,
             ) as client:
+
+                # ── Attempt 1: Root page ──────────────────────────────
                 resp = None
                 try:
                     resp = await client.get(target_url)
-                except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout, Exception) as fetch_err:
-                    logger.warning(f"[SCRAPER] Initial GET failed for {target_url} ({type(fetch_err).__name__}: {fetch_err})")
-                    # Try http:// fallback if https:// failed
+                except Exception as fetch_err:
+                    logger.warning(f"[SCRAPER] HTTPS fetch failed for {target_url}: {fetch_err}")
                     if target_url.startswith("https://"):
-                        fallback_url = "http://" + target_url[8:]
-                        logger.info(f"[SCRAPER] Attempting HTTP fallback for {fallback_url}")
+                        fallback = "http://" + target_url[8:]
+                        logger.info(f"[SCRAPER] Trying HTTP fallback: {fallback}")
                         try:
-                            resp = await client.get(fallback_url)
+                            resp = await client.get(fallback)
                         except Exception as fb_err:
-                            logger.warning(f"[SCRAPER] HTTP fallback failed for {fallback_url}: {fb_err}")
+                            logger.warning(f"[SCRAPER] HTTP fallback also failed for {fallback}: {fb_err}")
 
                 if not resp or resp.status_code >= 400:
-                    status_code = resp.status_code if resp else "NO_RESPONSE"
-                    logger.warning(f"[SCRAPER] Target {target_url} returned non-success status: {status_code}")
+                    logger.warning(
+                        f"[SCRAPER] {target_url} non-success: "
+                        f"{resp.status_code if resp else 'NO_RESPONSE'}"
+                    )
                     return None
 
                 base_url = str(resp.url)
                 base_domain = urlparse(base_url).netloc.replace("www.", "").lower()
                 headers_dict = dict(resp.headers)
 
-                # Attempt 1: Parse root page HTML
                 lead = self.parse_html_content(
                     html_content=resp.text,
                     source_url=base_url,
                     country=country,
                     city=city,
                     niche=niche,
-                    headers=headers_dict
+                    headers=headers_dict,
                 )
 
                 if lead and lead.all_emails:
-                    logger.info(f"[SCRAPER] Root page hit on {target_url}: found {len(lead.all_emails)} email(s) (Primary: {lead.primary_email})")
+                    logger.info(
+                        f"[SCRAPER] ✅ Root page hit on {target_url}: "
+                        f"{len(lead.all_emails)} email(s) | Primary: {lead.primary_email} | "
+                        f"Company: {lead.company_name}"
+                    )
                     return lead
 
-                # Attempt 2: If root landing page has no emails, crawl contact & impressum subpages
-                logger.info(f"[SCRAPER] No emails on root of {target_url}. Discovering contact & impressum subpages...")
+                # ── Attempt 2: Discover contact subpages ─────────────
+                logger.info(
+                    f"[SCRAPER] No emails on root of {target_url}. "
+                    f"Scanning for contact/about subpages..."
+                )
                 soup = BeautifulSoup(resp.text, "html.parser")
                 candidate_subpages: List[str] = []
 
-                # Scan anchor links on page
                 for a_tag in soup.find_all("a", href=True):
                     href = a_tag["href"].strip()
                     text = a_tag.get_text(strip=True).lower()
                     href_lower = href.lower()
-
                     if any(kw in href_lower or kw in text for kw in CONTACT_SUBPAGE_KEYWORDS):
                         full_sub_url = urljoin(base_url, href)
                         sub_domain = urlparse(full_sub_url).netloc.replace("www.", "").lower()
-                        # Ensure subpage belongs to same company domain
-                        if sub_domain == base_domain and full_sub_url not in candidate_subpages and full_sub_url != base_url:
+                        if (
+                            sub_domain == base_domain
+                            and full_sub_url not in candidate_subpages
+                            and full_sub_url != base_url
+                        ):
                             candidate_subpages.append(full_sub_url)
 
-                # If no matching links found in DOM, test standard regional subpaths
-                if len(candidate_subpages) < 2:
-                    for sp in COMMON_SUBPATHS:
-                        guess_url = urljoin(base_url, sp)
-                        if guess_url not in candidate_subpages and guess_url != base_url:
-                            candidate_subpages.append(guess_url)
+                # Always append common subpath guesses as extra fallback
+                for sp in COMMON_SUBPATHS:
+                    guess_url = urljoin(base_url, sp)
+                    if guess_url not in candidate_subpages and guess_url != base_url:
+                        candidate_subpages.append(guess_url)
 
-                logger.info(f"[SCRAPER] Discovered {len(candidate_subpages)} contact subpages for {base_domain}: {candidate_subpages[:3]}")
+                # Limit to 3 subpages to respect timeout budget
+                candidate_subpages = candidate_subpages[:3]
+                logger.info(
+                    f"[SCRAPER] {len(candidate_subpages)} contact subpage(s) queued for "
+                    f"{base_domain}: {candidate_subpages}"
+                )
 
-                # Calculate root niche score to pass to contact subpages if root had no direct emails
-                root_score = None
+                # Pre-compute root niche score for subpage inheritance
+                root_niche_score = None
                 try:
-                    meta_desc = ""
+                    root_title = soup.find("title").text.strip() if soup.find("title") and soup.find("title").text else ""
+                    root_meta = ""
                     desc_tag = soup.find("meta", attrs={"name": re.compile(r"description", re.I)})
                     if desc_tag and desc_tag.get("content"):
-                        meta_desc = desc_tag["content"].strip()
-                    page_text = soup.get_text(separator=" ", strip=True)
-                    raw_title = soup.find("title").text.strip() if soup.find("title") and soup.find("title").text else ""
-                    sc, _ = LeadValidationFilter.calculate_niche_score(niche, raw_title, page_text, meta_desc, base_domain)
+                        root_meta = desc_tag["content"].strip()
+                    root_text = soup.get_text(separator=" ", strip=True)
+                    sc, _ = LeadValidationFilter.calculate_niche_score(niche, root_title, root_text, root_meta, base_domain)
                     if sc >= 70:
-                        root_score = sc
+                        root_niche_score = sc
                 except Exception:
                     pass
 
-                # Crawl top 3 subpages for business contacts
-                for sub_url in candidate_subpages[:3]:
+                for sub_url in candidate_subpages:
                     try:
                         sub_resp = await client.get(sub_url)
                         if sub_resp.status_code < 400:
@@ -579,20 +920,32 @@ class DeepScraperAgent:
                                 city=city,
                                 niche=niche,
                                 headers=dict(sub_resp.headers),
-                                inherited_niche_score=root_score
+                                inherited_niche_score=root_niche_score,
                             )
                             if sub_lead and sub_lead.all_emails:
-                                logger.info(f"[SCRAPER] Contact subpage {sub_url} resolved {len(sub_lead.all_emails)} email(s) for {base_domain} (Primary: {sub_lead.primary_email})")
-                                # Retain root company name if subpage is generic (e.g. "Impressum")
+                                logger.info(
+                                    f"[SCRAPER] ✅ Subpage hit: {sub_url} → "
+                                    f"{len(sub_lead.all_emails)} email(s) | Primary: {sub_lead.primary_email}"
+                                )
+                                # Preserve root page company name if subpage title is generic
                                 if lead and lead.company_name and len(lead.company_name) > 3:
                                     sub_lead.company_name = lead.company_name
                                 return sub_lead
+                            else:
+                                logger.info(f"[SCRAPER] No valid emails on subpage {sub_url}")
                     except Exception as sub_err:
                         logger.debug(f"[SCRAPER] Subpage fetch error for {sub_url}: {sub_err}")
 
-                logger.warning(f"[SCRAPER] Discarding {target_url}: 0 business emails found after scanning root and contact subpages.")
+                logger.warning(
+                    f"[SCRAPER] ✗ Discarding {target_url}: "
+                    f"0 business emails after root + {len(candidate_subpages)} subpages."
+                )
                 return None
 
         except Exception as ex:
-            logger.error(f"[SCRAPER] Unexpected scraping error for {target_url}: {type(ex).__name__} - {ex}", exc_info=False)
+            logger.error(
+                f"[SCRAPER] Unexpected error for {target_url}: "
+                f"{type(ex).__name__} — {ex}",
+                exc_info=False,
+            )
             return None
