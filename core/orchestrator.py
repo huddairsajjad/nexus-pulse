@@ -147,7 +147,21 @@ class NexusPulseOrchestrator:
                 "primary_email": raw_lead.primary_email
             }
 
-        # 3. Deduplication Shield Check
+        # 3. Deduplication Shield & MongoDB Unique Index Check
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            if mongo.is_duplicate(domain=raw_lead.domain, email=raw_lead.primary_email):
+                return {
+                    "success": False,
+                    "reason": "DEDUPLICATION_BLOCKED",
+                    "details": f"Lead domain '{raw_lead.domain}' or email '{raw_lead.primary_email}' already indexed in MongoDB",
+                    "lead_domain": raw_lead.domain,
+                    "primary_email": raw_lead.primary_email
+                }
+        except Exception:
+            pass
+
         is_dup, dup_reason = self.dedup.is_entity_duplicate(
             domain=raw_lead.domain,
             email=raw_lead.primary_email,
@@ -194,6 +208,26 @@ class NexusPulseOrchestrator:
 
         # 6. Store in Category Vault & Synchronize Partitions (JSON, CSV, Excel)
         store_res = self.vault.store_lead(raw_lead, operator_id=operator_id)
+
+        # 7. Mirror lead to MongoDB with unique constraint indexing
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            mongo.insert_lead({
+                "lead_id": raw_lead.id,
+                "domain": raw_lead.domain,
+                "primary_email": raw_lead.primary_email,
+                "company_name": raw_lead.company_name,
+                "country": raw_lead.target_country,
+                "city": raw_lead.target_city,
+                "niche": raw_lead.industry_niche,
+                "quality_tag": raw_lead.quality_tag,
+                "priority_score": raw_lead.priority_score,
+                "operator_id": operator_id,
+                "unsubscribed": False
+            })
+        except Exception:
+            pass
 
         return {
             "success": True,

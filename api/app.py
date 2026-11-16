@@ -82,11 +82,23 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"  Dispatcher startup notice: {e}")
 
+    # 4. Start Automated APScheduler Background Tasks
+    apscheduler_mgr = None
+    try:
+        from core.outreach.apscheduler_manager import get_apscheduler_manager
+        apscheduler_mgr = get_apscheduler_manager()
+        apscheduler_mgr.start()
+        print("  APScheduler     : ACTIVE (Daily send-cap reset, trial checks, bounce feedback)")
+    except Exception as e:
+        print(f"  APScheduler notice: {e}")
+
     print("  Nexus-Pulse Level 2 Core Engine ONLINE & READY FOR TRAFFIC")
     print("=" * 68)
     yield
     if dispatcher_task:
         dispatcher_task.cancel()
+    if apscheduler_mgr:
+        apscheduler_mgr.shutdown()
     print("  Shutting down Nexus-Pulse Level 2 Core Engine...")
 
 

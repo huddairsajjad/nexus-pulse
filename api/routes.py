@@ -112,6 +112,16 @@ class RegisterRequest(BaseModel):
     role: Optional[str] = "operator"
 
 
+class GoogleAuthRequest(BaseModel):
+    credential: Optional[str] = None
+    email: Optional[str] = None
+    name: Optional[str] = None
+    sub: Optional[str] = None
+    refresh_token: Optional[str] = None
+    access_token: Optional[str] = None
+    device_id: Optional[str] = None
+
+
 class ConfigUpdateRequest(BaseModel):
     target_country: Optional[str] = None
     target_city: Optional[str] = None
@@ -284,8 +294,24 @@ class LogActivityRequest(BaseModel):
 
 
 # -------------------------------------------------------------
-# 1. SUPER ADMIN: PROFILE & OPERATORS MANAGEMENT
+# 1. SUPER ADMIN: ROOT ACCESS, PROFILE & OPERATORS MANAGEMENT
 # -------------------------------------------------------------
+@router.get("/admin")
+@router.get("/admin/")
+def admin_root_dashboard(admin_user: Dict[str, Any] = Depends(require_admin)):
+    """
+    Root Admin Access checkpoint.
+    Restricted to users with role='admin'. Regular operators get 403 Forbidden.
+    """
+    return {
+        "status": "ACCESS_GRANTED",
+        "role": admin_user.get("role"),
+        "user_id": admin_user.get("id"),
+        "username": admin_user.get("username"),
+        "full_name": admin_user.get("full_name")
+    }
+
+
 @router.get("/admin/profile")
 def get_admin_profile(admin_user: Dict[str, Any] = Depends(require_admin)):
     """Super Admin Profile inspector."""
@@ -628,6 +654,65 @@ def register_new_account(req: RegisterRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.post("/auth/google")
+def google_oauth_authenticate(req: GoogleAuthRequest):
+    """
+    Self-Serve Google OAuth 2.0:
+    Authenticates existing users or automatically provisions a 2-Day Free Trial
+    for new users with refresh token storage and background renewal.
+    """
+    um = get_user_manager()
+    email = (req.email or "").strip().lower()
+    name = req.name
+    sub = req.sub
+
+    # If credential (Google ID token / JWT) provided, decode payload claims if email not set
+    if req.credential and not email:
+        try:
+            import json
+            import base64
+            parts = req.credential.split(".")
+            if len(parts) >= 2:
+                payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8"))
+                email = (claims.get("email") or "").strip().lower()
+                name = name or claims.get("name")
+                sub = sub or claims.get("sub")
+        except Exception as e:
+            logger.warning(f"[GOOGLE_AUTH] Could not decode credential payload: {e}")
+
+    if not email:
+        raise HTTPException(status_code=400, detail="Google authentication failed: Email address is required.")
+
+    try:
+        res = um.authenticate_or_register_google_user(
+            email=email,
+            name=name,
+            google_id=sub,
+            refresh_token=req.refresh_token,
+            access_token=req.access_token,
+            device_lock_id=req.device_id
+        )
+        return res
+    except PermissionError as pe:
+        raise HTTPException(status_code=403, detail=str(pe))
+    except Exception as ex:
+        raise HTTPException(status_code=400, detail=str(ex))
+
+
+@router.get("/auth/google/url")
+def get_google_oauth_url(redirect_uri: Optional[str] = None):
+    """Generates Google OAuth 2.0 authorization URL for frontend redirect."""
+    client_id = os.getenv("GOOGLE_CLIENT_ID", "nexus-pulse-google-client-id.apps.googleusercontent.com")
+    target_redirect = redirect_uri or os.getenv("GOOGLE_REDIRECT_URI", "https://nexus-pulse.up.railway.app/login")
+    scope = "openid email profile"
+    url = f"https://accounts.google.com/o/oauth2/v2/auth?client_id={client_id}&redirect_uri={target_redirect}&response_type=code&scope={scope}&access_type=offline&prompt=consent"
+    return {
+        "url": url,
+        "client_id": client_id
+    }
+
+
 @router.get("/auth/me")
 def get_current_user_profile(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Returns profile for currently authenticated session."""
@@ -829,7 +914,7 @@ def dispatch_approved_item(
     gate = get_approval_gate()
     target_op = current_user["id"] if current_user.get("role") == "operator" else None
     try:
-        res = gate.dispatch_approved_outreach(queue_id, operator_id=target_op)
+        res = gate.dispatch_approved_outreach(queue_id, operator_id=target_op, bypass_window=bool(bypass_window))
         if not res.get("success"):
             raise HTTPException(status_code=400, detail=res.get("message", "Dispatch failed."))
         return res
@@ -854,7 +939,7 @@ def dispatch_now_trigger(
 
     if req and req.queue_id:
         try:
-            res = gate.dispatch_approved_outreach(req.queue_id, operator_id=target_op)
+            res = gate.dispatch_approved_outreach(req.queue_id, operator_id=target_op, bypass_window=effective_bypass)
             if not res.get("success"):
                 raise HTTPException(status_code=400, detail=res.get("message", "Dispatch failed."))
             return {
@@ -1306,6 +1391,34 @@ def handle_unsubscribe_link(token: Optional[str] = Query(None), email: Optional[
         listener.suppress_entity(clean_email, reason="UNSUBSCRIBE")
         listener.suppress_entity(domain_part, reason="UNSUBSCRIBE")
 
+        # Sync unsubscription status to MongoDB
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            mongo.set_unsubscribed(clean_email)
+            if domain_part:
+                mongo.set_unsubscribed(domain_part)
+        except Exception as mex:
+            logger.warning(f"[UNSUBSCRIBE] MongoDB sync error: {mex}")
+
+        # Update SQLite vault_leads and outreach_queue
+        try:
+            db = get_db_engine()
+            with db.get_connection() as conn:
+                conn.execute("""
+                    UPDATE outreach_queue
+                    SET unsubscribed = 1, status = 'SUPPRESSED', bounce_reason = 'UNSUBSCRIBED'
+                    WHERE lower(recipient) = ? OR lower(recipient) LIKE ?
+                """, (clean_email, f"%@{domain_part}"))
+                conn.execute("""
+                    UPDATE vault_leads
+                    SET unsubscribed = 1
+                    WHERE lower(primary_email) = ? OR lower(domain) = ?
+                """, (clean_email, domain_part))
+                conn.commit()
+        except Exception as sqex:
+            logger.warning(f"[UNSUBSCRIBE] SQLite sync error: {sqex}")
+
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -1336,7 +1449,36 @@ def handle_unsubscribe_post(req: UnsubscribeRequest):
     domain = clean.split("@")[-1] if "@" in clean else clean
     listener.suppress_entity(clean, reason="UNSUBSCRIBE")
     listener.suppress_entity(domain, reason="UNSUBSCRIBE")
-    return {"success": True, "suppressed_entity": clean}
+
+    # Sync unsubscription status to MongoDB
+    try:
+        from database.mongo_engine import get_mongo_engine
+        mongo = get_mongo_engine()
+        mongo.set_unsubscribed(clean)
+        if domain:
+            mongo.set_unsubscribed(domain)
+    except Exception as mex:
+        logger.warning(f"[UNSUBSCRIBE] MongoDB sync error: {mex}")
+
+    # Update SQLite vault_leads and outreach_queue
+    try:
+        db = get_db_engine()
+        with db.get_connection() as conn:
+            conn.execute("""
+                UPDATE outreach_queue
+                SET unsubscribed = 1, status = 'SUPPRESSED', bounce_reason = 'UNSUBSCRIBED'
+                WHERE lower(recipient) = ? OR lower(recipient) LIKE ?
+            """, (clean, f"%@{domain}"))
+            conn.execute("""
+                UPDATE vault_leads
+                SET unsubscribed = 1
+                WHERE lower(primary_email) = ? OR lower(domain) = ?
+            """, (clean, domain))
+            conn.commit()
+    except Exception as sqex:
+        logger.warning(f"[UNSUBSCRIBE] SQLite sync error: {sqex}")
+
+    return {"success": True, "suppressed_entity": clean, "unsubscribed": True}
 
 
 @router.get("/suppressed")

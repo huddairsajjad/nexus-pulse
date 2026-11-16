@@ -126,12 +126,13 @@ DEFAULT_HEADERS = _rotated_headers()
 # ---------------------------------------------------------------------------
 CONTACT_SUBPAGE_KEYWORDS = [
     "kontakt", "contact", "impressum", "about", "ueber-uns", "uber-uns",
-    "ansprechpartner", "team", "mentions", "mentions-legales", "legal",
+    "ansprechpartner", "team", "our-team", "leadership", "people", "staff", "mentions", "mentions-legales", "legal",
     "contacto", "contatti", "contacts", "direction", "firmensitz", "standort"
 ]
 COMMON_SUBPATHS = [
     "/contact", "/contact/", "/contact-us", "/contact-us/",
-    "/about", "/about-us", "/about/",
+    "/about", "/about-us", "/about-us/", "/about/",
+    "/team", "/team/", "/our-team", "/our-team/",
     "/kontakt", "/kontakt/", "/impressum", "/impressum/",
 ]
 
@@ -911,8 +912,21 @@ class DeepScraperAgent:
 
                 for sub_url in candidate_subpages:
                     try:
-                        sub_resp = await client.get(sub_url)
-                        if sub_resp.status_code < 400:
+                        sub_resp = None
+                        for retry_attempt in range(2):
+                            try:
+                                sub_resp = await client.get(sub_url)
+                                if sub_resp.status_code in (429, 502, 503, 504):
+                                    await asyncio.sleep(1.0 * (2 ** retry_attempt))
+                                    continue
+                                break
+                            except (httpx.RequestError, httpx.TimeoutException):
+                                if retry_attempt == 0:
+                                    await asyncio.sleep(1.0)
+                                    continue
+                                raise
+
+                        if sub_resp and sub_resp.status_code < 400:
                             sub_lead = self.parse_html_content(
                                 html_content=sub_resp.text,
                                 source_url=str(sub_resp.url),

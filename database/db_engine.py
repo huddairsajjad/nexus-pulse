@@ -164,7 +164,14 @@ class DatabaseEngine:
                 ("daily_scrape_quota", "INTEGER NOT NULL DEFAULT 200"),
                 ("daily_send_quota", "INTEGER NOT NULL DEFAULT 50"),
                 ("license_key", "TEXT"),
-                ("last_login_device", "TEXT")
+                ("last_login_device", "TEXT"),
+                ("auth_provider", "TEXT DEFAULT 'local'"),
+                ("google_id", "TEXT"),
+                ("google_refresh_token", "TEXT"),
+                ("google_access_token", "TEXT"),
+                ("google_token_expiry", "TEXT"),
+                ("trial_status", "TEXT DEFAULT 'active'"),
+                ("trial_started_at", "TEXT")
             ]
             for col_name, col_def in migrations:
                 if col_name not in existing_user_cols:
@@ -174,6 +181,8 @@ class DatabaseEngine:
             existing_vl_cols = {col["name"] for col in conn.execute("PRAGMA table_info(vault_leads)").fetchall()}
             if "operator_id" not in existing_vl_cols:
                 conn.execute("ALTER TABLE vault_leads ADD COLUMN operator_id TEXT;")
+            if "unsubscribed" not in existing_vl_cols:
+                conn.execute("ALTER TABLE vault_leads ADD COLUMN unsubscribed INTEGER NOT NULL DEFAULT 0;")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_operator ON vault_leads(operator_id);")
 
             # 5. Outreach Queue (Human Approval Gate & Scheduled Dispatch)
@@ -211,7 +220,8 @@ class DatabaseEngine:
                 ("opened_at", "TIMESTAMP"),
                 ("bounced_at", "TIMESTAMP"),
                 ("bounce_reason", "TEXT"),
-                ("message_id", "TEXT")
+                ("message_id", "TEXT"),
+                ("unsubscribed", "INTEGER NOT NULL DEFAULT 0")
             ]
             for col_name, col_def in oq_migrations:
                 if col_name not in existing_oq_cols:

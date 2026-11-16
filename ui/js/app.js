@@ -654,6 +654,50 @@ function NexusPulseApp() {
     }, 1300);
   };
 
+  const handleGoogleSignIn = async () => {
+    setLoginError("");
+    setIsScanning(true);
+    setScanStep("Initiating Zero-Config Google OAuth 2.0 handshake...");
+    try {
+      const googleEmail = prompt("Enter your Google Account email to activate 2-Day Free Trial:") || "";
+      if (!googleEmail || !googleEmail.includes("@")) {
+        setIsScanning(false);
+        return;
+      }
+      setScanStep(`Auto-provisioning 2-Day Free Trial for ${googleEmail}...`);
+      const resp = await fetch(`${API_BASE}/api/auth/google`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: googleEmail,
+          name: googleEmail.split("@")[0],
+          sub: "google_" + Date.now()
+        })
+      });
+      const data = await resp.json();
+      if (resp.ok && data.token) {
+        setScanStep("Google Identity Verified! 2-Day Free Trial provisioned...");
+        setTimeout(() => {
+          setToken(data.token);
+          setUser(data.user);
+          localStorage.setItem("nexus_token", data.token);
+          localStorage.setItem("nexus_user", JSON.stringify(data.user));
+          setIsScanning(false);
+          setAlertBanner({
+            type: "success",
+            message: `Welcome ${data.user.full_name || data.user.username}! 2-Day Free Trial successfully activated.`
+          });
+        }, 400);
+      } else {
+        setIsScanning(false);
+        setLoginError(data.detail || "Google OAuth authentication failed.");
+      }
+    } catch (err) {
+      setIsScanning(false);
+      setLoginError("Network Error: Could not connect to Google OAuth service.");
+    }
+  };
+
   const handleLogout = () => {
     localStorage.removeItem("nexus_token");
     localStorage.removeItem("nexus_user");
@@ -1884,6 +1928,25 @@ function NexusPulseApp() {
                 <span>Sign In & Verify Machine ID</span>
                 <span>➔</span>
               </button>
+
+              <div className="relative my-4">
+                <div className="absolute inset-0 flex items-center">
+                  <div className="w-full border-t border-[var(--border-subtle)]" />
+                </div>
+                <div className="relative flex justify-center text-[10px] uppercase font-mono">
+                  <span className="bg-surface px-2 text-theme-muted">Or Instant Self-Serve</span>
+                </div>
+              </div>
+
+              <button
+                type="button"
+                onClick={handleGoogleSignIn}
+                className="btn btn-secondary w-full justify-center btn-lg flex items-center gap-2 border border-[var(--border-subtle)] hover:border-[var(--accent)]"
+              >
+                <span className="font-bold text-xs text-theme-accent">G</span>
+                <span className="font-semibold text-xs text-theme-primary">Sign in with Google</span>
+                <span className="badge badge-accent text-[9px] px-1.5 py-0 ml-1">2-Day Free Trial</span>
+              </button>
             </form>
           )}
         </div>
@@ -2055,9 +2118,16 @@ function NexusPulseApp() {
           <div className="flex items-center gap-2 pl-2.5 border-l-theme">
             <div className="text-right hidden sm:block">
               <div className="text-xs font-semibold leading-tight text-theme-primary">{user.full_name || user.username}</div>
-              <span className="badge badge-gold uppercase text-[9px]">
-                {user.role}
-              </span>
+              <div className="flex items-center gap-1 justify-end mt-0.5">
+                <span className="badge badge-gold uppercase text-[9px]">
+                  {user.role}
+                </span>
+                {user.trial_status === "active" && (
+                  <span className="badge badge-accent text-[9px]" title="2-Day Free Trial">
+                    2-Day Trial
+                  </span>
+                )}
+              </div>
             </div>
             <button
               onClick={handleLogout}

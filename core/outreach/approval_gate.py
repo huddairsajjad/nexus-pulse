@@ -26,33 +26,52 @@ from core.hygiene.lead_validator import LeadValidationFilter
 logger = logging.getLogger("nexus.approval_gate")
 
 
-def _send_webhook_request(webhook_url: str, payload: dict) -> dict:
-    """Sends HTTPS POST request to Google Apps Script Webhook relay with redirect following."""
-    try:
-        import httpx
-        with httpx.Client(timeout=20.0, follow_redirects=True) as client:
-            resp = client.post(webhook_url, json=payload)
-            return resp.json()
-    except ImportError:
-        pass
+def _send_webhook_request(webhook_url: str, payload: dict, max_retries: int = 3) -> dict:
+    """
+    Sends HTTPS POST request to Webhook relay with retry queue and exponential backoff.
+    Follows redirects and validates live 200 OK payload confirmation.
+    Handles errors cleanly to avoid spamming deploy logs.
+    """
+    import time
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            try:
+                import httpx
+                with httpx.Client(timeout=15.0, follow_redirects=True) as client:
+                    resp = client.post(webhook_url, json=payload)
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                            if isinstance(data, dict):
+                                return data
+                            return {"status": "success", "response": data}
+                        except Exception:
+                            return {"status": "success", "raw": resp.text}
+                    else:
+                        last_err = f"HTTP {resp.status_code}: {resp.text[:100]}"
+            except ImportError:
+                import requests
+                resp = requests.post(webhook_url, json=payload, allow_redirects=True, timeout=15.0)
+                if resp.status_code == 200:
+                    try:
+                        data = resp.json()
+                        if isinstance(data, dict):
+                            return data
+                        return {"status": "success", "response": data}
+                    except Exception:
+                        return {"status": "success", "raw": resp.text}
+                else:
+                    last_err = f"HTTP {resp.status_code}: {resp.text[:100]}"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {str(e)}"
 
-    try:
-        import requests
-        resp = requests.post(webhook_url, json=payload, allow_redirects=True, timeout=20.0)
-        return resp.json()
-    except ImportError:
-        pass
+        if attempt < max_retries:
+            backoff_sleep = 0.5 * (2 ** (attempt - 1))
+            time.sleep(backoff_sleep)
 
-    import urllib.request
-    import json
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        webhook_url,
-        data=data,
-        headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=20.0) as response:
-        return json.loads(response.read().decode("utf-8"))
+    logger.warning(f"[WEBHOOK RELAY] Delivery attempt failed after {max_retries} retries ({last_err})")
+    return {"status": "error", "message": f"Webhook relay failed after {max_retries} attempts: {last_err}"}
 
 
 def generate_personalized_copy(
@@ -345,7 +364,12 @@ class HumanApprovalGate:
             conn.commit()
             return {"success": True, "queue_id": queue_id, "status": "REJECTED"}
 
-    def dispatch_approved_outreach(self, queue_id: str, operator_id: Optional[str] = None) -> Dict[str, Any]:
+    def dispatch_approved_outreach(
+        self,
+        queue_id: str,
+        operator_id: Optional[str] = None,
+        bypass_window: bool = False
+    ) -> Dict[str, Any]:
         """
         Dispatches an approved outreach item.
         Uses Google Apps Script HTTPS Webhook relay if configured (bypassing Railway SMTP port block),
@@ -358,12 +382,75 @@ class HumanApprovalGate:
             if not row:
                 raise ValueError(f"Queue item '{queue_id}' not found.")
 
-            target_op = operator_id or row["operator_id"]
-            if operator_id and row["operator_id"] and row["operator_id"] != operator_id:
+            # Convert sqlite3.Row to dict for safe attribute access
+            row = dict(row)
+
+            target_op = operator_id or row.get("operator_id")
+            if operator_id and row.get("operator_id") and row.get("operator_id") != operator_id:
                 raise PermissionError("Access denied: You cannot dispatch outreach for another tenant.")
 
             if row["status"] not in ("APPROVED", "SCHEDULED", "FAILED"):
                 raise PermissionError(f"CANNOT DISPATCH: Item is in '{row['status']}' state. Manual approval required.")
+
+            recip_clean = row["recipient"].strip().lower()
+            recip_dom = recip_clean.split("@")[-1] if "@" in recip_clean else recip_clean
+
+            # 1. Compliance & Unsubscribe Checks (MongoDB + SQLite + Blacklist)
+            is_unsub = False
+            try:
+                from database.mongo_engine import get_mongo_engine
+                mongo = get_mongo_engine()
+                if mongo.is_unsubscribed(recip_clean) or mongo.is_unsubscribed(recip_dom):
+                    is_unsub = True
+            except Exception:
+                pass
+
+            if not is_unsub and row.get("unsubscribed"):
+                is_unsub = True
+
+            is_bl, bl_reason = self.blacklist_manager.is_domain_blacklisted(recip_clean)
+
+            suppressed_entry = conn.execute("""
+                SELECT reason FROM suppressed_entities
+                WHERE lower(entity) = ? OR lower(entity) = ?
+            """, (recip_clean, recip_dom)).fetchone()
+
+            if is_unsub or is_bl or suppressed_entry:
+                sup_reason = "UNSUBSCRIBE" if is_unsub else (bl_reason or suppressed_entry["reason"])
+                conn.execute("""
+                    UPDATE outreach_queue
+                    SET status = 'SUPPRESSED', bounce_reason = ?
+                    WHERE id = ?
+                """, (f"Suppressed: {sup_reason}", queue_id))
+                conn.commit()
+                logger.info(f"[DISPATCH SUPPRESSED] {recip_clean} blocked by compliance guard ({sup_reason}).")
+                return {
+                    "success": False,
+                    "status": "SUPPRESSED",
+                    "reason": f"Recipient or domain is suppressed/unsubscribed: {sup_reason}",
+                    "recipient": recip_clean
+                }
+
+            # 2. Operational Working Hours Check (9 AM - 5 PM local recipient time)
+            country = row["target_country"] or "United Kingdom"
+            tz_eval = self.scheduler.get_target_local_time(country=country, domain=recip_dom, bypass_window=bypass_window)
+            if not tz_eval.get("is_in_send_window") and not bypass_window:
+                next_slot = self.scheduler.calculate_next_send_slot(country=country, domain=recip_dom, bypass_window=False)
+                conn.execute("""
+                    UPDATE outreach_queue
+                    SET status = 'SCHEDULED', scheduled_for = ?
+                    WHERE id = ?
+                """, (next_slot.isoformat(), queue_id))
+                conn.commit()
+                logger.info(f"[DISPATCH OFF-HOURS] {recip_clean} is outside operational hours ({tz_eval.get('current_local_time')}). Scheduled for {next_slot.isoformat()}.")
+                return {
+                    "success": False,
+                    "status": "SCHEDULED",
+                    "reason": "OFF_HOURS_BLOCKED",
+                    "message": f"Recipient local time is outside operational hours (9 AM - 5 PM). Scheduled for {next_slot.isoformat()}.",
+                    "scheduled_for": next_slot.isoformat(),
+                    "recipient": recip_clean
+                }
 
             # Dynamic Mailbox Credential Lookup: Reads live credentials directly from database at execution time
             mb_record = None
@@ -455,16 +542,16 @@ class HumanApprovalGate:
                 try:
                     logger.info(f"[WEBHOOK DISPATCH] Posting to Apps Script relay for {sender_email} -> {row['recipient']}...")
                     resp_json = _send_webhook_request(active_webhook, payload)
-                    if isinstance(resp_json, dict) and resp_json.get("status") == "success":
+                    if isinstance(resp_json, dict) and (resp_json.get("status") == "success" or resp_json.get("ok") is True or resp_json.get("success") is True):
                         dispatched_successfully = True
                         dispatch_method = "WEBHOOK"
-                        logger.info(f"[WEBHOOK DISPATCH SUCCESS] Email relayed via Google Apps Script for {sender_email} -> {row['recipient']}.")
+                        logger.info(f"[WEBHOOK RELAY 200 OK] Dispatched outreach to {row['recipient']} via {sender_email}.")
                     else:
                         webhook_err_msg = resp_json.get("message") or resp_json.get("error") if isinstance(resp_json, dict) else str(resp_json)
-                        logger.warning(f"[WEBHOOK DISPATCH NON-SUCCESS] Status not success: {webhook_err_msg}. Falling back to SMTP...")
+                        logger.warning(f"[WEBHOOK RELAY] Status: {webhook_err_msg}. Falling back to SMTP...")
                 except Exception as wh_ex:
                     webhook_err_msg = f"{type(wh_ex).__name__}: {str(wh_ex)}"
-                    logger.warning(f"[WEBHOOK DISPATCH ERROR] {webhook_err_msg}. Falling back to SMTP...")
+                    logger.warning(f"[WEBHOOK RELAY] {webhook_err_msg}. Falling back to SMTP...")
 
             # Priority 2: Fallback to SMTP transmission if webhook was not active or failed
             if not dispatched_successfully:
@@ -530,6 +617,8 @@ class HumanApprovalGate:
 
             # Increment daily send counter for this mailbox
             self.rotator.record_email_dispatched(mb["id"])
+            new_sent_today = mb["sent_today"] + 1
+            remaining_quota = max(0, mb["daily_limit"] - new_sent_today)
 
             now_iso = datetime.now(timezone.utc).isoformat()
             conn.execute("""
@@ -537,6 +626,19 @@ class HumanApprovalGate:
                 SET status = 'SENT', sent_at = CURRENT_TIMESTAMP, mailbox_used = ?, message_body = ?, bounce_reason = NULL, message_id = ?
                 WHERE id = ?
             """, (sender_email, msg_body, msg_id_val, queue_id))
+
+            # Record in operator_sessions audit log
+            try:
+                conn.execute("""
+                    INSERT INTO operator_sessions (user_id, username, action, detail, device_id)
+                    VALUES (?, ?, 'DISPATCH_EMAIL', ?, 'CLOUD_RELAY')
+                """, (
+                    target_op or "system",
+                    row.get("approved_by") or "operator",
+                    f"Dispatched {dispatch_method} outreach to {recip_clean} via {sender_email} (queue_id: {queue_id})"
+                ))
+            except Exception:
+                pass
 
             # Initialize 7-Day Follow-Up Sequence
             followup_id = str(uuid.uuid4())
@@ -558,7 +660,10 @@ class HumanApprovalGate:
                 "dispatched_via": sender_email,
                 "sent_at": now_iso,
                 "followup_scheduled_for_days": 7,
-                "delivery_method": dispatch_method
+                "delivery_method": dispatch_method,
+                "mailbox_daily_limit": mb["daily_limit"],
+                "sent_today": new_sent_today,
+                "remaining_daily_quota": remaining_quota
             }
 
     def dispatch_ready_queue(
