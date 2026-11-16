@@ -16,10 +16,20 @@
   <link rel="icon" type="image/x-icon" href="/favicon.ico">
   <link rel="icon" type="image/svg+xml" href="/ui/assets/icon.svg">
 
-  <!-- Tailwind CSS CDN -->
-  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- 1. Local Tailwind CSS Fallback (100% Offline Resilience / Zero CDN Dependency) -->
+  <link rel="stylesheet" href="/ui/css/tailwind.fallback.css">
+
+  <!-- 2. Nexus-Pulse Enterprise Theme System & Global Stylesheet -->
+  <link rel="stylesheet" href="/ui/css/cyberpunk.css">
+
+  <style>
+    @keyframes np-spin { to { transform: rotate(360deg); } }
+  </style>
+
+  <!-- Safe Tailwind Initialization: Guaranteed to never throw ReferenceError -->
   <script>
-    tailwind.config = {
+    window.tailwind = window.tailwind || {};
+    window.tailwind.config = {
       darkMode: ['class', '[data-theme="github-dark"]'],
       theme: {
         extend: {
@@ -46,13 +56,53 @@
     };
   </script>
 
-  <!-- Nexus-Pulse Enterprise Theme System & Global Stylesheet -->
-  <link rel="stylesheet" href="/ui/css/cyberpunk.css">
+  <!-- Optional Progressive Tailwind Runtime (Safe asynchronous load; fails gracefully) -->
+  <script async src="https://cdn.tailwindcss.com" onerror="console.info('[UI] Tailwind CDN blocked; local fallback stylesheet active.')"></script>
 
-  <!-- React 18 & Babel CDN -->
-  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
-  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <!-- 3. React 18 with Multi-CDN Cascading Fallback (Cloudflare -> jsDelivr -> unpkg) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js" crossorigin="anonymous"></script>
+  <script>
+    if (!window.React) {
+      console.warn('[CDN] Cloudflare React unavailable, cascading to jsDelivr...');
+      document.write('<script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js" crossorigin="anonymous"><\/script>');
+    }
+  </script>
+  <script>
+    if (!window.React) {
+      console.warn('[CDN] jsDelivr React unavailable, cascading to unpkg...');
+      document.write('<script src="https://unpkg.com/react@18.2.0/umd/react.production.min.js" crossorigin="anonymous"><\/script>');
+    }
+  </script>
+
+  <!-- 4. ReactDOM 18 with Multi-CDN Cascading Fallback (Cloudflare -> jsDelivr -> unpkg) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js" crossorigin="anonymous"></script>
+  <script>
+    if (!window.ReactDOM) {
+      console.warn('[CDN] Cloudflare ReactDOM unavailable, cascading to jsDelivr...');
+      document.write('<script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin="anonymous"><\/script>');
+    }
+  </script>
+  <script>
+    if (!window.ReactDOM) {
+      console.warn('[CDN] jsDelivr ReactDOM unavailable, cascading to unpkg...');
+      document.write('<script src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js" crossorigin="anonymous"><\/script>');
+    }
+  </script>
+
+  <!-- 5. Babel Standalone with Multi-CDN Cascading Fallback (Cloudflare -> jsDelivr -> unpkg) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.4/babel.min.js" crossorigin="anonymous"></script>
+  <script>
+    if (!window.Babel) {
+      console.warn('[CDN] Cloudflare Babel unavailable, cascading to jsDelivr...');
+      document.write('<script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.24.4/babel.min.js" crossorigin="anonymous"><\/script>');
+    }
+  </script>
+  <script>
+    if (!window.Babel) {
+      console.warn('[CDN] jsDelivr Babel unavailable, cascading to unpkg...');
+      document.write('<script src="https://unpkg.com/@babel/standalone@7.24.4/babel.min.js" crossorigin="anonymous"><\/script>');
+    }
+  </script>
 
   <script>
     // Apply saved theme before first paint to prevent Flash of Unstyled Content (FOUC)
@@ -90,7 +140,37 @@
   </script>
 </head>
 <body class="bg-base text-theme-primary antialiased m-0 p-0 selection:bg-[var(--accent)] selection:text-black">
-  <div id="root"></div>
+  <div id="root">
+    <!-- Smooth Initial Loading State (Replaced immediately upon React mount) -->
+    <div id="np-initial-loader" style="min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0d1117;color:#e6edf3;text-align:center;padding:24px;">
+      <div style="width:36px;height:36px;border:3px solid #30363d;border-top-color:#58a6ff;border-radius:50%;animation:np-spin 0.8s linear infinite;margin-bottom:16px;"></div>
+      <div style="font-weight:700;font-size:14px;letter-spacing:0.05em;color:#e6edf3;font-family:ui-monospace,monospace;">NEXUS-PULSE [LEVEL 2]</div>
+      <div style="font-size:12px;color:#8b949e;margin-top:6px;">Loading Enterprise Architecture & Theme Engine...</div>
+    </div>
+  </div>
+
+  <script>
+    // Global Watchdog: If React doesn't mount within 10s, provide diagnostic guidance instead of blank white screen
+    setTimeout(function() {
+      var loader = document.getElementById('np-initial-loader');
+      if (loader) {
+        var missing = [];
+        if (!window.React) missing.push('React');
+        if (!window.ReactDOM) missing.push('ReactDOM');
+        if (!window.Babel) missing.push('Babel');
+
+        loader.innerHTML = '<div style="max-width:440px;background:#161b22;border:1px solid #f85149;border-radius:8px;padding:24px;text-align:center;box-shadow:0 8px 30px rgba(0,0,0,0.5);">' +
+          '<div style="color:#f85149;font-weight:700;font-size:15px;margin-bottom:8px;">⚠️ Interface Initialization Alert</div>' +
+          '<p style="font-size:12px;color:#8b949e;line-height:1.6;margin-bottom:16px;">' +
+          (missing.length > 0
+            ? 'Network CDN was unable to supply critical scripts (' + missing.join(', ') + '). Check your connection or adblocker rules.'
+            : 'Interface script is finalizing transpilation. Click below to refresh if needed.') +
+          '</p>' +
+          '<button onclick="window.location.reload(true)" style="background:#58a6ff;color:#0d1117;border:none;border-radius:6px;padding:8px 18px;font-weight:600;font-size:12px;cursor:pointer;">Refresh Page</button>' +
+          '</div>';
+      }
+    }, 10000);
+  </script>
 
   <!-- Main React App Script (Transpiled via Babel in browser) -->
   <script type="text/babel" src="/ui/js/app.js"></script>
