@@ -240,11 +240,41 @@ function NexusPulseApp() {
   const [isInitializingAdmin, setIsInitializingAdmin] = useState(false);
 
   // Production Clean Login Form State (No pre-populated test/demo logins)
+  const [authMode, setAuthMode] = useState("login"); // 'login' | 'register'
   const [loginUsername, setLoginUsername] = useState("");
   const [loginPassword, setLoginPassword] = useState("");
   const [loginError, setLoginError] = useState("");
   const [isScanning, setIsScanning] = useState(false);
   const [scanStep, setScanStep] = useState("");
+
+  // Operator Registration Form State
+  const [regFullName, setRegFullName] = useState("");
+  const [regEmail, setRegEmail] = useState("");
+  const [regUsername, setRegUsername] = useState("");
+  const [regPassword, setRegPassword] = useState("");
+  const [regConfirmPassword, setRegConfirmPassword] = useState("");
+  const [regError, setRegError] = useState("");
+  const [isRegistering, setIsRegistering] = useState(false);
+
+  // Setup Guide & Webhook Modal State
+  const [isSetupGuideOpen, setIsSetupGuideOpen] = useState(false);
+  const [setupGuideTab, setSetupGuideTab] = useState("gmail_smtp"); // 'gmail_smtp' | 'webhook_script'
+  const [copiedWebhookScript, setCopiedWebhookScript] = useState(false);
+
+  // Inbound IMAP Reply Sync State
+  const [isSyncingReplies, setIsSyncingReplies] = useState(false);
+
+  // 2-Day Free Trial Activation State
+  const [isActivatingTrial, setIsActivatingTrial] = useState(false);
+
+  // Post-Trial Subscription Paywall State
+  const [selectedPaywallPlan, setSelectedPaywallPlan] = useState("3_months"); // '1_month', '2_months', '3_months'
+  const [paywallNotes, setPaywallNotes] = useState("");
+  const [isSubmittingPlan, setIsSubmittingPlan] = useState(false);
+  const [paywallSubmitted, setPaywallSubmitted] = useState(false);
+
+  // Admin Manual Billing: Pending Plan Requests State
+  const [planRequests, setPlanRequests] = useState([]);
 
   // ---------------------------------------------------------------------------
   // CORE TELEMETRY & PIPELINE STATE
@@ -472,7 +502,18 @@ function NexusPulseApp() {
         if (data && typeof data.total_sent === "number") setDeliverabilityStats(data);
       }).catch(() => {});
 
+      // Sync user profile state (trial & subscription statuses)
+      fetch(`${API_BASE}/api/auth/me`, { headers }).then(r => r.json()).then(data => {
+        if (data && data.id) {
+          setUser(prev => ({ ...(prev || {}), ...data }));
+          localStorage.setItem("nexus_user", JSON.stringify(data));
+        }
+      }).catch(() => {});
+
       if (user && user.role === "admin") {
+        fetch(`${API_BASE}/api/billing/plan-requests`, { headers }).then(r => r.json()).then(data => {
+          if (Array.isArray(data)) setPlanRequests(data);
+        }).catch(() => {});
         fetch(`${API_BASE}/api/operators`, { headers }).then(r => r.json()).then(data => {
           if (Array.isArray(data)) setOperatorsList(data);
         }).catch(() => {});
@@ -705,6 +746,300 @@ function NexusPulseApp() {
     setToken("");
     adminProfileLoadedRef.current = false;
     adminFormDirtyRef.current = false;
+  };
+
+  // ---------------------------------------------------------------------------
+  // SAAS MULTI-TENANT TRIAL, PAYWALL & IMAP LISTENERS HELPERS
+  // ---------------------------------------------------------------------------
+  const calculateTrialRemaining = (expiresAt) => {
+    if (!expiresAt) return "48h left";
+    try {
+      const exp = new Date(expiresAt.replace(" ", "T") + (expiresAt.includes("Z") ? "" : "Z"));
+      const now = new Date();
+      const diffMs = exp - now;
+      if (diffMs <= 0) return "Trial Expired";
+      const hours = Math.floor(diffMs / (1000 * 60 * 60));
+      const mins = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+      return `${hours}h ${mins}m left`;
+    } catch (e) {
+      return "48h left";
+    }
+  };
+
+  const isTrialExpired = (expiresAt) => {
+    if (!expiresAt) return false;
+    try {
+      const exp = new Date(expiresAt.replace(" ", "T") + (expiresAt.includes("Z") ? "" : "Z"));
+      return new Date() > exp;
+    } catch (e) {
+      return false;
+    }
+  };
+
+  const handleRegister = async (e) => {
+    if (e && e.preventDefault) e.preventDefault();
+    setRegError("");
+    if (!regUsername || !regPassword || !regFullName) {
+      setRegError("Please fill in all required fields.");
+      return;
+    }
+    if (regPassword.length < 6) {
+      setRegError("Passphrase must be at least 6 characters.");
+      return;
+    }
+    if (regPassword !== regConfirmPassword) {
+      setRegError("Passwords do not match.");
+      return;
+    }
+
+    setIsRegistering(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/auth/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          username: regUsername.trim(),
+          password: regPassword,
+          full_name: regFullName.trim(),
+          email: regEmail ? regEmail.trim().toLowerCase() : undefined,
+          role: "operator"
+        })
+      });
+      const data = await resp.json();
+      if (resp.ok && (data.token || data.access_token)) {
+        const userToken = data.token || data.access_token;
+        const userData = data.user || {
+          id: data.user_id,
+          username: regUsername.trim(),
+          role: "operator",
+          full_name: regFullName.trim(),
+          email: regEmail,
+          trial_active: 0,
+          trial_status: "pending"
+        };
+        setToken(userToken);
+        setUser(userData);
+        localStorage.setItem("nexus_token", userToken);
+        localStorage.setItem("nexus_user", JSON.stringify(userData));
+        setAlertBanner({
+          type: "success",
+          message: `Welcome ${userData.full_name || userData.username}! Your operator account is created. Activate your 2-Day Free Trial to begin.`
+        });
+      } else {
+        setRegError(data.detail || "Registration failed. Username may already exist.");
+      }
+    } catch (err) {
+      setRegError("Network Error: Could not connect to authentication service.");
+    } finally {
+      setIsRegistering(false);
+    }
+  };
+
+  const handleActivateTrial = async () => {
+    setIsActivatingTrial(true);
+    try {
+      const resp = await fetch(`${API_BASE}/api/auth/activate-trial`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        }
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        const updatedUser = {
+          ...user,
+          trial_active: 1,
+          trial_status: "active",
+          trial_expires_at: data.trial_expires_at,
+          expiry_date: data.expiry_date
+        };
+        setUser(updatedUser);
+        localStorage.setItem("nexus_user", JSON.stringify(updatedUser));
+        setAlertBanner({
+          type: "success",
+          message: "🚀 2-Day Free Trial successfully activated! 48 hours of full platform access unlocked."
+        });
+      } else {
+        setAlertBanner({ type: "error", message: data.detail || "Failed to activate trial." });
+      }
+    } catch (err) {
+      setAlertBanner({ type: "error", message: "Network error activating trial." });
+    } finally {
+      setIsActivatingTrial(false);
+    }
+  };
+
+  const handleSubmitPlanRequest = async () => {
+    setIsSubmittingPlan(true);
+    try {
+      const planMap = {
+        "1_month": { name: "1 Month Standard", days: 30, price: 199.00 },
+        "2_months": { name: "2 Months Pro", days: 60, price: 379.00 },
+        "3_months": { name: "3 Months Enterprise (10% Discount)", days: 90, price: 537.00 }
+      };
+      const plan = planMap[selectedPaywallPlan] || planMap["3_months"];
+
+      const resp = await fetch(`${API_BASE}/api/billing/request-plan`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          plan_name: plan.name,
+          duration_days: plan.days,
+          price: plan.price,
+          notes: paywallNotes || "Subscription requested from post-trial paywall"
+        })
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setPaywallSubmitted(true);
+        setAlertBanner({
+          type: "success",
+          message: "✅ Plan request submitted! Super Admin has been notified for manual billing review and approval."
+        });
+      } else {
+        setAlertBanner({ type: "error", message: data.detail || "Could not submit plan request." });
+      }
+    } catch (err) {
+      setAlertBanner({ type: "error", message: "Network error submitting plan request." });
+    } finally {
+      setIsSubmittingPlan(false);
+    }
+  };
+
+  const handleSyncReplies = async () => {
+    setIsSyncingReplies(true);
+    setAlertBanner({
+      type: "info",
+      message: "🔄 Connecting to IMAP mailboxes on Port 993 (SSL/TLS)... Scanning recent replies..."
+    });
+    try {
+      const resp = await fetch(`${API_BASE}/api/outreach/sync-replies`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        }
+      });
+      const data = await resp.json();
+      if (resp.ok) {
+        fetchData();
+        setAlertBanner({
+          type: "success",
+          message: data.message || `IMAP Sync Complete: ${data.new_replies_count || 0} new replies detected!`
+        });
+      } else {
+        setAlertBanner({ type: "error", message: data.detail || "IMAP Sync failed." });
+      }
+    } catch (err) {
+      setAlertBanner({ type: "error", message: "Network error during IMAP sync." });
+    } finally {
+      setIsSyncingReplies(false);
+    }
+  };
+
+  const WEBHOOK_SCRIPT_TEMPLATE = `// =============================================================================
+// Nexus-Pulse Cloud Deliverability Webhook Dispatcher
+// Deploy this script as a Google Apps Script Web App to send outreach emails
+// with 100% cloud deliverability from Google's trusted infrastructure.
+// =============================================================================
+
+function doPost(e) {
+  try {
+    var data = JSON.parse(e.postData.contents);
+    var recipient = data.recipient;
+    var subject = data.subject;
+    var body = data.body;
+    var htmlBody = data.html_body || body.replace(/\\n/g, "<br>");
+    
+    MailApp.sendEmail({
+      to: recipient,
+      subject: subject,
+      body: body,
+      htmlBody: htmlBody
+    });
+    
+    return ContentService.createTextOutput(JSON.stringify({
+      status: "SUCCESS",
+      message: "Dispatched via Google Apps Script Webhook"
+    })).setMimeType(ContentService.MimeType.JSON);
+  } catch (error) {
+    return ContentService.createTextOutput(JSON.stringify({
+      status: "ERROR",
+      message: error.toString()
+    })).setMimeType(ContentService.MimeType.JSON);
+  }
+}`;
+
+  const handleCopyWebhookScript = () => {
+    if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(WEBHOOK_SCRIPT_TEMPLATE).then(() => {
+        setCopiedWebhookScript(true);
+        setTimeout(() => setCopiedWebhookScript(false), 2500);
+      }).catch(() => fallbackCopy());
+    } else {
+      fallbackCopy();
+    }
+  };
+
+  const fallbackCopy = () => {
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = WEBHOOK_SCRIPT_TEMPLATE;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand("copy");
+      document.body.removeChild(ta);
+      setCopiedWebhookScript(true);
+      setTimeout(() => setCopiedWebhookScript(false), 2500);
+    } catch (e) {
+      alert("Please copy the script directly from the text area.");
+    }
+  };
+
+  const handleApprovePlanRequest = async (requestId) => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/billing/plan-requests/${requestId}/approve`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        }
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setAlertBanner({ type: "success", message: data.message || "Plan request approved!" });
+        fetchData();
+      } else {
+        setAlertBanner({ type: "error", message: data.detail || "Approval failed." });
+      }
+    } catch (err) {
+      setAlertBanner({ type: "error", message: "Network error approving plan." });
+    }
+  };
+
+  const handleRejectPlanRequest = async (requestId) => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/billing/plan-requests/${requestId}/reject`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        }
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setAlertBanner({ type: "info", message: "Plan request marked as rejected." });
+        fetchData();
+      } else {
+        setAlertBanner({ type: "error", message: data.detail || "Rejection failed." });
+      }
+    } catch (err) {
+      setAlertBanner({ type: "error", message: "Network error rejecting plan." });
+    }
   };
 
   // ---------------------------------------------------------------------------
@@ -1868,7 +2203,7 @@ function NexusPulseApp() {
         <div className="np-card w-full max-w-md p-8 relative overflow-hidden shadow-lg border-theme">
           {isScanning && <div className="biometric-scanner-line" />}
 
-          <div className="text-center mb-8">
+          <div className="text-center mb-6">
             <div className="w-12 h-12 mx-auto mb-3 rounded-lg border-theme bg-elevated flex items-center justify-center font-bold text-base text-theme-accent font-mono">
               NP
             </div>
@@ -1876,13 +2211,45 @@ function NexusPulseApp() {
               Nexus-Pulse Level 2 Enterprise
             </h1>
             <p className="text-xs text-theme-secondary mt-1">
-              Autonomous B2B Lead Engine & Hardware-Bound Gateway
+              Autonomous B2B Lead Engine & Multi-Tenant Gateway
             </p>
           </div>
 
-          {loginError && (
+          {/* Auth Mode Toggle Tabs */}
+          <div className="flex border-b border-[var(--border-subtle)] mb-5">
+            <button
+              type="button"
+              onClick={() => { setAuthMode("login"); setLoginError(""); setRegError(""); }}
+              className={`flex-1 py-2 text-xs font-semibold text-center border-b-2 transition-colors ${
+                authMode === "login"
+                  ? "border-[var(--accent)] text-theme-primary font-bold"
+                  : "border-transparent text-theme-secondary hover:text-theme-primary"
+              }`}
+            >
+              Sign In
+            </button>
+            <button
+              type="button"
+              onClick={() => { setAuthMode("register"); setLoginError(""); setRegError(""); }}
+              className={`flex-1 py-2 text-xs font-semibold text-center border-b-2 transition-colors ${
+                authMode === "register"
+                  ? "border-[var(--accent)] text-theme-primary font-bold"
+                  : "border-transparent text-theme-secondary hover:text-theme-primary"
+              }`}
+            >
+              Register (2-Day Trial)
+            </button>
+          </div>
+
+          {authMode === "login" && loginError && (
             <div className="mb-5 np-alert np-alert-error">
               <span>{loginError}</span>
+            </div>
+          )}
+
+          {authMode === "register" && regError && (
+            <div className="mb-5 np-alert np-alert-error">
+              <span>{regError}</span>
             </div>
           )}
 
@@ -1898,7 +2265,7 @@ function NexusPulseApp() {
                 <div className="h-full bg-[var(--accent)] animate-pulse" style={{ width: "80%" }} />
               </div>
             </div>
-          ) : (
+          ) : authMode === "login" ? (
             <form onSubmit={handleBiometricLogin} className="space-y-4">
               <div>
                 <label className="np-label">Operator or Admin Username</label>
@@ -1947,6 +2314,98 @@ function NexusPulseApp() {
                 <span className="font-semibold text-xs text-theme-primary">Sign in with Google</span>
                 <span className="badge badge-accent text-[9px] px-1.5 py-0 ml-1">2-Day Free Trial</span>
               </button>
+
+              <div className="text-center pt-2">
+                <button
+                  type="button"
+                  onClick={() => { setAuthMode("register"); setLoginError(""); }}
+                  className="text-xs text-theme-accent hover:underline font-mono"
+                >
+                  Need an account? Register with 2-Day Free Trial ➔
+                </button>
+              </div>
+            </form>
+          ) : (
+            <form onSubmit={handleRegister} className="space-y-3">
+              <div>
+                <label className="np-label">Full Name</label>
+                <input
+                  type="text"
+                  value={regFullName}
+                  onChange={(e) => setRegFullName(e.target.value)}
+                  className="np-input"
+                  placeholder="e.g. Alexander Stone"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="np-label">Work Email</label>
+                <input
+                  type="email"
+                  value={regEmail}
+                  onChange={(e) => setRegEmail(e.target.value)}
+                  className="np-input font-mono"
+                  placeholder="stone@contractors.de"
+                  required
+                />
+              </div>
+
+              <div>
+                <label className="np-label">Desired Username</label>
+                <input
+                  type="text"
+                  value={regUsername}
+                  onChange={(e) => setRegUsername(e.target.value)}
+                  className="np-input font-mono"
+                  placeholder="astone"
+                  required
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="np-label">Passphrase</label>
+                  <input
+                    type="password"
+                    value={regPassword}
+                    onChange={(e) => setRegPassword(e.target.value)}
+                    className="np-input font-mono"
+                    placeholder="••••••••"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="np-label">Confirm</label>
+                  <input
+                    type="password"
+                    value={regConfirmPassword}
+                    onChange={(e) => setRegConfirmPassword(e.target.value)}
+                    className="np-input font-mono"
+                    placeholder="••••••••"
+                    required
+                  />
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={isRegistering}
+                className="btn btn-primary w-full justify-center btn-lg mt-3"
+              >
+                <span>{isRegistering ? "Creating Account..." : "Create Account & Start 2-Day Trial"}</span>
+                <span>➔</span>
+              </button>
+
+              <div className="text-center pt-2">
+                <button
+                  type="button"
+                  onClick={() => { setAuthMode("login"); setRegError(""); }}
+                  className="text-xs text-theme-accent hover:underline font-mono"
+                >
+                  Already have an account? Sign In ➔
+                </button>
+              </div>
             </form>
           )}
         </div>
@@ -1995,6 +2454,16 @@ function NexusPulseApp() {
               <span className="badge badge-accent">
                 Level 2
               </span>
+              {user && user.role === "operator" && user.trial_active === 1 && user.subscription_status !== "active" && (
+                <span className="badge badge-warning text-[10px] font-mono px-2 py-0.5 animate-pulse" title={`Trial expires: ${user.trial_expires_at}`}>
+                  ⏳ 2-Day Trial: {calculateTrialRemaining(user.trial_expires_at)}
+                </span>
+              )}
+              {user && user.role === "operator" && user.subscription_status === "active" && (
+                <span className="badge badge-success text-[10px] font-mono px-2 py-0.5">
+                  ✓ {user.subscription_plan || "Active Subscription"}
+                </span>
+              )}
             </div>
             <div className="flex items-center gap-2 text-[11px] text-theme-muted font-mono">
               <span>Status: <strong className={
@@ -2251,8 +2720,20 @@ function NexusPulseApp() {
                 </p>
               </div>
 
-              <div className="text-xs font-mono text-theme-secondary">
-                Entities Tracked: <strong className="text-theme-accent">{kanbanItems.length}</strong>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleSyncReplies}
+                  disabled={isSyncingReplies}
+                  className="btn btn-secondary btn-xs flex items-center gap-1.5 border border-[var(--border-subtle)] hover:border-[var(--accent)] font-mono text-xs"
+                  title="Connect via IMAP (Port 993 SSL) to scan recent inbox replies and advance leads"
+                >
+                  <span className={isSyncingReplies ? "animate-spin" : ""}>🔄</span>
+                  <span>{isSyncingReplies ? "Scanning Inboxes..." : "Sync Replies Now"}</span>
+                </button>
+                <div className="text-xs font-mono text-theme-secondary">
+                  Entities Tracked: <strong className="text-theme-accent">{kanbanItems.length}</strong>
+                </div>
               </div>
             </div>
 
@@ -2549,12 +3030,22 @@ function NexusPulseApp() {
                 </p>
               </div>
 
-              <button
-                onClick={() => setIsAddMailboxOpen(true)}
-                className="btn btn-primary btn-sm"
-              >
-                + Enroll Mailbox
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsSetupGuideOpen(true)}
+                  className="btn btn-secondary btn-sm flex items-center gap-1.5 border border-[var(--border-subtle)] hover:border-[var(--accent)] text-theme-accent"
+                  title="Non-technical walkthrough for Gmail App Password & Webhook Script"
+                >
+                  <span>📘 Setup Guide & Webhook Script</span>
+                </button>
+                <button
+                  onClick={() => setIsAddMailboxOpen(true)}
+                  className="btn btn-primary btn-sm"
+                >
+                  + Enroll Mailbox
+                </button>
+              </div>
             </div>
 
             {mailboxes.length === 0 ? (
@@ -3351,6 +3842,73 @@ function NexusPulseApp() {
                   Direct operator license extensions, custom base pricing, and automated 10% discount on 90-day plans.
                 </p>
               </div>
+            </div>
+
+            {/* PENDING OPERATOR PLAN REQUESTS (PAYWALL INTAKE) */}
+            <div className="np-card p-5 space-y-3 border-theme">
+              <div className="flex items-center justify-between pb-2 border-b-theme">
+                <div>
+                  <h3 className="font-semibold text-sm text-theme-primary flex items-center gap-2">
+                    <span>📥 Pending Operator Plan Requests</span>
+                    <span className="badge badge-accent font-mono text-xs">{planRequests.length} Pending</span>
+                  </h3>
+                  <p className="text-xs text-theme-secondary mt-0.5">
+                    Self-serve plan requests submitted by operators encountering the post-trial paywall.
+                  </p>
+                </div>
+              </div>
+
+              {planRequests.length === 0 ? (
+                <div className="text-center py-6 text-xs text-theme-muted font-mono italic">
+                  Zero pending operator plan requests. All operator accounts are currently up to date.
+                </div>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs font-mono">
+                    <thead>
+                      <tr className="border-b border-[var(--border-subtle)] text-theme-secondary">
+                        <th className="py-2 px-3">Operator</th>
+                        <th className="py-2 px-3">Email</th>
+                        <th className="py-2 px-3">Plan Requested</th>
+                        <th className="py-2 px-3">Duration</th>
+                        <th className="py-2 px-3">Price</th>
+                        <th className="py-2 px-3">Notes</th>
+                        <th className="py-2 px-3">Submitted</th>
+                        <th className="py-2 px-3 text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {planRequests.map((req) => (
+                        <tr key={req.id} className="border-b border-[var(--border-subtle)] hover:bg-elevated">
+                          <td className="py-2.5 px-3 font-semibold text-theme-primary">{req.full_name || req.username}</td>
+                          <td className="py-2.5 px-3 text-theme-accent">{req.email || "N/A"}</td>
+                          <td className="py-2.5 px-3 font-bold text-theme-primary">{req.plan_name}</td>
+                          <td className="py-2.5 px-3 text-theme-secondary">+{req.duration_days} Days</td>
+                          <td className="py-2.5 px-3 font-bold text-theme-success">${Number(req.price).toFixed(2)}</td>
+                          <td className="py-2.5 px-3 text-theme-muted max-w-xs truncate" title={req.notes}>{req.notes || "—"}</td>
+                          <td className="py-2.5 px-3 text-theme-muted">{req.created_at ? req.created_at.slice(0, 16) : "Just now"}</td>
+                          <td className="py-2.5 px-3 text-right space-x-1.5 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => handleApprovePlanRequest(req.id)}
+                              className="btn btn-primary btn-xs"
+                            >
+                              ✓ Approve & Activate
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handleRejectPlanRequest(req.id)}
+                              className="btn btn-ghost btn-xs text-theme-danger"
+                            >
+                              ✕ Reject
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
 
             <div className="grid grid-cols-1 lg:grid-cols-3 gap-5">
@@ -4252,6 +4810,18 @@ function NexusPulseApp() {
 
             <form onSubmit={handleAddMailbox}>
               <div className="np-modal-body space-y-3">
+                <div className="bg-elevated p-2.5 rounded border border-[var(--border-subtle)] flex items-center justify-between">
+                  <div className="text-xs text-theme-secondary">
+                    Need Gmail App Password or Webhook relay script?
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsSetupGuideOpen(true)}
+                    className="btn btn-secondary btn-xs text-theme-accent font-semibold"
+                  >
+                    📘 View Setup Guide
+                  </button>
+                </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="np-label">Sender Display Name</label>
@@ -4390,6 +4960,18 @@ function NexusPulseApp() {
 
             <form onSubmit={handleUpdateMailbox}>
               <div className="np-modal-body space-y-3">
+                <div className="bg-elevated p-2.5 rounded border border-[var(--border-subtle)] flex items-center justify-between">
+                  <div className="text-xs text-theme-secondary">
+                    Need Gmail App Password or Webhook relay script?
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setIsSetupGuideOpen(true)}
+                    className="btn btn-secondary btn-xs text-theme-accent font-semibold"
+                  >
+                    📘 View Setup Guide
+                  </button>
+                </div>
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="np-label">Display Name</label>
@@ -4817,6 +5399,330 @@ function NexusPulseApp() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+      {/* MODAL: SETUP GUIDE & WEBHOOK SCRIPT */}
+      {isSetupGuideOpen && (
+        <div className="np-modal-backdrop">
+          <div className="np-modal max-w-2xl">
+            <div className="np-modal-header">
+              <div>
+                <h3 className="font-bold text-sm text-theme-primary flex items-center gap-2">
+                  <span>📘 Mailbox Setup Guide & Webhook Dispatcher</span>
+                </h3>
+                <p className="text-xs text-theme-secondary mt-0.5">
+                  Complete non-technical setup instructions for Gmail SMTP and Google Apps Script Webhooks.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setIsSetupGuideOpen(false)}
+                className="text-theme-secondary hover:text-theme-primary font-bold text-lg"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="np-modal-body space-y-4">
+              {/* Tab Selector */}
+              <div className="flex border-b border-[var(--border-subtle)] gap-4">
+                <button
+                  type="button"
+                  onClick={() => setSetupGuideTab("gmail_smtp")}
+                  className={`pb-2 text-xs font-semibold border-b-2 transition-colors ${
+                    setupGuideTab === "gmail_smtp"
+                      ? "border-[var(--accent)] text-theme-primary font-bold"
+                      : "border-transparent text-theme-secondary hover:text-theme-primary"
+                  }`}
+                >
+                  1. Gmail App Password & SMTP
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSetupGuideTab("webhook_script")}
+                  className={`pb-2 text-xs font-semibold border-b-2 transition-colors ${
+                    setupGuideTab === "webhook_script"
+                      ? "border-[var(--accent)] text-theme-primary font-bold"
+                      : "border-transparent text-theme-secondary hover:text-theme-primary"
+                  }`}
+                >
+                  2. Google Apps Script Webhook Relay
+                </button>
+              </div>
+
+              {setupGuideTab === "gmail_smtp" ? (
+                <div className="space-y-3 text-xs leading-relaxed text-theme-secondary">
+                  <div className="bg-elevated p-3 rounded border border-[var(--border-subtle)]">
+                    <h4 className="font-semibold text-theme-primary mb-1">Why an App Password?</h4>
+                    <p>
+                      Google does not allow third-party SaaS apps to use your direct account password.
+                      A 16-character <strong>App Password</strong> grants secure, isolated SMTP/IMAP access.
+                    </p>
+                  </div>
+
+                  <ol className="list-decimal list-inside space-y-2 font-mono">
+                    <li>
+                      <strong className="text-theme-primary">Step 1:</strong> Go to your Google Account (<a href="https://myaccount.google.com/security" target="_blank" rel="noreferrer" className="text-theme-accent underline">myaccount.google.com/security</a>).
+                    </li>
+                    <li>
+                      <strong className="text-theme-primary">Step 2:</strong> Under <em>How you sign in to Google</em>, verify that <strong>2-Step Verification</strong> is turned ON.
+                    </li>
+                    <li>
+                      <strong className="text-theme-primary">Step 3:</strong> Search for <strong>App Passwords</strong> (or visit <a href="https://myaccount.google.com/apppasswords" target="_blank" rel="noreferrer" className="text-theme-accent underline">myaccount.google.com/apppasswords</a>).
+                    </li>
+                    <li>
+                      <strong className="text-theme-primary">Step 4:</strong> Enter an App Name (e.g. <span className="text-theme-accent">Nexus-Pulse</span>) and click <strong>Create</strong>.
+                    </li>
+                    <li>
+                      <strong className="text-theme-primary">Step 5:</strong> Copy the 16-character generated code (e.g. <span className="text-theme-accent">xxxx xxxx xxxx xxxx</span>).
+                    </li>
+                  </ol>
+
+                  <div className="bg-elevated p-3 rounded border border-[var(--border-subtle)] space-y-1 font-mono text-[11px]">
+                    <div className="font-bold text-theme-primary pb-1 border-b border-[var(--border-subtle)]">
+                      Standard Nexus-Pulse Settings for Gmail:
+                    </div>
+                    <div className="flex justify-between py-0.5">
+                      <span className="text-theme-muted">SMTP Server:</span>
+                      <span className="text-theme-primary font-bold">smtp.gmail.com</span>
+                    </div>
+                    <div className="flex justify-between py-0.5">
+                      <span className="text-theme-muted">SMTP Port:</span>
+                      <span className="text-theme-primary font-bold">587 (TLS)</span>
+                    </div>
+                    <div className="flex justify-between py-0.5">
+                      <span className="text-theme-muted">IMAP Server:</span>
+                      <span className="text-theme-primary font-bold">imap.gmail.com</span>
+                    </div>
+                    <div className="flex justify-between py-0.5">
+                      <span className="text-theme-muted">IMAP Port:</span>
+                      <span className="text-theme-primary font-bold">993 (SSL/TLS)</span>
+                    </div>
+                    <div className="flex justify-between py-0.5">
+                      <span className="text-theme-muted">Username:</span>
+                      <span className="text-theme-primary font-bold">Your full Gmail address</span>
+                    </div>
+                    <div className="flex justify-between py-0.5">
+                      <span className="text-theme-muted">Password:</span>
+                      <span className="text-theme-primary font-bold">16-character App Password</span>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-3 text-xs leading-relaxed text-theme-secondary">
+                  <div className="bg-elevated p-3 rounded border border-[var(--border-subtle)]">
+                    <h4 className="font-semibold text-theme-primary mb-1">100% Deliverability Webhook Relay</h4>
+                    <p>
+                      Deploy this 20-line Google Apps Script to relay emails directly through Google's native IP pool.
+                      Guarantees zero IP blocklisting or Railway datacenter reputation flags.
+                    </p>
+                  </div>
+
+                  <div className="relative">
+                    <div className="flex items-center justify-between bg-surface px-3 py-1.5 rounded-t border-t border-x border-[var(--border-subtle)] font-mono text-[11px]">
+                      <span>Code.gs (Google Apps Script)</span>
+                      <button
+                        type="button"
+                        onClick={handleCopyWebhookScript}
+                        className="btn btn-secondary btn-xs text-theme-accent font-semibold"
+                      >
+                        {copiedWebhookScript ? "✓ Copied!" : "📋 Copy Script"}
+                      </button>
+                    </div>
+                    <pre className="bg-[#0d1117] text-[#c9d1d9] p-3 rounded-b border border-[var(--border-subtle)] font-mono text-[11px] overflow-x-auto max-h-48 scrollbar-thin">
+                      {WEBHOOK_SCRIPT_TEMPLATE}
+                    </pre>
+                  </div>
+
+                  <ol className="list-decimal list-inside space-y-1.5 font-mono text-[11px]">
+                    <li>Open <a href="https://script.google.com" target="_blank" rel="noreferrer" className="text-theme-accent underline">script.google.com</a> and click <strong>New Project</strong>.</li>
+                    <li>Replace all code in <strong>Code.gs</strong> with the snippet above and click <strong>Save (Ctrl+S)</strong>.</li>
+                    <li>Click <strong>Deploy ➔ New deployment</strong>. Click the gear icon and select <strong>Web app</strong>.</li>
+                    <li>Set <strong>Execute as:</strong> <em>Me</em> and <strong>Who has access:</strong> <em>Anyone</em>.</li>
+                    <li>Click <strong>Deploy</strong>, authorize permissions, and copy the <strong>Web App URL</strong> into the Nexus-Pulse mailbox form.</li>
+                  </ol>
+                </div>
+              )}
+            </div>
+
+            <div className="np-modal-footer">
+              <button
+                type="button"
+                onClick={() => setIsSetupGuideOpen(false)}
+                className="btn btn-primary btn-sm"
+              >
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: 2-DAY FREE TRIAL ACTIVATION (POP-UP ON FIRST LOGIN FOR OPERATORS) */}
+      {user && user.role === "operator" && (!user.trial_active || user.trial_status === "pending") && user.trial_status !== "expired" && user.subscription_status !== "active" && (
+        <div className="np-modal-backdrop">
+          <div className="np-modal max-w-md text-center p-6 space-y-4">
+            <div className="w-16 h-16 mx-auto rounded-full bg-[var(--accent-muted)] border-2 border-[var(--accent)] flex items-center justify-center text-3xl">
+              🚀
+            </div>
+
+            <div>
+              <h3 className="font-bold text-lg text-theme-primary">
+                Activate Your 2-Day Free Trial
+              </h3>
+              <p className="text-xs text-theme-secondary mt-1">
+                Welcome to Nexus-Pulse! Your account has 48 hours of unrestricted access to the automated commercial contractor lead pipeline.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 gap-2.5 text-left text-xs font-mono bg-elevated p-3.5 rounded border border-[var(--border-subtle)]">
+              <div className="flex items-center gap-2">
+                <span className="text-theme-success font-bold">✓</span>
+                <span className="text-theme-primary">Multi-Source B2B Lead Scraping</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-theme-success font-bold">✓</span>
+                <span className="text-theme-primary">3-Stage Zero-Bounce Email Hygiene</span>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="text-theme-success font-bold">✓</span>
+                <span className="text-theme-primary">Inbox Rotator & Automated IMAP Reply Listener</span>
+              </div>
+            </div>
+
+            <button
+              type="button"
+              onClick={handleActivateTrial}
+              disabled={isActivatingTrial}
+              className="btn btn-primary w-full justify-center btn-lg"
+            >
+              <span>{isActivatingTrial ? "Activating 48-Hour Trial..." : "🚀 Activate 2-Day Free Trial Now"}</span>
+            </button>
+
+            <div className="pt-1">
+              <button
+                type="button"
+                onClick={handleLogout}
+                className="text-xs text-theme-muted hover:text-theme-secondary font-mono underline"
+              >
+                Sign Out
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: POST-TRIAL SUBSCRIPTION PAYWALL (NON-DISMISSIBLE FOR EXPIRED OPERATORS) */}
+      {user && user.role === "operator" && user.subscription_status !== "active" && (user.is_expired || user.trial_status === "expired" || isTrialExpired(user.trial_expires_at)) && (
+        <div className="np-modal-backdrop">
+          <div className="np-modal max-w-xl p-6 space-y-4">
+            <div className="text-center">
+              <div className="w-14 h-14 mx-auto mb-2 rounded-full bg-[var(--danger-muted)] border-2 border-[var(--danger)] flex items-center justify-center text-2xl">
+                ⏱️
+              </div>
+              <h3 className="font-bold text-lg text-theme-primary">
+                Your 2-Day Free Trial Has Ended
+              </h3>
+              <p className="text-xs text-theme-secondary mt-1 max-w-md mx-auto">
+                Choose a subscription tier to continue prospecting and dispatching verified B2B leads.
+              </p>
+            </div>
+
+            {paywallSubmitted ? (
+              <div className="bg-elevated p-6 rounded text-center space-y-3 border border-[var(--border-subtle)]">
+                <span className="text-3xl block">✅</span>
+                <h4 className="font-bold text-sm text-theme-primary">Subscription Plan Request Submitted!</h4>
+                <p className="text-xs text-theme-secondary max-w-sm mx-auto">
+                  Your request has been logged into the Super Admin Manual Billing portal.
+                  Activation is typically completed promptly. You can also reach our team at <strong className="text-theme-accent">h.huddair@nexus-pulse.io</strong>.
+                </p>
+                <button
+                  type="button"
+                  onClick={handleLogout}
+                  className="btn btn-secondary btn-sm mt-2"
+                >
+                  Sign Out
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  {/* Plan 1 */}
+                  <div
+                    onClick={() => setSelectedPaywallPlan("1_month")}
+                    className={`cursor-pointer p-3.5 rounded border transition-all ${
+                      selectedPaywallPlan === "1_month"
+                        ? "border-[var(--accent)] bg-elevated ring-1 ring-[var(--accent)]"
+                        : "border-[var(--border-subtle)] hover:border-theme"
+                    }`}
+                  >
+                    <div className="text-xs font-bold text-theme-primary">1 Month Standard</div>
+                    <div className="text-lg font-bold text-theme-primary my-1">$199<span className="text-xs font-normal text-theme-muted">/mo</span></div>
+                    <div className="text-[10px] text-theme-secondary font-mono">100 scrapes/day<br/>25 sends/day</div>
+                  </div>
+
+                  {/* Plan 2 */}
+                  <div
+                    onClick={() => setSelectedPaywallPlan("2_months")}
+                    className={`cursor-pointer p-3.5 rounded border transition-all ${
+                      selectedPaywallPlan === "2_months"
+                        ? "border-[var(--accent)] bg-elevated ring-1 ring-[var(--accent)]"
+                        : "border-[var(--border-subtle)] hover:border-theme"
+                    }`}
+                  >
+                    <div className="text-xs font-bold text-theme-primary">2 Months Pro</div>
+                    <div className="text-lg font-bold text-theme-primary my-1">$379<span className="text-xs font-normal text-theme-muted"> total</span></div>
+                    <div className="text-[10px] text-theme-secondary font-mono">150 scrapes/day<br/>40 sends/day</div>
+                  </div>
+
+                  {/* Plan 3 */}
+                  <div
+                    onClick={() => setSelectedPaywallPlan("3_months")}
+                    className={`cursor-pointer p-3.5 rounded border relative transition-all ${
+                      selectedPaywallPlan === "3_months"
+                        ? "border-[var(--accent)] bg-elevated ring-1 ring-[var(--accent)]"
+                        : "border-[var(--border-subtle)] hover:border-theme"
+                    }`}
+                  >
+                    <span className="absolute -top-2 right-2 badge badge-success text-[9px] px-1 py-0">10% OFF</span>
+                    <div className="text-xs font-bold text-theme-primary">3 Months Enterprise</div>
+                    <div className="text-lg font-bold text-theme-success my-1">$537<span className="text-xs font-normal text-theme-muted"> total</span></div>
+                    <div className="text-[10px] text-theme-secondary font-mono">200 scrapes/day<br/>50 sends/day<br/>Priority dispatch</div>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="np-label">Payment Reference / Notes (Optional)</label>
+                  <input
+                    type="text"
+                    value={paywallNotes}
+                    onChange={(e) => setPaywallNotes(e.target.value)}
+                    placeholder="e.g. PO Number or Wire Transfer Reference"
+                    className="np-input font-mono text-xs"
+                  />
+                </div>
+
+                <div className="flex items-center justify-between pt-2">
+                  <button
+                    type="button"
+                    onClick={handleLogout}
+                    className="btn btn-ghost btn-sm text-theme-muted hover:text-theme-secondary font-mono text-xs"
+                  >
+                    Sign Out
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={handleSubmitPlanRequest}
+                    disabled={isSubmittingPlan}
+                    className="btn btn-primary btn-sm"
+                  >
+                    <span>{isSubmittingPlan ? "Submitting..." : "Submit Plan Request & Request Activation"}</span>
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

@@ -146,7 +146,10 @@ class UserManager:
             username=username,
             password=password,
             full_name=full_name,
-            email=email or f"{username.strip().lower()}@nexus-pulse.io"
+            email=email or f"{username.strip().lower()}@nexus-pulse.io",
+            trial_active=0,
+            trial_status="pending",
+            subscription_status="none"
         )
 
     def purge_all_data(self) -> Dict[str, int]:
@@ -170,7 +173,8 @@ class UserManager:
                 "service_templates",
                 "suppressed_entities",
                 "blacklist_rules",
-                "operator_billing"
+                "operator_billing",
+                "subscription_requests"
             ]
             for tbl in tables_to_purge:
                 try:
@@ -273,7 +277,11 @@ class UserManager:
             new_expiry_dt = start_date + timedelta(days=duration_days)
             new_expiry_str = new_expiry_dt.strftime("%Y-%m-%d %H:%M:%S")
 
-            conn.execute("UPDATE users SET expiry_date = ?, is_active = 1 WHERE id = ?", (new_expiry_str, clean_op_id))
+            conn.execute("""
+                UPDATE users
+                SET expiry_date = ?, is_active = 1, subscription_status = 'active', subscription_expires_at = ?
+                WHERE id = ?
+            """, (new_expiry_str, new_expiry_str, clean_op_id))
 
             billing_id = str(uuid.uuid4())
             conn.execute("""
@@ -389,7 +397,15 @@ class UserManager:
             row = conn.execute("""
                 SELECT id, username, password_hash, role, full_name, email,
                        is_active, device_lock_id, device_lock_enabled, expiry_date,
-                       daily_scrape_quota, daily_send_quota, license_key
+                       daily_scrape_quota, daily_send_quota, license_key,
+                       COALESCE(trial_status, 'active') as trial_status,
+                       trial_started_at,
+                       COALESCE(trial_active, 0) as trial_active,
+                       trial_expires_at,
+                       COALESCE(subscription_status, 'none') as subscription_status,
+                       COALESCE(subscription_plan, '') as subscription_plan,
+                       subscription_expires_at,
+                       COALESCE(auth_provider, 'local') as auth_provider
                 FROM users WHERE lower(username) = ?
             """, (clean_user,)).fetchone()
 
@@ -404,14 +420,53 @@ class UserManager:
             if row["is_active"] != 1:
                 raise PermissionError("ACCOUNT_REVOKED: Your account access has been revoked by H.Huddair.")
 
-            # 3. Check Account Expiry
-            if row["expiry_date"]:
-                try:
-                    exp_dt = datetime.fromisoformat(row["expiry_date"].replace(" ", "T"))
-                    if datetime.now(timezone.utc).replace(tzinfo=None) > exp_dt:
-                        raise PermissionError(f"ACCOUNT_EXPIRED: Subscription expired on {row['expiry_date']}. Contact H.Huddair.")
-                except ValueError:
-                    pass
+            # 3. Check Account Expiry & Paywall Status
+            is_expired = False
+            now_utc = datetime.now(timezone.utc)
+            trial_status = row["trial_status"]
+
+            # Admin accounts are 100% exempt from expiry and trial restrictions
+            if row["role"] != "admin":
+                # Check subscription expiry if active subscription
+                if row["subscription_status"] == "active" and row["subscription_expires_at"]:
+                    try:
+                        sub_exp_dt = datetime.fromisoformat(row["subscription_expires_at"].replace(" ", "T"))
+                        if now_utc.replace(tzinfo=None) > sub_exp_dt:
+                            is_expired = True
+                    except ValueError:
+                        pass
+
+                # Check trial expiry if trial is active
+                if row["trial_active"] == 1 and row["trial_expires_at"]:
+                    try:
+                        trial_exp_dt = datetime.fromisoformat(row["trial_expires_at"].replace(" ", "T"))
+                        if now_utc.replace(tzinfo=None) > trial_exp_dt:
+                            trial_status = "expired"
+                            if row["subscription_status"] != "active":
+                                is_expired = True
+                    except ValueError:
+                        pass
+
+                # Also check general expiry_date if set
+                if row["expiry_date"]:
+                    try:
+                        exp_dt = datetime.fromisoformat(row["expiry_date"].replace(" ", "T"))
+                        if now_utc.replace(tzinfo=None) > exp_dt:
+                            if row["subscription_status"] != "active":
+                                is_expired = True
+                                trial_status = "expired"
+                    except ValueError:
+                        pass
+
+                # If trial expired in DB, update trial_status
+                if is_expired and row["trial_status"] != "expired":
+                    try:
+                        conn.execute("UPDATE users SET trial_status = 'expired' WHERE id = ?", (row["id"],))
+                        conn.commit()
+                    except Exception:
+                        pass
+                # NOTE: For operators, do NOT raise PermissionError on expiry so they can log in
+                # and view the subscription paywall modal to select a plan.
 
             # 4. Enforce Device Lock (Cloud-Safe)
             import os
@@ -458,7 +513,15 @@ class UserManager:
                     "device_lock_id": row["device_lock_id"] or host_device,
                     "daily_scrape_quota": row["daily_scrape_quota"],
                     "daily_send_quota": row["daily_send_quota"],
-                    "expiry_date": row["expiry_date"]
+                    "expiry_date": row["expiry_date"],
+                    "trial_active": row["trial_active"],
+                    "trial_status": trial_status,
+                    "trial_expires_at": row["trial_expires_at"],
+                    "subscription_status": row["subscription_status"],
+                    "subscription_plan": row["subscription_plan"],
+                    "subscription_expires_at": row["subscription_expires_at"],
+                    "is_expired": is_expired,
+                    "auth_provider": row["auth_provider"]
                 }
             }
 
@@ -685,10 +748,39 @@ class UserManager:
                        created_at, last_login, last_login_device,
                        COALESCE(trial_status, 'active') as trial_status,
                        trial_started_at,
+                       COALESCE(trial_active, 0) as trial_active,
+                       trial_expires_at,
+                       COALESCE(subscription_status, 'none') as subscription_status,
+                       COALESCE(subscription_plan, '') as subscription_plan,
+                       subscription_expires_at,
                        COALESCE(auth_provider, 'local') as auth_provider
                 FROM users WHERE id = ?
             """, (user_id,)).fetchone()
-            return dict(row) if row else None
+            if not row:
+                return None
+            res = dict(row)
+            is_expired = False
+            now_utc = datetime.now(timezone.utc)
+            if res["role"] != "admin":
+                if res["subscription_status"] != "active":
+                    if res["trial_active"] == 1 and res["trial_expires_at"]:
+                        try:
+                            trial_exp = datetime.fromisoformat(res["trial_expires_at"].replace(" ", "T"))
+                            if now_utc.replace(tzinfo=None) > trial_exp:
+                                is_expired = True
+                                res["trial_status"] = "expired"
+                        except ValueError:
+                            pass
+                    elif res["expiry_date"]:
+                        try:
+                            exp_dt = datetime.fromisoformat(res["expiry_date"].replace(" ", "T"))
+                            if now_utc.replace(tzinfo=None) > exp_dt:
+                                is_expired = True
+                                res["trial_status"] = "expired"
+                        except ValueError:
+                            pass
+            res["is_expired"] = is_expired
+            return res
 
     def update_admin_profile(
         self,
@@ -793,7 +885,10 @@ class UserManager:
         device_lock_enabled: bool = True,
         expiry_days: int = 90,
         daily_scrape_quota: int = 200,
-        daily_send_quota: int = 50
+        daily_send_quota: int = 50,
+        trial_active: int = 0,
+        trial_status: str = "pending",
+        subscription_status: str = "none"
     ) -> Dict[str, Any]:
         """
         Creates new Operator account with custom device locking, quotas,
@@ -824,12 +919,14 @@ class UserManager:
                 INSERT INTO users (
                     id, username, password_hash, role, full_name, email,
                     is_active, device_lock_id, device_lock_enabled, expiry_date,
-                    daily_scrape_quota, daily_send_quota, license_key
-                ) VALUES (?, ?, ?, 'operator', ?, ?, 1, ?, ?, ?, ?, ?, ?)
+                    daily_scrape_quota, daily_send_quota, license_key,
+                    trial_active, trial_status, subscription_status
+                ) VALUES (?, ?, ?, 'operator', ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 user_id, clean_user, pass_hash, full_name.strip(), email.strip().lower(),
                 target_device, 1 if device_lock_enabled else 0, exp_date,
-                daily_scrape_quota, daily_send_quota, license_token
+                daily_scrape_quota, daily_send_quota, license_token,
+                trial_active, trial_status, subscription_status
             ))
             conn.commit()
 
@@ -840,7 +937,10 @@ class UserManager:
             "role": "operator",
             "device_lock_id": target_device,
             "expiry_date": exp_date,
-            "license_key": license_token
+            "license_key": license_token,
+            "trial_active": trial_active,
+            "trial_status": trial_status,
+            "subscription_status": subscription_status
         }
 
     def toggle_user_active_status(self, user_id: str) -> Dict[str, Any]:
@@ -1000,6 +1100,195 @@ class UserManager:
                 "daily_send_quota": daily_send_quota or row["daily_send_quota"],
                 "message": "License & Quotas successfully updated."
             }
+
+    # -------------------------------------------------------------
+    # REQUIREMENT 4: 2-Day Free Trial & Subscription Paywall
+    # -------------------------------------------------------------
+    def activate_user_trial(self, user_id: str) -> Dict[str, Any]:
+        """
+        Activates the 2-Day Free Trial for an operator.
+        Sets trial_active = 1, trial_status = 'active', trial_started_at = now,
+        trial_expires_at = now + 48 hours, and updates expiry_date = now + 48 hours.
+        """
+        now_utc = datetime.now(timezone.utc)
+        trial_expiry_dt = now_utc + timedelta(days=2)
+        exp_date_str = trial_expiry_dt.strftime("%Y-%m-%d %H:%M:%S")
+        started_str = now_utc.strftime("%Y-%m-%d %H:%M:%S")
+
+        with self.db.get_connection() as conn:
+            user = conn.execute("SELECT id, username, role, trial_active FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not user:
+                raise ValueError("User not found.")
+            if user["role"] == "admin":
+                return {
+                    "success": True,
+                    "message": "Admin account is permanent and exempt from trial restrictions.",
+                    "trial_active": 1,
+                    "trial_status": "permanent",
+                    "trial_expires_at": "2099-12-31 23:59:59"
+                }
+
+            conn.execute("""
+                UPDATE users
+                SET trial_active = 1,
+                    trial_status = 'active',
+                    trial_started_at = ?,
+                    trial_expires_at = ?,
+                    expiry_date = ?
+                WHERE id = ?
+            """, (started_str, exp_date_str, exp_date_str, user_id))
+            conn.commit()
+
+            try:
+                conn.execute("""
+                    INSERT INTO operator_sessions (user_id, username, action, detail)
+                    VALUES (?, ?, 'TRIAL_ACTIVATED', 'Activated 2-Day Free Trial')
+                """, (user_id, user["username"]))
+                conn.commit()
+            except Exception:
+                pass
+
+        return {
+            "success": True,
+            "user_id": user_id,
+            "trial_active": 1,
+            "trial_status": "active",
+            "trial_started_at": started_str,
+            "trial_expires_at": exp_date_str,
+            "expiry_date": exp_date_str,
+            "message": "2-Day Free Trial successfully activated!"
+        }
+
+    def submit_plan_request(
+        self,
+        user_id: str,
+        plan_name: str,
+        duration_days: int,
+        price: float,
+        payment_method: str = "MANUAL_INVOICE",
+        notes: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Submits a subscription plan request when an operator hits paywall."""
+        with self.db.get_connection() as conn:
+            user = conn.execute("SELECT id, username, role FROM users WHERE id = ?", (user_id,)).fetchone()
+            if not user:
+                raise ValueError("User not found.")
+
+            req_id = str(uuid.uuid4())
+            conn.execute("""
+                INSERT INTO subscription_requests (
+                    id, user_id, plan_name, duration_days, price, payment_method, notes, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING')
+            """, (
+                req_id, user_id, plan_name, int(duration_days), float(price), payment_method, notes or ""
+            ))
+            conn.commit()
+
+            try:
+                conn.execute("""
+                    INSERT INTO operator_sessions (user_id, username, action, detail)
+                    VALUES (?, ?, 'PLAN_REQUESTED', ?)
+                """, (user_id, user["username"], f"Requested {plan_name} ({duration_days}d @ ${price})"))
+                conn.commit()
+            except Exception:
+                pass
+
+        return {
+            "success": True,
+            "request_id": req_id,
+            "plan_name": plan_name,
+            "duration_days": duration_days,
+            "price": price,
+            "status": "PENDING",
+            "message": "Subscription plan request submitted. Super Admin will review and activate your account shortly."
+        }
+
+    def get_pending_plan_requests(self) -> List[Dict[str, Any]]:
+        """Returns all pending subscription requests for admin manual billing."""
+        with self.db.get_connection() as conn:
+            rows = conn.execute("""
+                SELECT sr.*, u.username, u.full_name, u.email
+                FROM subscription_requests sr
+                LEFT JOIN users u ON sr.user_id = u.id
+                WHERE sr.status = 'PENDING'
+                ORDER BY sr.created_at DESC
+            """).fetchall()
+            return [dict(r) for r in rows]
+
+    def approve_plan_request(self, request_id: str, approved_by: str = "admin") -> Dict[str, Any]:
+        """Super Admin approves plan request and extends operator account."""
+        with self.db.get_connection() as conn:
+            req = conn.execute("SELECT * FROM subscription_requests WHERE id = ?", (request_id,)).fetchone()
+            if not req:
+                raise ValueError("Subscription request not found.")
+            if req["status"] != "PENDING":
+                raise ValueError(f"Subscription request is already {req['status']}.")
+
+            user_id = req["user_id"]
+            duration_days = req["duration_days"]
+            price = req["price"]
+            plan_name = req["plan_name"]
+
+            # Extend operator license using billing method
+            billing_res = self.apply_operator_billing(
+                operator_id=user_id,
+                base_price=price,
+                duration_days=duration_days,
+                notes=f"Approved plan request: {plan_name}",
+                created_by=approved_by
+            )
+            new_exp = billing_res.get("new_expiry_date")
+
+            # Update subscription request
+            conn.execute("""
+                UPDATE subscription_requests
+                SET status = 'APPROVED', resolved_at = CURRENT_TIMESTAMP, resolved_by = ?
+                WHERE id = ?
+            """, (approved_by, request_id))
+
+            # Update user subscription status
+            conn.execute("""
+                UPDATE users
+                SET subscription_status = 'active',
+                    subscription_plan = ?,
+                    subscription_expires_at = ?,
+                    is_active = 1
+                WHERE id = ?
+            """, (plan_name, new_exp, user_id))
+            conn.commit()
+
+        return {
+            "success": True,
+            "request_id": request_id,
+            "user_id": user_id,
+            "plan_name": plan_name,
+            "status": "APPROVED",
+            "new_expiry_date": new_exp,
+            "message": f"Plan '{plan_name}' approved. Operator subscription active until {new_exp}."
+        }
+
+    def reject_plan_request(self, request_id: str, rejected_by: str = "admin") -> Dict[str, Any]:
+        """Super Admin rejects a subscription request."""
+        with self.db.get_connection() as conn:
+            req = conn.execute("SELECT * FROM subscription_requests WHERE id = ?", (request_id,)).fetchone()
+            if not req:
+                raise ValueError("Subscription request not found.")
+            if req["status"] != "PENDING":
+                raise ValueError(f"Subscription request is already {req['status']}.")
+
+            conn.execute("""
+                UPDATE subscription_requests
+                SET status = 'REJECTED', resolved_at = CURRENT_TIMESTAMP, resolved_by = ?
+                WHERE id = ?
+            """, (rejected_by, request_id))
+            conn.commit()
+
+        return {
+            "success": True,
+            "request_id": request_id,
+            "status": "REJECTED",
+            "message": "Subscription request rejected."
+        }
 
 
 _global_user_manager = None

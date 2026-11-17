@@ -110,6 +110,15 @@ class RegisterRequest(BaseModel):
     password: str
     full_name: str
     role: Optional[str] = "operator"
+    email: Optional[str] = None
+
+
+class PlanRequestPayload(BaseModel):
+    plan_name: str
+    duration_days: int
+    price: float
+    payment_method: Optional[str] = "MANUAL_INVOICE"
+    notes: Optional[str] = None
 
 
 class GoogleAuthRequest(BaseModel):
@@ -460,6 +469,53 @@ def get_all_billing_history(admin_user: Dict[str, Any] = Depends(require_admin))
     return um.get_operator_billing_history(operator_id=None)
 
 
+@router.post("/billing/request-plan")
+def request_subscription_plan(req: PlanRequestPayload, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Allows an operator hitting the paywall to submit a plan request
+    (1 Month, 2 Months, 3 Months). Logs request into Admin Manual Billing.
+    """
+    um = get_user_manager()
+    try:
+        return um.submit_plan_request(
+            user_id=current_user["id"],
+            plan_name=req.plan_name,
+            duration_days=req.duration_days,
+            price=req.price,
+            payment_method=req.payment_method or "MANUAL_INVOICE",
+            notes=req.notes
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/billing/plan-requests")
+def get_pending_plan_requests(admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Super Admin fetches all pending plan requests submitted by operators."""
+    um = get_user_manager()
+    return um.get_pending_plan_requests()
+
+
+@router.post("/billing/plan-requests/{request_id}/approve")
+def approve_plan_request(request_id: str, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Super Admin approves a pending plan request and activates operator access."""
+    um = get_user_manager()
+    try:
+        return um.approve_plan_request(request_id=request_id, approved_by=admin_user.get("username", "admin"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/billing/plan-requests/{request_id}/reject")
+def reject_plan_request(request_id: str, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Super Admin rejects a pending plan request."""
+    um = get_user_manager()
+    try:
+        return um.reject_plan_request(request_id=request_id, rejected_by=admin_user.get("username", "admin"))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 # -------------------------------------------------------------
 # 3. SUPER ADMIN: TELEMETRY & CLEAN DATABASE RESET
 # -------------------------------------------------------------
@@ -640,7 +696,8 @@ def register_new_account(req: RegisterRequest):
             username=req.username,
             password=req.password,
             full_name=req.full_name,
-            role=req.role or "operator"
+            role=req.role or "operator",
+            email=req.email
         )
         # If token was not issued directly (e.g. operator created), auto-authenticate to return token
         if "token" not in reg_res:
@@ -651,6 +708,19 @@ def register_new_account(req: RegisterRequest):
                 reg_res["user"] = auth_res["user"]
         return reg_res
     except (ValueError, PermissionError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/auth/activate-trial")
+def activate_free_trial(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Activates the 2-Day Free Trial for the authenticated operator.
+    Sets trial_active = 1, sets expiration to 48 hours from activation.
+    """
+    um = get_user_manager()
+    try:
+        return um.activate_user_trial(current_user["id"])
+    except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -716,6 +786,10 @@ def get_google_oauth_url(redirect_uri: Optional[str] = None):
 @router.get("/auth/me")
 def get_current_user_profile(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Returns profile for currently authenticated session."""
+    um = get_user_manager()
+    profile = um.get_user_profile(current_user["id"])
+    if profile:
+        return profile
     return current_user
 
 
@@ -772,7 +846,7 @@ def get_kanban_leads(
                 SELECT id, lead_id, channel, recipient, company_name, subject,
                        message_body, status, target_country, scheduled_for,
                        approved_by, sent_at, mailbox_used, operator_id,
-                       opened_at, bounced_at, bounce_reason, created_at
+                       opened_at, bounced_at, bounce_reason, replied_at, reply_snippet, created_at
                 FROM outreach_queue
                 WHERE operator_id = ? OR operator_id IS NULL
                 ORDER BY created_at DESC
@@ -782,7 +856,7 @@ def get_kanban_leads(
                 SELECT id, lead_id, channel, recipient, company_name, subject,
                        message_body, status, target_country, scheduled_for,
                        approved_by, sent_at, mailbox_used, operator_id,
-                       opened_at, bounced_at, bounce_reason, created_at
+                       opened_at, bounced_at, bounce_reason, replied_at, reply_snippet, created_at
                 FROM outreach_queue
                 ORDER BY created_at DESC
             """).fetchall()
@@ -1296,6 +1370,26 @@ def simulate_inbound_reply(req: SimulateReplyRequest, current_user: Dict[str, An
     )
 
 
+@router.post("/outreach/sync-replies")
+def sync_inbound_replies(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Manual trigger to scan recent messages across inboxes via IMAP (Port 993, SSL/TLS).
+    Matches incoming From addresses against leads currently in 'Dispatched' (SENT) status,
+    transitions matched leads to 'REPLIED', and returns count of newly detected replies.
+    """
+    listener = get_reply_listener()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    res = listener.poll_enrolled_inboxes(operator_id=target_op)
+    new_count = res.get("new_replies_count", 0)
+    return {
+        "success": True,
+        "new_replies_count": new_count,
+        "processed_count": res.get("processed_count", 0),
+        "errors": res.get("errors", []),
+        "message": f"Sync complete: {new_count} new replies detected."
+    }
+
+
 @router.post("/inbox/poll")
 def poll_imap_inboxes(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
@@ -1303,7 +1397,8 @@ def poll_imap_inboxes(current_user: Dict[str, Any] = Depends(get_current_user)):
     Monitors enrolled IMAP inboxes for bounces and responses.
     """
     listener = get_reply_listener()
-    return listener.poll_enrolled_inboxes()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    return listener.poll_enrolled_inboxes(operator_id=target_op)
 
 
 # -------------------------------------------------------------

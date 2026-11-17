@@ -300,6 +300,12 @@ class IMAPReplyListener:
                 matching_qid = None
 
             ai_reply = ReplyClassifier.draft_1click_response(clean_sender, comp, body) if is_hot else ""
+            snippet = (body or "").strip()[:280]
+
+            # Determine if this is a newly detected reply on a currently dispatched lead
+            is_new_reply = False
+            if matching_q and matching_q["status"] in ("SENT", "DISPATCHED"):
+                is_new_reply = True
 
             # Case 1: BOUNCE
             if classification == "BOUNCE":
@@ -373,43 +379,59 @@ class IMAPReplyListener:
                 if matching_qid:
                     conn.execute("""
                         UPDATE outreach_queue
-                        SET status = 'HOT_LEAD'
+                        SET status = 'HOT_LEAD',
+                            replied_at = CURRENT_TIMESTAMP,
+                            reply_snippet = ?
                         WHERE id = ?
-                    """, (matching_qid,))
+                    """, (snippet, matching_qid))
 
                 conn.execute("""
                     UPDATE outreach_queue
-                    SET status = 'HOT_LEAD'
+                    SET status = 'HOT_LEAD',
+                        replied_at = CURRENT_TIMESTAMP,
+                        reply_snippet = ?
                     WHERE lower(recipient) = ?
-                """, (clean_sender,))
+                """, (snippet, clean_sender))
 
             # Case 4: NEUTRAL / STANDARD REPLY
             else:
                 if matching_qid:
                     conn.execute("""
                         UPDATE outreach_queue
-                        SET status = 'REPLIED'
+                        SET status = 'REPLIED',
+                            replied_at = CURRENT_TIMESTAMP,
+                            reply_snippet = ?
                         WHERE id = ?
-                    """, (matching_qid,))
+                    """, (snippet, matching_qid))
 
                 conn.execute("""
                     UPDATE outreach_queue
-                    SET status = 'REPLIED'
-                    WHERE lower(recipient) = ? AND status IN ('SENT', 'APPROVED', 'SCHEDULED')
-                """, (clean_sender,))
+                    SET status = 'REPLIED',
+                        replied_at = CURRENT_TIMESTAMP,
+                        reply_snippet = ?
+                    WHERE lower(recipient) = ? AND status IN ('SENT', 'DISPATCHED', 'APPROVED', 'SCHEDULED')
+                """, (snippet, clean_sender))
 
-            # Log into inbox_replies
-            conn.execute("""
-                INSERT INTO inbox_replies (
-                    id, lead_id, sender_email, company_name, subject,
-                    message_body, classification, is_hot_lead, ai_suggested_reply,
+            # Log into inbox_replies (avoid duplicates if same email re-scanned within 48h)
+            existing_rep = conn.execute("""
+                SELECT id FROM inbox_replies
+                WHERE lower(sender_email) = ? AND subject = ?
+                  AND received_at >= datetime('now', '-2 days')
+                LIMIT 1
+            """, (clean_sender, subject)).fetchone()
+
+            if not existing_rep:
+                conn.execute("""
+                    INSERT INTO inbox_replies (
+                        id, lead_id, sender_email, company_name, subject,
+                        message_body, classification, is_hot_lead, ai_suggested_reply,
+                        operator_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    reply_id, lead_id, clean_sender, comp, subject,
+                    body, classification, 1 if is_hot else 0, ai_reply,
                     operator_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                reply_id, lead_id, clean_sender, comp, subject,
-                body, classification, 1 if is_hot else 0, ai_reply,
-                operator_id
-            ))
+                ))
 
             # Terminate active follow-up sequences for this recipient
             conn.execute("""
@@ -434,44 +456,60 @@ class IMAPReplyListener:
             "company_name": comp,
             "classification": classification,
             "is_hot_lead": is_hot,
+            "is_new_reply": is_new_reply,
+            "reply_snippet": snippet,
             "ai_suggested_reply": ai_reply,
             "operator_id": operator_id,
             "alert": alert_msg,
             "blacklisted": classification in ("UNSUBSCRIBE", "BOUNCE")
         }
 
-    def poll_enrolled_inboxes(self) -> Dict[str, Any]:
+    def poll_enrolled_inboxes(self, operator_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Background polling service monitoring active enrolled IMAP inboxes.
-        Connects via imap.gmail.com:993 with sanitized credentials without silent errors.
+        Inbound IMAP reply detection connecting to imap.gmail.com:993 (SSL/TLS).
+        Scans recent messages (last 48 hours, both read and unread) in INBOX,
+        matches incoming 'From' addresses against leads currently in 'Dispatched' (SENT) status,
+        and transitions matched leads to 'REPLIED'.
         """
+        from datetime import timedelta
         results: List[Dict[str, Any]] = []
         errors: List[str] = []
 
         with self.db.get_connection() as conn:
-            mailboxes = conn.execute("""
-                SELECT id, email_address, imap_host, imap_port, imap_username, imap_password, operator_id
-                FROM mailbox_rotator
-                WHERE is_active = 1
-            """).fetchall()
+            if operator_id:
+                mailboxes = conn.execute("""
+                    SELECT id, email_address, imap_host, imap_port, imap_username, imap_password, smtp_password, operator_id
+                    FROM mailbox_rotator
+                    WHERE is_active = 1 AND (operator_id = ? OR operator_id IS NULL)
+                """, (operator_id,)).fetchall()
+            else:
+                mailboxes = conn.execute("""
+                    SELECT id, email_address, imap_host, imap_port, imap_username, imap_password, smtp_password, operator_id
+                    FROM mailbox_rotator
+                    WHERE is_active = 1
+                """).fetchall()
 
         if not mailboxes:
             return {
                 "success": True,
                 "processed_count": 0,
+                "new_replies_count": 0,
                 "processed": [],
                 "errors": ["No active mailboxes enrolled in rotator."],
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
+
+        cutoff_dt = datetime.now(timezone.utc) - timedelta(days=2)
+        since_date_str = cutoff_dt.strftime("%d-%b-%Y")
 
         for mb in mailboxes:
             mb_email = mb["email_address"]
             host = (mb["imap_host"] or "").strip() or "imap.gmail.com"
             port = int(mb["imap_port"] or 993)
             user = (mb["imap_username"] or mb["email_address"] or "").strip()
-            raw_pwd = mb["imap_password"] or ""
+            raw_pwd = mb["imap_password"] or mb["smtp_password"] or ""
             pwd = re.sub(r'\s+', '', raw_pwd)
-            op_id = mb["operator_id"]
+            op_id = mb["operator_id"] or operator_id
 
             if not user or not pwd:
                 err_msg = f"{mb_email}: Missing IMAP credentials (username or App Password)"
@@ -479,58 +517,88 @@ class IMAPReplyListener:
                 continue
 
             try:
-                mail = imaplib.IMAP4_SSL(host, port)
+                mail = imaplib.IMAP4_SSL(host, port, timeout=15)
                 mail.login(user, pwd)
                 mail.select("INBOX")
-                status, messages = mail.search(None, "UNSEEN")
-                if status == "OK" and messages[0]:
-                    for msg_id in messages[0].split():
-                        res, msg_data = mail.fetch(msg_id, "(RFC822)")
-                        for response_part in msg_data:
-                            if isinstance(response_part, tuple):
-                                msg = email.message_from_bytes(response_part[1])
-                                sender = msg.get("From", "")
-                                subject_raw = decode_mime_header(msg.get("Subject", ""))
-                                in_reply_to = msg.get("In-Reply-To", "")
-                                references = msg.get("References", "")
-                                body_text = ""
-                                if msg.is_multipart():
-                                    for part in msg.walk():
-                                        if part.get_content_type() == "text/plain":
-                                            payload = part.get_payload(decode=True)
-                                            if payload:
-                                                body_text += payload.decode("utf-8", errors="ignore")
-                                else:
-                                    payload = msg.get_payload(decode=True)
-                                    if payload:
-                                        body_text = payload.decode("utf-8", errors="ignore")
 
-                                # Extract email from sender string
-                                sender_match = re.search(r'[\w\.-]+@[\w\.-]+', sender)
-                                clean_sender = sender_match.group(0) if sender_match else sender
+                # Robust 48h scan: look for messages SINCE cutoff_date (both read and unread)
+                status, messages = None, [b""]
+                try:
+                    status, messages = mail.search(None, f'SINCE "{since_date_str}"')
+                except Exception:
+                    pass
 
-                                proc = self.process_incoming_reply(
-                                    sender_email=clean_sender,
-                                    subject=subject_raw,
-                                    body=body_text,
-                                    operator_id=op_id,
-                                    in_reply_to=in_reply_to,
-                                    references=references
-                                )
-                                results.append(proc)
-                        # Mark email as read/seen in mailbox
+                if status != "OK" or not messages or not messages[0]:
+                    try:
+                        status, messages = mail.search(None, f'(SINCE {since_date_str})')
+                    except Exception:
+                        pass
+
+                if status != "OK" or not messages or not messages[0]:
+                    # Fallback to recent messages
+                    try:
+                        status, messages = mail.search(None, "ALL")
+                    except Exception:
+                        status, messages = ("NO", [b""])
+
+                if status == "OK" and messages and messages[0]:
+                    msg_ids = messages[0].split()
+                    # Limit to the most recent 100 messages to maintain speed
+                    if len(msg_ids) > 100:
+                        msg_ids = msg_ids[-100:]
+
+                    for msg_id in msg_ids:
                         try:
-                            mail.store(msg_id, "+FLAGS", "\\Seen")
-                        except Exception:
-                            pass
+                            res, msg_data = mail.fetch(msg_id, "(RFC822)")
+                            if not msg_data or res != "OK":
+                                continue
+
+                            for response_part in msg_data:
+                                if isinstance(response_part, tuple):
+                                    msg = email.message_from_bytes(response_part[1])
+                                    sender = msg.get("From", "")
+                                    subject_raw = decode_mime_header(msg.get("Subject", ""))
+                                    in_reply_to = msg.get("In-Reply-To", "")
+                                    references = msg.get("References", "")
+                                    body_text = ""
+                                    if msg.is_multipart():
+                                        for part in msg.walk():
+                                            if part.get_content_type() == "text/plain":
+                                                payload = part.get_payload(decode=True)
+                                                if payload:
+                                                    body_text += payload.decode("utf-8", errors="ignore")
+                                    else:
+                                        payload = msg.get_payload(decode=True)
+                                        if payload:
+                                            body_text = payload.decode("utf-8", errors="ignore")
+
+                                    # Extract email from sender string
+                                    sender_match = re.search(r'[\w\.-]+@[\w\.-]+', sender)
+                                    clean_sender = sender_match.group(0) if sender_match else sender
+
+                                    proc = self.process_incoming_reply(
+                                        sender_email=clean_sender,
+                                        subject=subject_raw,
+                                        body=body_text,
+                                        operator_id=op_id,
+                                        in_reply_to=in_reply_to,
+                                        references=references
+                                    )
+                                    results.append(proc)
+                        except Exception as msg_err:
+                            errors.append(f"{mb_email} msg fetch error: {str(msg_err)}")
+
                 mail.logout()
             except Exception as e:
                 err_msg = f"{mb_email} ({host}:{port}): {type(e).__name__} - {str(e)}"
                 errors.append(err_msg)
 
+        new_replies_count = sum(1 for r in results if r.get("is_new_reply"))
+
         return {
             "success": len(errors) == 0,
             "processed_count": len(results),
+            "new_replies_count": new_replies_count,
             "processed": results,
             "errors": errors,
             "timestamp": datetime.now(timezone.utc).isoformat()

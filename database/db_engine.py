@@ -171,7 +171,12 @@ class DatabaseEngine:
                 ("google_access_token", "TEXT"),
                 ("google_token_expiry", "TEXT"),
                 ("trial_status", "TEXT DEFAULT 'active'"),
-                ("trial_started_at", "TEXT")
+                ("trial_started_at", "TEXT"),
+                ("trial_active", "INTEGER NOT NULL DEFAULT 0"),
+                ("trial_expires_at", "TEXT"),
+                ("subscription_status", "TEXT DEFAULT 'none'"),
+                ("subscription_plan", "TEXT DEFAULT ''"),
+                ("subscription_expires_at", "TEXT")
             ]
             for col_name, col_def in migrations:
                 if col_name not in existing_user_cols:
@@ -221,7 +226,9 @@ class DatabaseEngine:
                 ("bounced_at", "TIMESTAMP"),
                 ("bounce_reason", "TEXT"),
                 ("message_id", "TEXT"),
-                ("unsubscribed", "INTEGER NOT NULL DEFAULT 0")
+                ("unsubscribed", "INTEGER NOT NULL DEFAULT 0"),
+                ("replied_at", "TIMESTAMP"),
+                ("reply_snippet", "TEXT")
             ]
             for col_name, col_def in oq_migrations:
                 if col_name not in existing_oq_cols:
@@ -410,6 +417,34 @@ class DatabaseEngine:
                 );
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_billing_operator ON operator_billing(operator_id);")
+
+            # 15. User Subscription Plan Requests (Post-Trial Paywall)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS subscription_requests (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    plan_name TEXT NOT NULL,
+                    duration_days INTEGER NOT NULL,
+                    price REAL NOT NULL,
+                    payment_method TEXT DEFAULT 'MANUAL_INVOICE',
+                    notes TEXT,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    resolved_at TIMESTAMP,
+                    resolved_by TEXT
+                );
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sub_req_user ON subscription_requests(user_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sub_req_status ON subscription_requests(status);")
+
+            # 16. System & Billing Configuration
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS system_config (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
 
             conn.commit()
 
