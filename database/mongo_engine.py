@@ -68,6 +68,17 @@ class MongoDatabaseEngine:
         else:
             logger.warning("[MONGO] Neither live MongoDB nor mongomock available.")
 
+    def _ensure_connected(self):
+        """Validates connection to MongoDB and auto-reconnects if disconnected."""
+        if self.client and not self.is_mock and pymongo:
+            try:
+                self.client.admin.command("ping")
+            except Exception:
+                logger.warning("[MONGO] Transient connection drop detected; reconnecting...")
+                self._initialize_connection()
+        elif self.db is None:
+            self._initialize_connection()
+
     def _ensure_unique_indexes(self):
         """Enforces MongoDB unique indexes on domain and primary_email."""
         if self.db is None:
@@ -103,6 +114,7 @@ class MongoDatabaseEngine:
         Inserts lead into MongoDB collection.
         Raises DuplicateKeyError or ValueError if domain or primary_email already exists.
         """
+        self._ensure_connected()
         if self.db is None:
             return {"success": False, "reason": "NO_MONGO_CONNECTION"}
 
@@ -131,6 +143,7 @@ class MongoDatabaseEngine:
 
     def is_duplicate(self, domain: Optional[str] = None, email: Optional[str] = None) -> bool:
         """Checks if a domain or email already exists in MongoDB leads collection."""
+        self._ensure_connected()
         if self.db is None:
             return False
 
@@ -148,12 +161,14 @@ class MongoDatabaseEngine:
 
     def find_lead(self, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Finds single lead matching query."""
+        self._ensure_connected()
         if self.db is None:
             return None
         return self.db.leads.find_one(query)
 
     def set_unsubscribed(self, email_or_domain: str) -> int:
         """Marks lead as unsubscribed: true across MongoDB."""
+        self._ensure_connected()
         if self.db is None:
             return 0
         target = email_or_domain.strip().lower()
@@ -165,6 +180,7 @@ class MongoDatabaseEngine:
 
     def is_unsubscribed(self, email_or_domain: str) -> bool:
         """Checks if lead has unsubscribed: true in MongoDB."""
+        self._ensure_connected()
         if self.db is None:
             return False
         target = email_or_domain.strip().lower()
@@ -179,6 +195,7 @@ class MongoDatabaseEngine:
         Permanently purges all documents across all collections in MongoDB.
         Used for Step 8 strict database cleanup.
         """
+        self._ensure_connected()
         counts = {}
         if self.db is None:
             return counts

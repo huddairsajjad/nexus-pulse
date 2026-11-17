@@ -31,7 +31,7 @@ class BlacklistManager:
             """).fetchall()
             return [dict(r) for r in rows]
 
-    def add_rule(self, pattern: str, reason: str = "Excluded Domain", created_by: str = "admin") -> Dict[str, Any]:
+    def add_rule(self, pattern: str, reason: str = "Excluded Domain", created_by: str = "admin", entity_type: str = "domain") -> Dict[str, Any]:
         """Registers a new blacklist rule pattern."""
         clean_pat = pattern.strip().lower()
         if not clean_pat:
@@ -44,14 +44,15 @@ class BlacklistManager:
 
             conn.execute("""
                 INSERT INTO blacklist_rules (pattern, entity_type, reason, created_by)
-                VALUES (?, 'domain', ?, ?)
-            """, (clean_pat, reason.strip() or "Excluded Pattern", created_by))
+                VALUES (?, ?, ?, ?)
+            """, (clean_pat, entity_type, reason.strip() or "Excluded Pattern", created_by))
             conn.commit()
             last_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
         return {
             "id": last_id,
             "pattern": clean_pat,
+            "entity_type": entity_type,
             "reason": reason,
             "created_by": created_by
         }
@@ -69,6 +70,12 @@ class BlacklistManager:
     def is_domain_blacklisted(self, domain_or_email: str) -> Tuple[bool, Optional[str]]:
         """
         Evaluates whether a domain or email matches any registered blacklist rule.
+        Checks:
+          1. Exact full-string match (supports stored email patterns like 'user@domain.com')
+          2. Domain-part exact match
+          3. Subdomain match
+          4. Wildcard fnmatch patterns
+          5. Dot-prefix suffix match
         Returns: (is_blacklisted: bool, matching_rule_or_reason: str)
         """
         if not domain_or_email:
@@ -88,7 +95,11 @@ class BlacklistManager:
                 pat = rule["pattern"].lower()
                 reason = rule["reason"]
 
-                # Exact match
+                # Exact full-string match (e.g. stored email 'optout@example.co.uk')
+                if pat == clean:
+                    return True, f"Matched blacklist rule (exact): {pat} ({reason})"
+
+                # Exact domain match
                 if pat == domain:
                     return True, f"Matched blacklist rule: {pat} ({reason})"
 
@@ -99,6 +110,8 @@ class BlacklistManager:
                 # Wildcard matching (e.g. '*.gov', '*.mil', '*bank*')
                 if "*" in pat:
                     if fnmatch.fnmatch(domain, pat):
+                        return True, f"Matched wildcard pattern: {pat} ({reason})"
+                    if fnmatch.fnmatch(clean, pat):
                         return True, f"Matched wildcard pattern: {pat} ({reason})"
                     # Also match if pattern is *.gov and domain is something.gov
                     if pat.startswith("*.") and domain.endswith(pat[1:]):

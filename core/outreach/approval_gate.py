@@ -535,14 +535,30 @@ class HumanApprovalGate:
                 payload = {
                     "secret": webhook_secret,
                     "to": row["recipient"].strip(),
+                    "recipient": row["recipient"].strip(),
                     "subject": row["subject"],
                     "body": msg_body,
+                    "html_body": msg_body.replace("\n", "<br>"),
                     "sender_name": display_name or "H.Huddair"
                 }
                 try:
                     logger.info(f"[WEBHOOK DISPATCH] Posting to Apps Script relay for {sender_email} -> {row['recipient']}...")
                     resp_json = _send_webhook_request(active_webhook, payload)
-                    if isinstance(resp_json, dict) and (resp_json.get("status") == "success" or resp_json.get("ok") is True or resp_json.get("success") is True):
+                    is_success = False
+                    if isinstance(resp_json, dict):
+                        st = str(resp_json.get("status", "")).strip().lower()
+                        ok_val = resp_json.get("ok")
+                        succ_val = resp_json.get("success")
+                        if (
+                            ok_val is True
+                            or succ_val is True
+                            or st in ("success", "ok", "delivered", "sent")
+                        ):
+                            is_success = True
+                        elif "raw" in resp_json and any(kw in str(resp_json["raw"]).lower() for kw in ("success", "ok")):
+                            is_success = True
+
+                    if is_success:
                         dispatched_successfully = True
                         dispatch_method = "WEBHOOK"
                         logger.info(f"[WEBHOOK RELAY 200 OK] Dispatched outreach to {row['recipient']} via {sender_email}.")
@@ -562,9 +578,20 @@ class HumanApprovalGate:
                     logger.error(f"[DISPATCH FAILED] {err_msg}")
                     conn.execute("""
                         UPDATE outreach_queue
-                        SET status = 'FAILED', bounce_reason = ?
+                        SET status = 'APPROVED', bounce_reason = ?
                         WHERE id = ?
-                    """, (err_msg, queue_id))
+                    """, (f"Dispatch Error: {err_msg}", queue_id))
+                    try:
+                        conn.execute("""
+                            INSERT INTO operator_sessions (user_id, username, action, detail, device_id)
+                            VALUES (?, ?, 'DISPATCH_ERROR', ?, 'CLOUD_RELAY')
+                        """, (
+                            target_op or "system",
+                            row.get("approved_by") or "operator",
+                            f"Missing credentials for {recip_clean} via {sender_email}: {err_msg}"
+                        ))
+                    except Exception:
+                        pass
                     conn.commit()
                     return {
                         "success": False,
@@ -603,9 +630,20 @@ class HumanApprovalGate:
                     logger.error(f"[SMTP DISPATCH FAILED] Error transmitting to {row['recipient']}: {err_details}", exc_info=True)
                     conn.execute("""
                         UPDATE outreach_queue
-                        SET status = 'FAILED', bounce_reason = ?
+                        SET status = 'APPROVED', bounce_reason = ?
                         WHERE id = ?
-                    """, (f"Dispatch Failure: {err_details}", queue_id))
+                    """, (f"Dispatch Error: {err_details}", queue_id))
+                    try:
+                        conn.execute("""
+                            INSERT INTO operator_sessions (user_id, username, action, detail, device_id)
+                            VALUES (?, ?, 'DISPATCH_ERROR', ?, 'CLOUD_RELAY')
+                        """, (
+                            target_op or "system",
+                            row.get("approved_by") or "operator",
+                            f"Dispatch failed for {recip_clean} via {sender_email}: {err_details}"
+                        ))
+                    except Exception:
+                        pass
                     conn.commit()
                     return {
                         "success": False,
@@ -695,8 +733,9 @@ class HumanApprovalGate:
         dispatched = []
         scheduled = []
         errors = []
+        import time
 
-        for r in rows:
+        for idx, r in enumerate(rows):
             q_id = r["id"]
             country = r["target_country"]
             recipient = r["recipient"]
@@ -706,15 +745,18 @@ class HumanApprovalGate:
             tz_eval = self.scheduler.get_target_local_time(country=country, domain=domain, bypass_window=bypass_window)
 
             if tz_eval["is_in_send_window"]:
-                # Attempt dispatch
+                # Attempt dispatch with forwarded bypass_window flag
                 try:
-                    res = self.dispatch_approved_outreach(q_id, operator_id=r["operator_id"])
+                    res = self.dispatch_approved_outreach(q_id, operator_id=r["operator_id"], bypass_window=bypass_window)
                     if res.get("success"):
                         dispatched.append({
                             "queue_id": q_id,
                             "recipient": recipient,
                             "dispatched_via": res.get("dispatched_via")
                         })
+                        # 1.5s sequential batch delay to prevent rate-limiting or concurrency conflicts
+                        if idx < len(rows) - 1:
+                            time.sleep(1.5)
                     else:
                         errors.append({
                             "queue_id": q_id,

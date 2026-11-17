@@ -990,7 +990,8 @@ def dispatch_approved_item(
     try:
         res = gate.dispatch_approved_outreach(queue_id, operator_id=target_op, bypass_window=bool(bypass_window))
         if not res.get("success"):
-            raise HTTPException(status_code=400, detail=res.get("message", "Dispatch failed."))
+            err_msg = res.get("message") or res.get("reason") or "Dispatch failed."
+            raise HTTPException(status_code=400, detail=err_msg)
         return res
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1015,7 +1016,8 @@ def dispatch_now_trigger(
         try:
             res = gate.dispatch_approved_outreach(req.queue_id, operator_id=target_op, bypass_window=effective_bypass)
             if not res.get("success"):
-                raise HTTPException(status_code=400, detail=res.get("message", "Dispatch failed."))
+                err_msg = res.get("message") or res.get("reason") or "Dispatch failed."
+                raise HTTPException(status_code=400, detail=err_msg)
             return {
                 "success": True,
                 "dispatched_count": 1,
@@ -1122,6 +1124,10 @@ def enroll_mailbox(req: MailboxCreateRequest, current_user: Dict[str, Any] = Dep
     """Enrolls an active SMTP profile with per-mailbox daily sending cap and optional webhook relay."""
     rotator = get_inbox_rotator()
     op_id = current_user["id"]
+    if req.webhook_url and req.webhook_url.strip():
+        wh_url = req.webhook_url.strip()
+        if not wh_url.startswith("https://"):
+            raise HTTPException(status_code=400, detail="Webhook URL must be a valid HTTPS endpoint (starting with https://).")
     try:
         return rotator.enroll_mailbox(
             email_address=req.email_address,
@@ -1182,7 +1188,10 @@ def update_mailbox(mailbox_id: str, req: MailboxUpdateRequest, current_user: Dic
         if req.imap_password is not None:
             fields.append("imap_password = ?"); values.append(req.imap_password)
         if req.webhook_url is not None:
-            fields.append("webhook_url = ?"); values.append(req.webhook_url.strip())
+            wh_val = req.webhook_url.strip()
+            if wh_val and not wh_val.startswith("https://"):
+                raise HTTPException(status_code=400, detail="Webhook URL must be a valid HTTPS endpoint (starting with https://).")
+            fields.append("webhook_url = ?"); values.append(wh_val)
 
         if not fields:
             raise HTTPException(status_code=400, detail="No fields provided to update.")
@@ -1495,6 +1504,26 @@ def handle_unsubscribe_link(token: Optional[str] = Query(None), email: Optional[
                 mongo.set_unsubscribed(domain_part)
         except Exception as mex:
             logger.warning(f"[UNSUBSCRIBE] MongoDB sync error: {mex}")
+
+        # Add to blacklist_rules for persistent cross-module rejection
+        try:
+            from core.outreach.blacklist_manager import get_blacklist_manager
+            bl_mgr = get_blacklist_manager()
+            bl_mgr.add_rule(clean_email, entity_type="email", reason="Unsubscribed via opt-out link", created_by="UNSUBSCRIBE_HOOK")
+            if domain_part:
+                bl_mgr.add_rule(domain_part, entity_type="domain", reason="Domain opt-out", created_by="UNSUBSCRIBE_HOOK")
+        except Exception as blex:
+            logger.warning(f"[UNSUBSCRIBE] Blacklist rule error: {blex}")
+
+        # Add to blacklist_rules for persistent cross-module rejection
+        try:
+            from core.outreach.blacklist_manager import get_blacklist_manager
+            bl_mgr = get_blacklist_manager()
+            bl_mgr.add_rule(clean, entity_type="email", reason="Unsubscribed via POST API", created_by="UNSUBSCRIBE_HOOK")
+            if domain:
+                bl_mgr.add_rule(domain, entity_type="domain", reason="Domain opt-out", created_by="UNSUBSCRIBE_HOOK")
+        except Exception as blex:
+            logger.warning(f"[UNSUBSCRIBE] Blacklist rule error: {blex}")
 
         # Update SQLite vault_leads and outreach_queue
         try:

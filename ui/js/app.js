@@ -195,6 +195,21 @@ const KANBAN_STAGES = [
   { key: "CLOSED", label: "Converted", badgeClass: "badge-success" }
 ];
 
+const normalizeLeadStatus = (rawStatus) => {
+  if (!rawStatus) return "SCRAPED";
+  const s = String(rawStatus).toUpperCase().trim();
+  if (s === "PENDING_APPROVAL" || s === "APPROVAL_HOLD" || s === "PENDING") return "PENDING_APPROVAL";
+  if (s === "APPROVED" || s === "AUTHORIZED" || s === "FAILED" || s === "SCHEDULED") return "APPROVED";
+  if (s === "SENT" || s === "DISPATCHED" || s === "CONTACTED" || s === "DELIVERED" || s === "BOUNCED") return "SENT";
+  if (s === "REPLIED" || s === "INTERESTED" || s === "NEUTRAL") return "REPLIED";
+  if (s === "HOT_LEAD" || s === "HOT" || s === "HOTLEAD") return "HOT_LEAD";
+  if (s === "CLOSED" || s === "CONVERTED" || s === "WON") return "CLOSED";
+  if (s === "VERIFIED" || s === "VALIDATED") return "VERIFIED";
+  if (s === "SCRAPED" || s === "NEW" || s === "HUNTED" || s === "DISCOVERED") return "SCRAPED";
+  if (s === "SUPPRESSED" || s === "BLACKLISTED" || s === "UNSUBSCRIBED") return "PENDING_APPROVAL";
+  return "SCRAPED";
+};
+
 function NexusPulseApp() {
   // ---------------------------------------------------------------------------
   // THEME ENGINE (Requirement 1)
@@ -926,7 +941,7 @@ function NexusPulseApp() {
       });
       const data = await resp.json();
       if (resp.ok) {
-        fetchData();
+        await fetchData();
         setAlertBanner({
           type: "success",
           message: data.message || `IMAP Sync Complete: ${data.new_replies_count || 0} new replies detected!`
@@ -1349,16 +1364,31 @@ function doPost(e) {
       });
       const data = await resp.json();
       if (resp.ok && data.success) {
-        setAlertBanner({
-          type: "success",
-          message: `⚡ Dispatch Engine Triggered: ${data.dispatched_count || 0} leads dispatched! (${data.scheduled_count || 0} queued for local business hours)`
-        });
-        fetchData();
+        if (data.dispatched_count === 0 && data.errors && data.errors.length > 0) {
+          const firstErr = data.errors[0];
+          setAlertBanner({
+            type: "danger",
+            message: `⚠️ Dispatch Blocked: ${firstErr.message || firstErr.reason || "Unable to dispatch leads."}`
+          });
+        } else if (data.dispatched_count === 0 && data.scheduled_count === 0) {
+          setAlertBanner({
+            type: "info",
+            message: "No authorized leads currently waiting in queue to be dispatched."
+          });
+        } else {
+          setAlertBanner({
+            type: "success",
+            message: `⚡ Dispatch Engine Triggered: ${data.dispatched_count || 0} leads dispatched! (${data.scheduled_count || 0} queued for local business hours)`
+          });
+        }
+        await fetchData();
       } else {
+        const errMsg = data.detail || (data.errors && data.errors[0] && (data.errors[0].message || data.errors[0].reason)) || data.message || "Dispatch queue trigger failed.";
         setAlertBanner({
           type: "danger",
-          message: data.detail || data.message || "Dispatch queue trigger failed."
+          message: `Dispatch failed: ${errMsg}`
         });
+        await fetchData();
       }
     } catch (err) {
       setAlertBanner({
@@ -2740,7 +2770,7 @@ function doPost(e) {
             {/* Responsive Board Container */}
             <div className="flex gap-3 overflow-x-auto pb-4 scrollbar-thin">
               {KANBAN_STAGES.map((stage) => {
-                const stageLeads = kanbanItems.filter((item) => item.status === stage.key);
+                const stageLeads = kanbanItems.filter((item) => normalizeLeadStatus(item.status) === stage.key);
                 return (
                   <div key={stage.key} className="kanban-col">
                     <div className="kanban-col-header">
@@ -2793,6 +2823,31 @@ function doPost(e) {
                                 ))}
                               </div>
 
+                              {/* Status Indicators & Warning Badges */}
+                              <div className="flex flex-wrap gap-1 mb-2">
+                                {(lead.bounce_reason || String(lead.status).toUpperCase() === "FAILED") && (
+                                  <span
+                                    className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-red-950 text-red-300 border border-red-800"
+                                    title={lead.bounce_reason || "Dispatch Error"}
+                                  >
+                                    ⚠️ {lead.bounce_reason ? (lead.bounce_reason.length > 25 ? lead.bounce_reason.slice(0, 25) + "..." : lead.bounce_reason) : "Dispatch Failed"}
+                                  </span>
+                                )}
+                                {(String(lead.status).toUpperCase() === "SCHEDULED" || (lead.scheduled_for && !lead.sent_at)) && (
+                                  <span
+                                    className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-blue-950 text-blue-300 border border-blue-800"
+                                    title={`Scheduled for: ${lead.scheduled_for}`}
+                                  >
+                                    🕒 Scheduled
+                                  </span>
+                                )}
+                                {(lead.unsubscribed || String(lead.status).toUpperCase() === "SUPPRESSED") && (
+                                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-800">
+                                    🚫 Suppressed
+                                  </span>
+                                )}
+                              </div>
+
                               {/* Tech Stack Chips */}
                               {lead.tech_stack && lead.tech_stack.length > 0 && (
                                 <div className="flex flex-wrap gap-1 mb-2">
@@ -2812,6 +2867,25 @@ function doPost(e) {
                                     className="btn btn-warning btn-sm flex-1 justify-center"
                                   >
                                     Review & Authorize ➔
+                                  </button>
+                                  <button
+                                    onClick={() => handleDeleteQueueItem(lead.id, lead.recipient || lead.primary_email)}
+                                    className="btn btn-danger btn-sm px-2"
+                                    title="Delete Lead"
+                                  >
+                                    🗑️
+                                  </button>
+                                </div>
+                              )}
+
+                              {stage.key === "APPROVED" && (
+                                <div className="flex items-center gap-1 mt-1">
+                                  <button
+                                    onClick={() => handleDispatchQueueNow(true, lead.id)}
+                                    className="btn btn-primary btn-sm flex-1 justify-center"
+                                    title="Force immediate dispatch for this authorized lead"
+                                  >
+                                    🚀 Dispatch Now
                                   </button>
                                   <button
                                     onClick={() => handleDeleteQueueItem(lead.id, lead.recipient || lead.primary_email)}

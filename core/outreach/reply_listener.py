@@ -10,6 +10,7 @@ import uuid
 import imaplib
 import email
 from email.header import decode_header
+from email.utils import parseaddr
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from database.db_engine import get_db_engine
@@ -572,9 +573,30 @@ class IMAPReplyListener:
                                         if payload:
                                             body_text = payload.decode("utf-8", errors="ignore")
 
-                                    # Extract email from sender string
-                                    sender_match = re.search(r'[\w\.-]+@[\w\.-]+', sender)
-                                    clean_sender = sender_match.group(0) if sender_match else sender
+                                    # Parse sender strictly using parseaddr
+                                    _, parsed_addr = parseaddr(sender)
+                                    clean_sender = (parsed_addr or "").strip().lower()
+                                    if not clean_sender:
+                                        sender_match = re.search(r'[\w\.-]+@[\w\.-]+', sender)
+                                        clean_sender = sender_match.group(0).lower().strip() if sender_match else sender.lower().strip()
+
+                                    mb_email_clean = (mb_email or "").strip().lower()
+                                    user_clean = (user or "").strip().lower()
+
+                                    # 1. Ignore self-sent emails from the mailbox itself
+                                    if clean_sender in (mb_email_clean, user_clean):
+                                        continue
+
+                                    # 2. Ignore automated system notifications unless they match bounce patterns
+                                    system_noise = (
+                                        "no-reply@", "noreply@", "notifications@", "googlecommunityteam",
+                                        "mail-noreply@", "donotreply@", "do-not-reply@", "newsletter@"
+                                    )
+                                    if any(sn in clean_sender for sn in system_noise):
+                                        combined_check = f"{subject_raw} {body_text}"
+                                        is_bounce = any(re.search(bp, combined_check, re.IGNORECASE) for bp in BOUNCE_PATTERNS)
+                                        if not is_bounce:
+                                            continue
 
                                     proc = self.process_incoming_reply(
                                         sender_email=clean_sender,

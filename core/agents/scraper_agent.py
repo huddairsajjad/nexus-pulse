@@ -560,39 +560,125 @@ class DeepScraperAgent:
         return False
 
     # ------------------------------------------------------------------
-    # Company name cleaner: strips SEO suffixes from <title>
+    # Company name cleaner: prioritized multi-layer brand extraction
     # ------------------------------------------------------------------
-    @staticmethod
-    def _clean_company_name(raw_title: str, domain: str) -> str:
+    @classmethod
+    def extract_clean_company_name(cls, soup: Optional[BeautifulSoup], raw_title: str, domain: str) -> str:
         """
-        Derives a clean company name from the page <title> by stripping
-        common SEO suffixes: '| Home', '- Contact Us', '– Official Site', etc.
-        Falls back to LeadValidationFilter domain extractor if title is generic.
+        Derives an authentic clean brand/company name using a prioritized hierarchy:
+        1. Schema.org JSON-LD (Organization, LocalBusiness, GeneralContractor, ConstructionBusiness)
+        2. OpenGraph meta (og:site_name) or application-name
+        3. Title parsing with strict generic SEO pattern rejection (ignoring taglines like
+           'Best Construction Company in X', 'Find local contractors for free')
+        4. Fallback to clean domain brand extraction.
         """
-        if not raw_title:
-            return LeadValidationFilter.extract_brand_name_from_domain(domain)
+        import json
 
-        # Split on common separators and take the longest meaningful segment
-        SEO_SUFFIXES = re.compile(
-            r'\s*[\|\-\–\—]\s*(?:'
-            r'home\s*page?|home|welcome|contact\s+us|contact|about\s+us|about|'
-            r'official\s+site|official\s+website|main\s+page|our\s+services|'
-            r'services|solutions|get\s+a\s+quote|quote|estimating|construction|'
-            r'contractors?|builders?|group|ltd|limited|inc|llc|plc'
-            r')$',
-            re.IGNORECASE,
-        )
-        cleaned = SEO_SUFFIXES.sub("", raw_title).strip()
-        # Also split on first separator if the right part is a generic single word
-        parts = re.split(r'[\|\-\–\—]', cleaned)
-        candidates = [p.strip() for p in parts if p.strip() and len(p.strip()) >= 2]
-        if candidates:
-            # Prefer the longest candidate as it's usually the brand name
-            best = max(candidates, key=len)
-            if len(best) >= 2:
-                return best
+        GENERIC_SEO_PATTERNS = [
+            r"^(?:home|welcome|contact|contact\s+us|about|about\s+us|services?|solutions|official\s+site)$",
+            r"\bbest\s+.*(?:in|near|across)\b",
+            r"\btop\s+\d+\s+",
+            r"\bfind\s+(?:local\s+)?(?:contractors?|builders?|companies)\b",
+            r"\bfree\s+(?:estimates?|quotes?)\b",
+            r"\bwelcome\s+to\b",
+            r"\bhome\s*page?\b",
+            r"\bcontact\s+us\b",
+            r"\babout\s+us\b",
+            r"\bservices?\s*overview\b",
+            r"\bour\s+services\b",
+            r"\bleading\s+(?:provider|contractor|construction|builder)\b",
+            r"\btrusted\s+(?:local|commercial)?\s*(?:contractors?|builders?)\b",
+            r"\bcommercial\s+construction\s+services\b",
+            r"\baffordable\s+(?:construction|roofing|cladding)\b",
+            r"\bfor\s+free\b"
+        ]
 
+        def is_generic_phrase(text: str) -> bool:
+            if not text or len(text.strip()) < 2:
+                return True
+            t_lower = text.strip().lower()
+            if any(re.search(pat, t_lower) for pat in GENERIC_SEO_PATTERNS):
+                return True
+            words = text.strip().split()
+            if len(words) > 7:
+                return True
+            return False
+
+        # Priority 1: Schema.org JSON-LD structured data
+        if soup:
+            try:
+                for script in soup.find_all("script", type="application/ld+json"):
+                    if not script.string:
+                        continue
+                    try:
+                        data = json.loads(script.string.strip())
+                    except Exception:
+                        continue
+
+                    items = data if isinstance(data, list) else [data]
+                    if isinstance(data, dict) and "@graph" in data and isinstance(data["@graph"], list):
+                        items.extend(data["@graph"])
+
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        schema_type = str(item.get("@type", "")).lower()
+                        if any(target in schema_type for target in ("organization", "business", "contractor", "corporation")):
+                            name_val = item.get("name") or item.get("legalName")
+                            if isinstance(name_val, str) and name_val.strip() and not is_generic_phrase(name_val):
+                                return name_val.strip()
+            except Exception:
+                pass
+
+        # Priority 2: OpenGraph og:site_name or application-name meta tag
+        if soup:
+            try:
+                og_site = soup.find("meta", property=re.compile(r"^og:site_name$", re.I)) or soup.find("meta", attrs={"name": re.compile(r"^og:site_name$", re.I)})
+                if og_site and og_site.get("content"):
+                    site_name = og_site["content"].strip()
+                    if site_name and not is_generic_phrase(site_name) and len(site_name) >= 2:
+                        return site_name
+
+                app_name = soup.find("meta", attrs={"name": re.compile(r"^application-name$", re.I)})
+                if app_name and app_name.get("content"):
+                    app_name_val = app_name["content"].strip()
+                    if app_name_val and not is_generic_phrase(app_name_val) and len(app_name_val) >= 2:
+                        return app_name_val
+            except Exception:
+                pass
+
+        # Priority 3: Refined title cleaning & segment ranking
+        if raw_title:
+            cleaned = re.sub(
+                r'\s*[\|\-\–\—•:]\s*(?:'
+                r'home\s*page?|home|welcome|contact\s+us|contact|about\s+us|about|'
+                r'official\s+site|official\s+website|main\s+page|our\s+services|'
+                r'services|solutions|get\s+a\s+quote|quote|estimating'
+                r')$',
+                "", raw_title, flags=re.IGNORECASE
+            ).strip()
+
+            parts = [p.strip() for p in re.split(r'[\|\-\–\—•:]', cleaned) if p.strip()]
+            valid_candidates = []
+            for p in parts:
+                if len(p) >= 2 and not is_generic_phrase(p):
+                    valid_candidates.append(p)
+
+            if valid_candidates:
+                domain_brand = LeadValidationFilter.extract_brand_name_from_domain(domain).lower()
+                for cand in valid_candidates:
+                    cand_clean = re.sub(r'[^a-zA-Z0-9]', '', cand).lower()
+                    if domain_brand in cand_clean or cand_clean in domain_brand:
+                        return cand
+
+                return min(valid_candidates, key=lambda c: len(c.split()))
+
+        # Priority 4: Fallback to domain-derived brand name
         return LeadValidationFilter.extract_brand_name_from_domain(domain)
+
+    @classmethod
+    def _clean_company_name(cls, raw_title: str, domain: str) -> str:
+        return cls.extract_clean_company_name(None, raw_title, domain)
 
     # ------------------------------------------------------------------
     # HTML parser (single page → Lead or None)
@@ -646,8 +732,8 @@ class DeepScraperAgent:
         except Exception:
             lv_company_name = ""
 
-        # Clean company name using our SEO-suffix stripper
-        company_name = self._clean_company_name(raw_title, domain) or lv_company_name
+        # Clean company name using our multi-priority extractor
+        company_name = self.extract_clean_company_name(soup, raw_title, domain) or lv_company_name
 
         # ── Layer 4: Niche relevance scoring ───────────────────────────
         if inherited_niche_score is not None:

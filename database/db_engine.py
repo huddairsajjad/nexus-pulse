@@ -44,16 +44,30 @@ class DatabaseEngine:
         self._init_schema()
 
     @contextmanager
-    def get_connection(self):
-        """Context-managed SQLite connection ensuring transaction commit and clean closing."""
-        conn = sqlite3.connect(str(self.db_path), timeout=20.0)
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL;")
-        conn.execute("PRAGMA foreign_keys = ON;")
+    def get_connection(self, max_retries: int = 3, retry_delay: float = 0.2):
+        """Context-managed SQLite connection ensuring transaction commit, retry resilience, and clean closing."""
+        import time
+        conn = None
+        for attempt in range(max_retries):
+            try:
+                conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA journal_mode = WAL;")
+                conn.execute("PRAGMA foreign_keys = ON;")
+                conn.execute("PRAGMA busy_timeout = 30000;")
+                break
+            except sqlite3.OperationalError as e:
+                if attempt == max_retries - 1:
+                    raise
+                time.sleep(retry_delay * (2 ** attempt))
         try:
             yield conn
         finally:
-            conn.close()
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     async def get_async_connection(self):
         """Asynchronous SQLite connection helper for high-concurrency cloud workloads."""
