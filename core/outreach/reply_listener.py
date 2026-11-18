@@ -30,18 +30,31 @@ HOT_LEAD_PATTERNS = [
     r"(?:quote|proposal|rate card|scope of work)"
 ]
 
-# DNC / GDPR Opt-out signals
+# DNC / GDPR Opt-out signals — STRICT patterns only; require explicit opt-out intent
+# Positive/neutral context must NOT trigger these patterns
 UNSUBSCRIBE_PATTERNS = [
     r"\bunsubscribe\b",
-    r"\bstop\b",
-    r"^stop\b",
-    r"remove (?:me|us|this email)",
-    r"do not (?:contact|email|reach out)",
+    r"(?<!\w)stop\s+(?:emails?|emailing|contact(?:ing)?|sending|all\s+emails?)(?!\s+by|\s+at|\s+before|\s+when|\s+if)",
+    r"^stop$",
+    r"remove (?:me|us|our (?:email|address|company)) (?:from|off)",
+    r"do not (?:contact|email|reach out to) (?:me|us)\b",
     r"\bdnc\b",
-    r"\bgdpr\b",
-    r"(?:stop emailing|leave us alone|take me off)",
-    r"(?:not interested|cease and desist|reported as spam)",
-    r"opt[ -]?out"
+    r"\bgdpr\s+(?:removal|request|delete)\b",
+    r"(?:stop emailing|leave us alone|take me off (?:your|the) (?:list|database))",
+    r"(?:cease and desist|reported (?:as|for) spam)",
+    r"\bopt[ -]?out\b"
+]
+
+# Positive engagement signals — if matched, ALWAYS bypass UNSUBSCRIBE classification
+POSITIVE_ENGAGEMENT_PATTERNS = [
+    r"(?:send|forward|provide|share) (?:more|through|over|us|me) (?:info|details|pricing|specs|documents?|quote|proposal)",
+    r"(?:call me|give me a call|let's (?:talk|speak|chat|connect)|set up a (?:call|meeting))",
+    r"(?:schedule|book) (?:a call|a meeting|time|an appointment)",
+    r"(?:interested|please send|happy to|sounds good|look forward)",
+    r"(?:what(?:'s| is) (?:your|the) (?:rate|price|cost|availability))",
+    r"(?:tender|rfq|rfp|quote|proposal|estimate|scope)",
+    r"(?:when (?:can|are|will) you|your availability|start date)",
+    r"(?:pre-qual|prequalif|subcontractor questionnaire|vendor list)",
 ]
 
 # Bounce & Delivery Failure signals
@@ -85,22 +98,34 @@ class ReplyClassifier:
         """
         Returns: (classification: str, is_hot_lead: bool)
         Classifications: 'INTERESTED', 'UNSUBSCRIBE', 'BOUNCE', 'NEUTRAL'
+
+        Priority order:
+          0. If positive engagement detected → bypass UNSUBSCRIBE, go straight to INTERESTED/NEUTRAL
+          1. UNSUBSCRIBE check (strict patterns only)
+          2. BOUNCE check
+          3. HOT_LEAD / INTERESTED check
+          4. NEUTRAL fallback
         """
         combined = f"{sender}\n{subject}\n{body}".lower()
+        body_lower = (body or "").lower()
 
-        # 1. Check Unsubscribe / Opt-Out (Top Priority for GDPR/CAN-SPAM)
-        for pat in UNSUBSCRIBE_PATTERNS:
-            if re.search(pat, combined):
-                return "UNSUBSCRIBE", False
+        # 0. Check positive engagement FIRST — if present, never classify as UNSUBSCRIBE
+        is_positive = any(re.search(pat, body_lower, re.IGNORECASE) for pat in POSITIVE_ENGAGEMENT_PATTERNS)
+
+        if not is_positive:
+            # 1. Check Unsubscribe / Opt-Out (GDPR/CAN-SPAM)
+            for pat in UNSUBSCRIBE_PATTERNS:
+                if re.search(pat, combined, re.IGNORECASE):
+                    return "UNSUBSCRIBE", False
 
         # 2. Check Bounce / Delivery Failure
         for pat in BOUNCE_PATTERNS:
-            if re.search(pat, combined):
+            if re.search(pat, combined, re.IGNORECASE):
                 return "BOUNCE", False
 
         # 3. Check Hot Lead / High-Intent Interest
         for pat in HOT_LEAD_PATTERNS:
-            if re.search(pat, combined):
+            if re.search(pat, combined, re.IGNORECASE):
                 return "INTERESTED", True
 
         return "NEUTRAL", False
@@ -128,6 +153,37 @@ class IMAPReplyListener:
     def __init__(self):
         self.db = get_db_engine()
         self.blacklist_mgr = get_blacklist_manager()
+        # Purge any false-positive suppression entries that may have been created
+        # by IMAP poller from enrolled sending mailbox addresses
+        self._purge_enrolled_sender_suppressions()
+
+    def _purge_enrolled_sender_suppressions(self) -> None:
+        """
+        Removes any suppression/blacklist entries that were incorrectly created
+        for enrolled sending mailbox addresses. Runs once at startup.
+        """
+        try:
+            with self.db.get_connection() as conn:
+                enrolled = conn.execute(
+                    "SELECT lower(email_address) FROM mailbox_rotator WHERE is_active = 1"
+                ).fetchall()
+                for row in enrolled:
+                    addr = (row[0] or "").strip()
+                    if not addr:
+                        continue
+                    conn.execute(
+                        "DELETE FROM suppressed_entities WHERE lower(entity) = ?", (addr,)
+                    )
+                    conn.execute(
+                        "DELETE FROM dnc_blacklist WHERE lower(entity) = ?", (addr,)
+                    )
+                    conn.execute(
+                        "DELETE FROM blacklist_rules WHERE lower(pattern) = ? AND created_by = 'IMAP_POLLER'",
+                        (addr,)
+                    )
+                conn.commit()
+        except Exception:
+            pass  # Non-fatal startup cleanup
 
     def is_suppressed(self, email_or_domain: str) -> bool:
         """Checks if entity exists in global suppression table or DNC list."""
@@ -276,7 +332,8 @@ class IMAPReplyListener:
         company_name: Optional[str] = None,
         operator_id: Optional[str] = None,
         in_reply_to: Optional[str] = None,
-        references: Optional[str] = None
+        references: Optional[str] = None,
+        message_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Processes an incoming response:
@@ -337,6 +394,24 @@ class IMAPReplyListener:
                        OR lower(?) LIKE '%' || lower(trim(subject)) || '%'
                     ORDER BY created_at DESC LIMIT 1
                 """, (clean_subject, f"%{clean_subject}%", clean_subject)).fetchone()
+
+            # Vector D: Sender email matches a lead's recipient (most recent SENT/DISPATCHED first)
+            if not matching_q and clean_sender:
+                matching_q = conn.execute("""
+                    SELECT * FROM outreach_queue
+                    WHERE lower(recipient) = ?
+                      AND status IN ('SENT', 'DISPATCHED', 'APPROVED', 'SCHEDULED')
+                    ORDER BY sent_at DESC, created_at DESC LIMIT 1
+                """, (clean_sender,)).fetchone()
+
+            # Vector E: Corporate domain fuzzy match (non-public domains only)
+            if not matching_q and domain_part and not is_public_email_domain(domain_part):
+                matching_q = conn.execute("""
+                    SELECT * FROM outreach_queue
+                    WHERE lower(recipient) LIKE ?
+                      AND status IN ('SENT', 'DISPATCHED', 'APPROVED', 'SCHEDULED')
+                    ORDER BY sent_at DESC, created_at DESC LIMIT 1
+                """, (f"%@{domain_part}",)).fetchone()
 
             if matching_q:
                 if not lead_id:
@@ -467,25 +542,32 @@ class IMAPReplyListener:
                     WHERE lower(recipient) = ? AND status IN ('SENT', 'DISPATCHED', 'APPROVED', 'SCHEDULED')
                 """, (snippet, clean_sender))
 
-            # Log into inbox_replies (avoid duplicates if same email re-scanned within 48h)
-            existing_rep = conn.execute("""
-                SELECT id FROM inbox_replies
-                WHERE lower(sender_email) = ? AND subject = ?
-                  AND received_at >= datetime('now', '-2 days')
-                LIMIT 1
-            """, (clean_sender, subject)).fetchone()
+            # Log into inbox_replies — deduplicate by message_id (if present) or by sender+subject within 48h
+            existing_rep = None
+            if message_id:
+                existing_rep = conn.execute(
+                    "SELECT id FROM inbox_replies WHERE message_id = ? LIMIT 1",
+                    (message_id,)
+                ).fetchone()
+            if not existing_rep:
+                existing_rep = conn.execute("""
+                    SELECT id FROM inbox_replies
+                    WHERE lower(sender_email) = ? AND subject = ?
+                      AND received_at >= datetime('now', '-2 days')
+                    LIMIT 1
+                """, (clean_sender, subject)).fetchone()
 
             if not existing_rep:
                 conn.execute("""
                     INSERT INTO inbox_replies (
                         id, lead_id, sender_email, company_name, subject,
                         message_body, classification, is_hot_lead, ai_suggested_reply,
-                        operator_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        operator_id, message_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     reply_id, lead_id, clean_sender, comp, subject,
                     body, classification, 1 if is_hot else 0, ai_reply,
-                    operator_id
+                    operator_id, message_id or None
                 ))
 
             # Terminate active follow-up sequences for this recipient
@@ -543,6 +625,12 @@ class IMAPReplyListener:
                     FROM mailbox_rotator
                     WHERE is_active = 1
                 """).fetchall()
+
+            # Build set of all enrolled sending mailbox addresses for whitelist
+            all_enrolled = conn.execute(
+                "SELECT lower(email_address) FROM mailbox_rotator WHERE is_active = 1"
+            ).fetchall()
+            enrolled_senders: set = {row[0].strip() for row in all_enrolled if row[0]}
 
         if not mailboxes:
             return {
@@ -615,6 +703,8 @@ class IMAPReplyListener:
                                     subject_raw = decode_mime_header(msg.get("Subject", ""))
                                     in_reply_to = msg.get("In-Reply-To", "")
                                     references = msg.get("References", "")
+                                    # Extract Message-ID for deduplication (Item 4)
+                                    raw_message_id = (msg.get("Message-ID", "") or "").strip()
                                     body_text = ""
                                     if msg.is_multipart():
                                         for part in msg.walk():
@@ -641,7 +731,12 @@ class IMAPReplyListener:
                                     if clean_sender in (mb_email_clean, user_clean):
                                         continue
 
-                                    # 2. Ignore automated system notifications unless they match bounce patterns
+                                    # 2. Ignore emails from other enrolled sending mailboxes
+                                    #    (prevents enrolled senders from being classified/suppressed)
+                                    if clean_sender in enrolled_senders:
+                                        continue
+
+                                    # 3. Ignore automated system notifications unless they match bounce patterns
                                     system_noise = (
                                         "no-reply@", "noreply@", "notifications@", "googlecommunityteam",
                                         "mail-noreply@", "donotreply@", "do-not-reply@", "newsletter@"
@@ -652,13 +747,25 @@ class IMAPReplyListener:
                                         if not is_bounce:
                                             continue
 
+                                    # 4. Message-ID deduplication (Item 4)
+                                    #    Skip if this exact message was already processed
+                                    if raw_message_id:
+                                        with self.db.get_connection() as dedup_conn:
+                                            already_seen = dedup_conn.execute(
+                                                "SELECT id FROM inbox_replies WHERE message_id = ? LIMIT 1",
+                                                (raw_message_id,)
+                                            ).fetchone()
+                                        if already_seen:
+                                            continue
+
                                     proc = self.process_incoming_reply(
                                         sender_email=clean_sender,
                                         subject=subject_raw,
                                         body=body_text,
                                         operator_id=op_id,
                                         in_reply_to=in_reply_to,
-                                        references=references
+                                        references=references,
+                                        message_id=raw_message_id
                                     )
                                     results.append(proc)
                         except Exception as msg_err:

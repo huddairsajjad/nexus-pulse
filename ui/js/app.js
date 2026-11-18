@@ -4776,17 +4776,18 @@ function doPost(e) {
                 </div>
 
                 <div>
-                  <label className="np-label">Industry Niche / Trade Focus</label>
+                  <label className="np-label">Custom Niche / Target Keyword</label>
                   <input
                     type="text"
                     value={huntNiche}
                     onChange={(e) => setHuntNiche(e.target.value)}
-                    placeholder="e.g. Commercial Construction, Sports Wear Manufacturers"
+                    placeholder="Type any keyword or select a preset below →"
                     className="np-input"
                     required
                     disabled={isHunting}
                   />
 
+                  <p className="text-[10px] text-theme-secondary mt-1 mb-1.5">— Quick Presets —</p>
                   <div className="flex flex-wrap gap-1.5 mt-2">
                     {INDUSTRY_PRESETS.map((preset) => (
                       <button

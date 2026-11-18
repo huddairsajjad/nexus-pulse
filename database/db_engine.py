@@ -320,10 +320,15 @@ class DatabaseEngine:
             existing_rep_cols = {col["name"] for col in conn.execute("PRAGMA table_info(inbox_replies)").fetchall()}
             if "operator_id" not in existing_rep_cols:
                 conn.execute("ALTER TABLE inbox_replies ADD COLUMN operator_id TEXT;")
+            # Item 4: Message-ID deduplication column
+            if "message_id" not in existing_rep_cols:
+                conn.execute("ALTER TABLE inbox_replies ADD COLUMN message_id TEXT;")
 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_hot ON inbox_replies(is_hot_lead);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_class ON inbox_replies(classification);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_operator ON inbox_replies(operator_id);")
+            # Unique index on message_id for fast dedup lookups (NULL values are excluded from uniqueness)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_msgid ON inbox_replies(message_id);")
 
             # 8. Autonomous 7-Day Follow-Up Sequences
             conn.execute("""
