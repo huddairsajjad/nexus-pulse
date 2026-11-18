@@ -60,11 +60,14 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"  Security / Cloud notice: {e}")
 
-    # 2. Database Schema Initialization
+    # 2. Database Schema Initialization & Public Webmail Suppression Clean
     try:
         db = get_db_engine()
         um = get_user_manager()
+        purged = db.purge_public_domain_suppressions()
         print(f"  Database Engine : OPERATIONAL ({db.db_path.name})")
+        if any(purged.values()):
+            print(f"  Suppression Fix : Purged public domain wildcard entries ({purged})")
         if um.has_admin():
             print(f"  User Auth Store : READY (Administrator Initialized)")
         else:

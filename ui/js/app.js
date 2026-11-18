@@ -206,7 +206,7 @@ const normalizeLeadStatus = (rawStatus) => {
   if (s === "CLOSED" || s === "CONVERTED" || s === "WON") return "CLOSED";
   if (s === "VERIFIED" || s === "VALIDATED") return "VERIFIED";
   if (s === "SCRAPED" || s === "NEW" || s === "HUNTED" || s === "DISCOVERED") return "SCRAPED";
-  if (s === "SUPPRESSED" || s === "BLACKLISTED" || s === "UNSUBSCRIBED") return "PENDING_APPROVAL";
+  if (s === "SUPPRESSED" || s === "BLACKLISTED" || s === "UNSUBSCRIBED") return "SUPPRESSED";
   return "SCRAPED";
 };
 
@@ -1347,6 +1347,37 @@ function doPost(e) {
     }
   };
 
+  const handleUnblockLead = async (queueId, recipient) => {
+    try {
+      const resp = await fetch(`${API_BASE}/api/outreach/unblock`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ queue_id: queueId })
+      });
+      const data = await resp.json();
+      if (resp.ok && data.success) {
+        setAlertBanner({
+          type: "success",
+          message: `✓ Unblocked: ${recipient || "Lead"} returned to Approval Hold.`
+        });
+        await fetchData();
+      } else {
+        setAlertBanner({
+          type: "danger",
+          message: data.detail || data.message || "Failed to unblock lead."
+        });
+      }
+    } catch (err) {
+      setAlertBanner({
+        type: "danger",
+        message: "Error unblocking lead."
+      });
+    }
+  };
+
   const handleDispatchQueueNow = async (bypassWindow = true, specificQueueId = null) => {
     setIsDispatchingNow(true);
     setPulseState("DISPATCHING");
@@ -1370,11 +1401,13 @@ function doPost(e) {
             type: "danger",
             message: `⚠️ Dispatch Blocked: ${firstErr.message || firstErr.reason || "Unable to dispatch leads."}`
           });
+          setPulseState("RUNNING");
         } else if (data.dispatched_count === 0 && data.scheduled_count === 0) {
           setAlertBanner({
             type: "info",
             message: "No authorized leads currently waiting in queue to be dispatched."
           });
+          setPulseState("RUNNING");
         } else {
           setAlertBanner({
             type: "success",
@@ -1388,6 +1421,7 @@ function doPost(e) {
           type: "danger",
           message: `Dispatch failed: ${errMsg}`
         });
+        setPulseState("RUNNING");
         await fetchData();
       }
     } catch (err) {
@@ -1395,8 +1429,10 @@ function doPost(e) {
         type: "danger",
         message: "Error executing dispatch trigger."
       });
+      setPulseState("RUNNING");
     } finally {
       setIsDispatchingNow(false);
+      setPulseState("RUNNING");
     }
   };
 
@@ -2824,78 +2860,103 @@ function doPost(e) {
                               </div>
 
                               {/* Status Indicators & Warning Badges */}
-                              <div className="flex flex-wrap gap-1 mb-2">
-                                {(lead.bounce_reason || String(lead.status).toUpperCase() === "FAILED") && (
-                                  <span
-                                    className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-red-950 text-red-300 border border-red-800"
-                                    title={lead.bounce_reason || "Dispatch Error"}
-                                  >
-                                    ⚠️ {lead.bounce_reason ? (lead.bounce_reason.length > 25 ? lead.bounce_reason.slice(0, 25) + "..." : lead.bounce_reason) : "Dispatch Failed"}
-                                  </span>
-                                )}
-                                {(String(lead.status).toUpperCase() === "SCHEDULED" || (lead.scheduled_for && !lead.sent_at)) && (
-                                  <span
-                                    className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-blue-950 text-blue-300 border border-blue-800"
-                                    title={`Scheduled for: ${lead.scheduled_for}`}
-                                  >
-                                    🕒 Scheduled
-                                  </span>
-                                )}
-                                {(lead.unsubscribed || String(lead.status).toUpperCase() === "SUPPRESSED") && (
-                                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-800">
-                                    🚫 Suppressed
-                                  </span>
-                                )}
-                              </div>
+                              {(() => {
+                                const isSuppressed = lead.unsubscribed || String(lead.status).toUpperCase() === "SUPPRESSED" || String(lead.status).toUpperCase() === "BLACKLISTED";
+                                return (
+                                  <>
+                                    <div className="flex flex-wrap gap-1 mb-2">
+                                      {(lead.bounce_reason || String(lead.status).toUpperCase() === "FAILED") && !isSuppressed && (
+                                        <span
+                                          className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-red-950 text-red-300 border border-red-800"
+                                          title={lead.bounce_reason || "Dispatch Error"}
+                                        >
+                                          ⚠️ {lead.bounce_reason ? (lead.bounce_reason.length > 25 ? lead.bounce_reason.slice(0, 25) + "..." : lead.bounce_reason) : "Dispatch Failed"}
+                                        </span>
+                                      )}
+                                      {!isSuppressed && (String(lead.status).toUpperCase() === "SCHEDULED" || (lead.scheduled_for && !lead.sent_at)) && (
+                                        <span
+                                          className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-blue-950 text-blue-300 border border-blue-800"
+                                          title={`Scheduled for: ${lead.scheduled_for}`}
+                                        >
+                                          🕒 Scheduled
+                                        </span>
+                                      )}
+                                      {isSuppressed && (
+                                        <span
+                                          className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-amber-950 text-amber-300 border border-amber-800"
+                                          title={lead.bounce_reason || "Suppressed from outreach"}
+                                        >
+                                          🚫 Suppressed
+                                        </span>
+                                      )}
+                                    </div>
 
-                              {/* Tech Stack Chips */}
-                              {lead.tech_stack && lead.tech_stack.length > 0 && (
-                                <div className="flex flex-wrap gap-1 mb-2">
-                                  {lead.tech_stack.slice(0, 3).map((tech, i) => (
-                                    <span key={i} className="text-[9px] font-mono px-1 py-0.2 rounded bg-overlay text-theme-muted">
-                                      {tech}
-                                    </span>
-                                  ))}
-                                </div>
-                              )}
+                                    {/* Tech Stack Chips */}
+                                    {lead.tech_stack && lead.tech_stack.length > 0 && (
+                                      <div className="flex flex-wrap gap-1 mb-2">
+                                        {lead.tech_stack.slice(0, 3).map((tech, i) => (
+                                          <span key={i} className="text-[9px] font-mono px-1 py-0.2 rounded bg-overlay text-theme-muted">
+                                            {tech}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    )}
 
-                              {/* Stage-Specific Actions */}
-                              {stage.key === "PENDING_APPROVAL" && (
-                                <div className="flex items-center gap-1 mt-1">
-                                  <button
-                                    onClick={() => handleOpenApprovalModal(lead)}
-                                    className="btn btn-warning btn-sm flex-1 justify-center"
-                                  >
-                                    Review & Authorize ➔
-                                  </button>
-                                  <button
-                                    onClick={() => handleDeleteQueueItem(lead.id, lead.recipient || lead.primary_email)}
-                                    className="btn btn-danger btn-sm px-2"
-                                    title="Delete Lead"
-                                  >
-                                    🗑️
-                                  </button>
-                                </div>
-                              )}
-
-                              {stage.key === "APPROVED" && (
-                                <div className="flex items-center gap-1 mt-1">
-                                  <button
-                                    onClick={() => handleDispatchQueueNow(true, lead.id)}
-                                    className="btn btn-primary btn-sm flex-1 justify-center"
-                                    title="Force immediate dispatch for this authorized lead"
-                                  >
-                                    🚀 Dispatch Now
-                                  </button>
-                                  <button
-                                    onClick={() => handleDeleteQueueItem(lead.id, lead.recipient || lead.primary_email)}
-                                    className="btn btn-danger btn-sm px-2"
-                                    title="Delete Lead"
-                                  >
-                                    🗑️
-                                  </button>
-                                </div>
-                              )}
+                                    {/* Actions */}
+                                    {isSuppressed ? (
+                                      <div className="flex items-center gap-1 mt-1">
+                                        <button
+                                          onClick={() => handleUnblockLead(lead.id, lead.recipient || lead.primary_email)}
+                                          className="btn btn-warning btn-sm flex-1 justify-center text-[10px]"
+                                          title="Unblock this suppressed lead and return it to Approval Hold"
+                                        >
+                                          🔓 Unblock / Reset
+                                        </button>
+                                        <button
+                                          onClick={() => handleDeleteQueueItem(lead.id, lead.recipient || lead.primary_email)}
+                                          className="btn btn-danger btn-sm px-2 text-[10px]"
+                                          title="Delete Lead"
+                                        >
+                                          🗑️
+                                        </button>
+                                      </div>
+                                    ) : stage.key === "PENDING_APPROVAL" ? (
+                                      <div className="flex items-center gap-1 mt-1">
+                                        <button
+                                          onClick={() => handleOpenApprovalModal(lead)}
+                                          className="btn btn-warning btn-sm flex-1 justify-center"
+                                        >
+                                          Review & Authorize ➔
+                                        </button>
+                                        <button
+                                          onClick={() => handleDeleteQueueItem(lead.id, lead.recipient || lead.primary_email)}
+                                          className="btn btn-danger btn-sm px-2"
+                                          title="Delete Lead"
+                                        >
+                                          🗑️
+                                        </button>
+                                      </div>
+                                    ) : stage.key === "APPROVED" ? (
+                                      <div className="flex items-center gap-1 mt-1">
+                                        <button
+                                          onClick={() => handleDispatchQueueNow(true, lead.id)}
+                                          className="btn btn-primary btn-sm flex-1 justify-center"
+                                          title="Force immediate dispatch for this authorized lead"
+                                        >
+                                          🚀 Dispatch Now
+                                        </button>
+                                        <button
+                                          onClick={() => handleDeleteQueueItem(lead.id, lead.recipient || lead.primary_email)}
+                                          className="btn btn-danger btn-sm px-2"
+                                          title="Delete Lead"
+                                        >
+                                          🗑️
+                                        </button>
+                                      </div>
+                                    ) : null}
+                                  </>
+                                );
+                              })()}
 
                               {stage.key === "HOT_LEAD" && (
                                 <button
@@ -2914,6 +2975,67 @@ function doPost(e) {
                 );
               })}
             </div>
+
+            {/* Suppressed & Excluded Leads Section */}
+            {(() => {
+              const suppressedLeads = kanbanItems.filter(
+                (item) => normalizeLeadStatus(item.status) === "SUPPRESSED" || item.unsubscribed
+              );
+              if (suppressedLeads.length === 0) return null;
+              return (
+                <div className="mt-6 np-card p-4 border-l-4 border-l-[var(--danger)]">
+                  <div className="flex items-center justify-between pb-2 border-b-theme mb-3">
+                    <div className="flex items-center gap-2">
+                      <span className="font-semibold text-xs text-theme-primary flex items-center gap-1.5">
+                        <span>🚫 Suppressed / Excluded Leads</span>
+                        <span className="badge badge-danger text-[10px] font-mono px-1.5 py-0">
+                          {suppressedLeads.length}
+                        </span>
+                      </span>
+                      <span className="text-[11px] text-theme-secondary">
+                        (Excluded from active pipeline & Approval Hold — click Unblock to restore to Approval Hold)
+                      </span>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+                    {suppressedLeads.map((sLead) => (
+                      <div key={sLead.id} className="np-card p-3 space-y-2 bg-overlay border-theme">
+                        <div className="flex items-start justify-between gap-1">
+                          <h4 className="font-semibold text-xs text-theme-primary truncate">
+                            {sLead.company_name}
+                          </h4>
+                          <span className="badge badge-danger text-[9px] font-mono shrink-0">
+                            SUPPRESSED
+                          </span>
+                        </div>
+                        <p className="text-[11px] font-mono text-theme-accent truncate">
+                          {sLead.recipient || sLead.primary_email}
+                        </p>
+                        <p className="text-[10px] text-theme-secondary line-clamp-1" title={sLead.bounce_reason || "Opt-out / Unsubscribe"}>
+                          Reason: {sLead.bounce_reason || "Opt-out / Unsubscribe"}
+                        </p>
+                        <div className="flex items-center gap-1 pt-1">
+                          <button
+                            onClick={() => handleUnblockLead(sLead.id, sLead.recipient || sLead.primary_email)}
+                            className="btn btn-warning btn-sm text-[10px] flex-1 justify-center"
+                            title="Unblock this suppressed lead and return it to Approval Hold"
+                          >
+                            🔓 Unblock / Reset
+                          </button>
+                          <button
+                            onClick={() => handleDeleteQueueItem(sLead.id, sLead.recipient || sLead.primary_email)}
+                            className="btn btn-danger btn-sm text-[10px] px-2"
+                            title="Permanently Delete Lead"
+                          >
+                            🗑️
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
           </div>
         )}
 
@@ -3007,25 +3129,37 @@ function doPost(e) {
                         >
                           🗑️ Delete
                         </button>
-                        {user.role === "admin" && (
+                        {(item.unsubscribed || String(item.status).toUpperCase() === "SUPPRESSED") ? (
                           <button
-                            onClick={() => handleApproveOutreach(item.id, item.subject, item.message_body, item.recipient, item.company_name)}
+                            onClick={() => handleUnblockLead(item.id, item.recipient)}
                             className="btn btn-warning btn-sm"
+                            title="Unblock this lead and return to Approval Hold"
                           >
-                            Authorize
+                            🔓 Unblock / Reset
                           </button>
-                        )}
-                        {user.role === "admin" && (
-                          <button
-                            onClick={async () => {
-                              await handleApproveOutreach(item.id, item.subject, item.message_body, item.recipient, item.company_name);
-                              await handleDispatchQueueNow(true, item.id);
-                            }}
-                            className="btn btn-primary btn-sm"
-                            title="Authorize and dispatch immediately outside business hours"
-                          >
-                            ⚡ Authorize & Send Now
-                          </button>
+                        ) : (
+                          <>
+                            {user.role === "admin" && (
+                              <button
+                                onClick={() => handleApproveOutreach(item.id, item.subject, item.message_body, item.recipient, item.company_name)}
+                                className="btn btn-warning btn-sm"
+                              >
+                                Authorize
+                              </button>
+                            )}
+                            {user.role === "admin" && (
+                              <button
+                                onClick={async () => {
+                                  await handleApproveOutreach(item.id, item.subject, item.message_body, item.recipient, item.company_name);
+                                  await handleDispatchQueueNow(true, item.id);
+                                }}
+                                className="btn btn-primary btn-sm"
+                                title="Authorize and dispatch immediately outside business hours"
+                              >
+                                ⚡ Authorize & Send Now
+                              </button>
+                            )}
+                          </>
                         )}
                       </div>
                     </div>
@@ -4266,9 +4400,10 @@ function doPost(e) {
                   <table className="np-table text-xs">
                     <thead>
                       <tr>
-                        <th>Domain / Wildcard Pattern</th>
+                        <th>Domain / Email Pattern</th>
+                        <th>Type</th>
                         <th>Reason</th>
-                        <th>Created By</th>
+                        <th>Source / Added By</th>
                         <th>Added Date</th>
                         <th className="text-right">Action</th>
                       </tr>
@@ -4277,16 +4412,24 @@ function doPost(e) {
                       {blacklistRules.map((rule) => (
                         <tr key={rule.id}>
                           <td className="font-mono font-bold text-theme-accent">{rule.pattern}</td>
+                          <td>
+                            <span className={`badge text-[9px] font-mono ${rule.entity_type === "email" ? "badge-warning" : "badge-purple"}`}>
+                              {rule.entity_type || "domain"}
+                            </span>
+                          </td>
                           <td className="text-theme-secondary">{rule.reason || "Excluded"}</td>
-                          <td className="font-mono text-theme-muted">{rule.created_by || "admin"}</td>
+                          <td className="font-mono text-theme-muted">
+                            {rule.source === "suppressed_entities" ? "Opt-Out / Bounce" : (rule.created_by || "admin")}
+                          </td>
                           <td className="font-mono text-theme-muted">{rule.created_at ? rule.created_at.split("T")[0] : "—"}</td>
                           <td className="text-right">
                             <button
                               type="button"
                               onClick={() => handleDeleteBlacklistRule(rule.id)}
                               className="btn btn-danger btn-sm"
+                              title="Delete rule and unblock entity"
                             >
-                              Remove
+                              Remove / Unblock
                             </button>
                           </td>
                         </tr>
@@ -4296,6 +4439,73 @@ function doPost(e) {
                 </div>
               )}
             </div>
+
+            {/* Suppressed Pipeline Leads Section */}
+            {(() => {
+              const suppressedLeads = kanbanItems.filter(
+                (item) => normalizeLeadStatus(item.status) === "SUPPRESSED" || item.unsubscribed
+              );
+              return (
+                <div className="np-card p-5 space-y-3">
+                  <div className="flex items-center justify-between pb-2 border-b-theme">
+                    <div>
+                      <h3 className="font-semibold text-sm text-theme-primary flex items-center gap-2">
+                        <span>🚫 Suppressed Pipeline Leads</span>
+                        <span className="badge badge-danger font-mono text-xs">{suppressedLeads.length} Suppressed</span>
+                      </h3>
+                      <p className="text-xs text-theme-secondary mt-0.5">
+                        Leads locked in suppressed state due to opt-outs, bounces, or exclusion rules. Click 'Unblock' to restore to Approval Hold.
+                      </p>
+                    </div>
+                  </div>
+
+                  {suppressedLeads.length === 0 ? (
+                    <div className="p-6 text-center">
+                      <span className="text-2xl mb-1 block">✓</span>
+                      <h4 className="font-semibold text-xs text-theme-primary">No Suppressed Leads</h4>
+                      <p className="text-[11px] text-theme-secondary mt-0.5">All contacts in your pipeline are eligible for review or dispatch.</p>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-3">
+                      {suppressedLeads.map((sLead) => (
+                        <div key={sLead.id} className="np-card p-3 space-y-2 bg-overlay border-theme">
+                          <div className="flex items-start justify-between gap-1">
+                            <h4 className="font-semibold text-xs text-theme-primary truncate">
+                              {sLead.company_name}
+                            </h4>
+                            <span className="badge badge-danger text-[9px] font-mono shrink-0">
+                              SUPPRESSED
+                            </span>
+                          </div>
+                          <p className="text-[11px] font-mono text-theme-accent truncate">
+                            {sLead.recipient || sLead.primary_email}
+                          </p>
+                          <p className="text-[10px] text-theme-secondary line-clamp-1" title={sLead.bounce_reason || "Opt-out / Unsubscribe"}>
+                            Reason: {sLead.bounce_reason || "Opt-out / Unsubscribe"}
+                          </p>
+                          <div className="flex items-center gap-1 pt-1">
+                            <button
+                              onClick={() => handleUnblockLead(sLead.id, sLead.recipient || sLead.primary_email)}
+                              className="btn btn-warning btn-sm text-[10px] flex-1 justify-center"
+                              title="Unblock this suppressed lead and return it to Approval Hold"
+                            >
+                              🔓 Unblock / Reset to Approval
+                            </button>
+                            <button
+                              onClick={() => handleDeleteQueueItem(sLead.id, sLead.recipient || sLead.primary_email)}
+                              className="btn btn-danger btn-sm text-[10px] px-2"
+                              title="Permanently Delete Lead"
+                            >
+                              🗑️
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </div>
         )}
 

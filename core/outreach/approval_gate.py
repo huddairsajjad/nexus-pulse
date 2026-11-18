@@ -20,7 +20,7 @@ from database.db_engine import get_db_engine
 from .scheduler import get_scheduler
 from .inbox_rotator import get_inbox_rotator
 from .template_manager import get_template_manager
-from .blacklist_manager import get_blacklist_manager
+from .blacklist_manager import get_blacklist_manager, is_public_email_domain, PUBLIC_EMAIL_DOMAINS
 from core.hygiene.lead_validator import LeadValidationFilter
 
 logger = logging.getLogger("nexus.approval_gate")
@@ -172,10 +172,17 @@ class HumanApprovalGate:
             }
 
         with self.db.get_connection() as conn:
-            suppressed = conn.execute("""
-                SELECT reason FROM suppressed_entities
-                WHERE lower(entity) = lower(?) OR lower(entity) = lower(?)
-            """, (recipient.lower(), recipient.split("@")[-1].lower() if "@" in recipient else recipient.lower())).fetchone()
+            recip_dom = recipient.split("@")[-1].lower() if "@" in recipient else recipient.lower()
+            if is_public_email_domain(recip_dom):
+                suppressed = conn.execute("""
+                    SELECT reason FROM suppressed_entities
+                    WHERE lower(entity) = lower(?)
+                """, (recipient.lower(),)).fetchone()
+            else:
+                suppressed = conn.execute("""
+                    SELECT reason FROM suppressed_entities
+                    WHERE lower(entity) = lower(?) OR lower(entity) = lower(?)
+                """, (recipient.lower(), recip_dom)).fetchone()
             if suppressed:
                 return {
                     "queue_id": None,
@@ -394,13 +401,14 @@ class HumanApprovalGate:
 
             recip_clean = row["recipient"].strip().lower()
             recip_dom = recip_clean.split("@")[-1] if "@" in recip_clean else recip_clean
+            is_pub = is_public_email_domain(recip_dom)
 
             # 1. Compliance & Unsubscribe Checks (MongoDB + SQLite + Blacklist)
             is_unsub = False
             try:
                 from database.mongo_engine import get_mongo_engine
                 mongo = get_mongo_engine()
-                if mongo.is_unsubscribed(recip_clean) or mongo.is_unsubscribed(recip_dom):
+                if mongo.is_unsubscribed(recip_clean) or (not is_pub and mongo.is_unsubscribed(recip_dom)):
                     is_unsub = True
             except Exception:
                 pass
@@ -410,16 +418,22 @@ class HumanApprovalGate:
 
             is_bl, bl_reason = self.blacklist_manager.is_domain_blacklisted(recip_clean)
 
-            suppressed_entry = conn.execute("""
-                SELECT reason FROM suppressed_entities
-                WHERE lower(entity) = ? OR lower(entity) = ?
-            """, (recip_clean, recip_dom)).fetchone()
+            if is_pub:
+                suppressed_entry = conn.execute("""
+                    SELECT reason FROM suppressed_entities
+                    WHERE lower(entity) = ?
+                """, (recip_clean,)).fetchone()
+            else:
+                suppressed_entry = conn.execute("""
+                    SELECT reason FROM suppressed_entities
+                    WHERE lower(entity) = ? OR lower(entity) = ?
+                """, (recip_clean, recip_dom)).fetchone()
 
             if is_unsub or is_bl or suppressed_entry:
                 sup_reason = "UNSUBSCRIBE" if is_unsub else (bl_reason or suppressed_entry["reason"])
                 conn.execute("""
                     UPDATE outreach_queue
-                    SET status = 'SUPPRESSED', bounce_reason = ?
+                    SET status = 'SUPPRESSED', scheduled_for = NULL, bounce_reason = ?
                     WHERE id = ?
                 """, (f"Suppressed: {sup_reason}", queue_id))
                 conn.commit()
@@ -661,7 +675,7 @@ class HumanApprovalGate:
             now_iso = datetime.now(timezone.utc).isoformat()
             conn.execute("""
                 UPDATE outreach_queue
-                SET status = 'SENT', sent_at = CURRENT_TIMESTAMP, mailbox_used = ?, message_body = ?, bounce_reason = NULL, message_id = ?
+                SET status = 'SENT', sent_at = CURRENT_TIMESTAMP, dispatched_at = CURRENT_TIMESTAMP, mailbox_used = ?, message_body = ?, bounce_reason = NULL, message_id = ?
                 WHERE id = ?
             """, (sender_email, msg_body, msg_id_val, queue_id))
 
@@ -842,6 +856,60 @@ class HumanApprovalGate:
                     ORDER BY created_at DESC
                 """).fetchall()
             return [dict(r) for r in rows]
+
+    def unblock_lead(self, queue_id: str, operator_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Unblocks a suppressed lead and restores it to PENDING_APPROVAL.
+        Clears associated suppression records and blacklist rules for the exact recipient.
+        """
+        with self.db.get_connection() as conn:
+            row = conn.execute("SELECT * FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
+            if not row:
+                raise ValueError(f"Queue item '{queue_id}' not found.")
+            row = dict(row)
+
+            if operator_id and row.get("operator_id") and row.get("operator_id") != operator_id:
+                raise PermissionError("Access denied: You cannot unblock leads for another tenant.")
+
+            recipient = row["recipient"].strip().lower()
+
+            # 1. Reset outreach_queue
+            conn.execute("""
+                UPDATE outreach_queue
+                SET status = 'PENDING_APPROVAL', unsubscribed = 0, bounce_reason = NULL, scheduled_for = NULL
+                WHERE id = ?
+            """, (queue_id,))
+
+            # 2. Clear exact email suppression in suppressed_entities and dnc_blacklist
+            conn.execute("DELETE FROM suppressed_entities WHERE lower(entity) = ?", (recipient,))
+            conn.execute("DELETE FROM dnc_blacklist WHERE lower(entity) = ?", (recipient,))
+
+            # 3. Clear exact pattern from blacklist_rules
+            conn.execute("DELETE FROM blacklist_rules WHERE lower(pattern) = ?", (recipient,))
+
+            # 4. Clear unsubscription in vault_leads
+            conn.execute("UPDATE vault_leads SET unsubscribed = 0 WHERE lower(primary_email) = ?", (recipient,))
+            conn.commit()
+
+        # 5. Clear unsubscription in MongoDB if connected
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            if mongo and mongo.db is not None:
+                mongo.db.leads.update_many(
+                    {"primary_email": recipient},
+                    {"$set": {"unsubscribed": False, "unsubscribed_at": None}}
+                )
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "message": f"Lead '{recipient}' unblocked and returned to Approval Hold.",
+            "queue_id": queue_id,
+            "status": "PENDING_APPROVAL",
+            "recipient": recipient
+        }
 
 
 _global_approval_gate = None

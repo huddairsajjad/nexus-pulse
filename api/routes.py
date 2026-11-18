@@ -40,7 +40,7 @@ from core.outreach.dispatcher_worker import get_dispatcher_worker
 from core.outreach.inbox_rotator import get_inbox_rotator
 from core.outreach.reply_listener import get_reply_listener
 from core.outreach.template_manager import get_template_manager
-from core.outreach.blacklist_manager import get_blacklist_manager
+from core.outreach.blacklist_manager import get_blacklist_manager, is_public_email_domain, PUBLIC_EMAIL_DOMAINS
 from core.agents.webform_agent import BackupWebFormAgent
 from core.agents.followup_engine import get_followup_engine
 
@@ -268,6 +268,10 @@ class ModifyQuotaRequest(BaseModel):
 class OperatorBillingRequest(BaseModel):
     base_price: float
     duration_days: int
+
+
+class UnblockLeadRequest(BaseModel):
+    queue_id: str
     notes: Optional[str] = None
 
 
@@ -573,12 +577,12 @@ def add_blacklist_rule(req: BlacklistCreateRequest, admin_user: Dict[str, Any] =
 
 
 @router.delete("/blacklist/{rule_id}")
-def delete_blacklist_rule(rule_id: int, admin_user: Dict[str, Any] = Depends(require_admin)):
-    """Removes a blacklist rule."""
+def delete_blacklist_rule(rule_id: str, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """Removes a blacklist rule or suppression record."""
     mgr = get_blacklist_manager()
     removed = mgr.remove_rule(rule_id)
     if not removed:
-        raise HTTPException(status_code=404, detail="Rule not found.")
+        raise HTTPException(status_code=404, detail="Rule or suppression record not found.")
     return {"success": True, "deleted_rule_id": rule_id}
 
 
@@ -938,6 +942,20 @@ def delete_outreach_item(queue_id: str, current_user: Dict[str, Any] = Depends(g
     target_op = current_user["id"] if current_user.get("role") == "operator" else None
     try:
         return gate.delete_queue_item(queue_id, operator_id=target_op)
+    except (ValueError, PermissionError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/outreach/unblock")
+def unblock_outreach_item(req: UnblockLeadRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """
+    Unblocks a suppressed lead, clearing suppression/blacklist records
+    and restoring it to PENDING_APPROVAL in the Human Approval Gate.
+    """
+    gate = get_approval_gate()
+    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    try:
+        return gate.unblock_lead(req.queue_id, operator_id=target_op)
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1426,7 +1444,13 @@ def get_deliverability_analytics(current_user: Dict[str, Any] = Depends(get_curr
         q_filter = "WHERE operator_id = ?" if op_id else ""
         q_params = [op_id] if op_id else []
 
-        total_sent = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status IN ('SENT', 'HOT_LEAD', 'REPLIED')", q_params).fetchone()[0]
+        total_sent = conn.execute(f"""
+            SELECT count(*) FROM outreach_queue
+            {q_filter} {'AND' if q_filter else 'WHERE'} (
+                dispatched_at IS NOT NULL
+                OR lower(status) IN ('sent', 'dispatched', 'replied', 'hot_lead', 'suppressed', 'blacklisted')
+            )
+        """, q_params).fetchone()[0]
         total_opened = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} opened_at IS NOT NULL", q_params).fetchone()[0]
         total_bounced = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} (status = 'BOUNCED' OR bounced_at IS NOT NULL)", q_params).fetchone()[0]
         
@@ -1491,37 +1515,29 @@ def handle_unsubscribe_link(token: Optional[str] = Query(None), email: Optional[
 
     if clean_email:
         listener = get_reply_listener()
-        domain_part = clean_email.split("@")[-1] if "@" in clean_email else clean_email
+        domain_part = clean_email.split("@")[-1] if "@" in clean_email else ""
+        is_pub = is_public_email_domain(domain_part)
+
         listener.suppress_entity(clean_email, reason="UNSUBSCRIBE")
-        listener.suppress_entity(domain_part, reason="UNSUBSCRIBE")
+        if domain_part and not is_pub:
+            listener.suppress_entity(domain_part, reason="UNSUBSCRIBE")
 
         # Sync unsubscription status to MongoDB
         try:
             from database.mongo_engine import get_mongo_engine
             mongo = get_mongo_engine()
             mongo.set_unsubscribed(clean_email)
-            if domain_part:
+            if domain_part and not is_pub:
                 mongo.set_unsubscribed(domain_part)
         except Exception as mex:
             logger.warning(f"[UNSUBSCRIBE] MongoDB sync error: {mex}")
 
         # Add to blacklist_rules for persistent cross-module rejection
         try:
-            from core.outreach.blacklist_manager import get_blacklist_manager
             bl_mgr = get_blacklist_manager()
             bl_mgr.add_rule(clean_email, entity_type="email", reason="Unsubscribed via opt-out link", created_by="UNSUBSCRIBE_HOOK")
-            if domain_part:
+            if domain_part and not is_pub:
                 bl_mgr.add_rule(domain_part, entity_type="domain", reason="Domain opt-out", created_by="UNSUBSCRIBE_HOOK")
-        except Exception as blex:
-            logger.warning(f"[UNSUBSCRIBE] Blacklist rule error: {blex}")
-
-        # Add to blacklist_rules for persistent cross-module rejection
-        try:
-            from core.outreach.blacklist_manager import get_blacklist_manager
-            bl_mgr = get_blacklist_manager()
-            bl_mgr.add_rule(clean, entity_type="email", reason="Unsubscribed via POST API", created_by="UNSUBSCRIBE_HOOK")
-            if domain:
-                bl_mgr.add_rule(domain, entity_type="domain", reason="Domain opt-out", created_by="UNSUBSCRIBE_HOOK")
         except Exception as blex:
             logger.warning(f"[UNSUBSCRIBE] Blacklist rule error: {blex}")
 
@@ -1529,16 +1545,28 @@ def handle_unsubscribe_link(token: Optional[str] = Query(None), email: Optional[
         try:
             db = get_db_engine()
             with db.get_connection() as conn:
-                conn.execute("""
-                    UPDATE outreach_queue
-                    SET unsubscribed = 1, status = 'SUPPRESSED', bounce_reason = 'UNSUBSCRIBED'
-                    WHERE lower(recipient) = ? OR lower(recipient) LIKE ?
-                """, (clean_email, f"%@{domain_part}"))
-                conn.execute("""
-                    UPDATE vault_leads
-                    SET unsubscribed = 1
-                    WHERE lower(primary_email) = ? OR lower(domain) = ?
-                """, (clean_email, domain_part))
+                if is_pub:
+                    conn.execute("""
+                        UPDATE outreach_queue
+                        SET unsubscribed = 1, status = 'SUPPRESSED', scheduled_for = NULL, bounce_reason = 'Suppressed: UNSUBSCRIBE'
+                        WHERE lower(recipient) = ?
+                    """, (clean_email,))
+                    conn.execute("""
+                        UPDATE vault_leads
+                        SET unsubscribed = 1
+                        WHERE lower(primary_email) = ?
+                    """, (clean_email,))
+                else:
+                    conn.execute("""
+                        UPDATE outreach_queue
+                        SET unsubscribed = 1, status = 'SUPPRESSED', scheduled_for = NULL, bounce_reason = 'Suppressed: UNSUBSCRIBE'
+                        WHERE lower(recipient) = ? OR lower(recipient) LIKE ?
+                    """, (clean_email, f"%@{domain_part}"))
+                    conn.execute("""
+                        UPDATE vault_leads
+                        SET unsubscribed = 1
+                        WHERE lower(primary_email) = ? OR lower(domain) = ?
+                    """, (clean_email, domain_part))
                 conn.commit()
         except Exception as sqex:
             logger.warning(f"[UNSUBSCRIBE] SQLite sync error: {sqex}")
@@ -1557,7 +1585,7 @@ def handle_unsubscribe_link(token: Optional[str] = Query(None), email: Optional[
     <div class="card">
       <h1>✓ Opt-Out Confirmed</h1>
       <p>The entity <strong>{clean_email or 'specified recipient'}</strong> has been globally suppressed.</p>
-      <p>All future automated outreach and data aggregation have been permanently disabled for this domain in accordance with CAN-SPAM and GDPR guidelines.</p>
+      <p>All future automated outreach and data aggregation have been permanently disabled in accordance with CAN-SPAM and GDPR guidelines.</p>
       <div class="badge">Suppressed from Outreach Engine</div>
     </div>
     </body></html>
@@ -1570,37 +1598,63 @@ def handle_unsubscribe_post(req: UnsubscribeRequest):
     """API endpoint for opt-out suppression."""
     listener = get_reply_listener()
     clean = req.email.strip().lower()
-    domain = clean.split("@")[-1] if "@" in clean else clean
+    domain = clean.split("@")[-1] if "@" in clean else ""
+    is_pub = is_public_email_domain(domain)
+
     listener.suppress_entity(clean, reason="UNSUBSCRIBE")
-    listener.suppress_entity(domain, reason="UNSUBSCRIBE")
+    if domain and not is_pub:
+        listener.suppress_entity(domain, reason="UNSUBSCRIBE")
 
     # Sync unsubscription status to MongoDB
     try:
         from database.mongo_engine import get_mongo_engine
         mongo = get_mongo_engine()
         mongo.set_unsubscribed(clean)
-        if domain:
+        if domain and not is_pub:
             mongo.set_unsubscribed(domain)
     except Exception as mex:
         logger.warning(f"[UNSUBSCRIBE] MongoDB sync error: {mex}")
+
+    # Add to blacklist_rules for persistent cross-module rejection
+    try:
+        bl_mgr = get_blacklist_manager()
+        bl_mgr.add_rule(clean, entity_type="email", reason="Unsubscribed via POST API", created_by="UNSUBSCRIBE_HOOK")
+        if domain and not is_pub:
+            bl_mgr.add_rule(domain, entity_type="domain", reason="Domain opt-out", created_by="UNSUBSCRIBE_HOOK")
+    except Exception as blex:
+        logger.warning(f"[UNSUBSCRIBE] Blacklist rule error: {blex}")
 
     # Update SQLite vault_leads and outreach_queue
     try:
         db = get_db_engine()
         with db.get_connection() as conn:
-            conn.execute("""
-                UPDATE outreach_queue
-                SET unsubscribed = 1, status = 'SUPPRESSED', bounce_reason = 'UNSUBSCRIBED'
-                WHERE lower(recipient) = ? OR lower(recipient) LIKE ?
-            """, (clean, f"%@{domain}"))
-            conn.execute("""
-                UPDATE vault_leads
-                SET unsubscribed = 1
-                WHERE lower(primary_email) = ? OR lower(domain) = ?
-            """, (clean, domain))
+            if is_pub:
+                conn.execute("""
+                    UPDATE outreach_queue
+                    SET unsubscribed = 1, status = 'SUPPRESSED', scheduled_for = NULL, bounce_reason = 'Suppressed: UNSUBSCRIBE'
+                    WHERE lower(recipient) = ?
+                """, (clean,))
+                conn.execute("""
+                    UPDATE vault_leads
+                    SET unsubscribed = 1
+                    WHERE lower(primary_email) = ?
+                """, (clean,))
+            else:
+                conn.execute("""
+                    UPDATE outreach_queue
+                    SET unsubscribed = 1, status = 'SUPPRESSED', scheduled_for = NULL, bounce_reason = 'Suppressed: UNSUBSCRIBE'
+                    WHERE lower(recipient) = ? OR lower(recipient) LIKE ?
+                """, (clean, f"%@{domain}"))
+                conn.execute("""
+                    UPDATE vault_leads
+                    SET unsubscribed = 1
+                    WHERE lower(primary_email) = ? OR lower(domain) = ?
+                """, (clean, domain))
             conn.commit()
     except Exception as sqex:
         logger.warning(f"[UNSUBSCRIBE] SQLite sync error: {sqex}")
+
+    return {"success": True, "suppressed_entity": clean, "unsubscribed": True}
 
     return {"success": True, "suppressed_entity": clean, "unsubscribed": True}
 

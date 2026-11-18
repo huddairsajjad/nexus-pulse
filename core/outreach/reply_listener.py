@@ -14,7 +14,7 @@ from email.utils import parseaddr
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 from database.db_engine import get_db_engine
-from .blacklist_manager import get_blacklist_manager
+from .blacklist_manager import get_blacklist_manager, is_public_email_domain, PUBLIC_EMAIL_DOMAINS
 
 # High-intent positive signals
 HOT_LEAD_PATTERNS = [
@@ -131,25 +131,46 @@ class IMAPReplyListener:
 
     def is_suppressed(self, email_or_domain: str) -> bool:
         """Checks if entity exists in global suppression table or DNC list."""
+        if not email_or_domain:
+            return False
         clean = email_or_domain.strip().lower()
         domain = clean.split("@")[-1] if "@" in clean else clean
+
+        # Never treat root public email providers as suppressed
+        if "@" not in clean and clean in PUBLIC_EMAIL_DOMAINS:
+            return False
 
         # Also check blacklist patterns
         is_bl, _ = self.blacklist_mgr.is_domain_blacklisted(clean)
         if is_bl:
             return True
 
-        with self.db.get_connection() as conn:
-            row = conn.execute("""
-                SELECT id FROM suppressed_entities WHERE lower(entity) = ? OR lower(entity) = ?
-            """, (clean, domain)).fetchone()
-            if row:
-                return True
+        is_pub = is_public_email_domain(domain)
 
-            dnc_row = conn.execute("""
-                SELECT id FROM dnc_blacklist WHERE lower(entity) = ? OR lower(entity) = ?
-            """, (clean, domain)).fetchone()
-            return dnc_row is not None
+        with self.db.get_connection() as conn:
+            if is_pub:
+                # For public webmail (e.g. gmail.com), ONLY check exact email
+                row = conn.execute("""
+                    SELECT id FROM suppressed_entities WHERE lower(entity) = ?
+                """, (clean,)).fetchone()
+                if row:
+                    return True
+
+                dnc_row = conn.execute("""
+                    SELECT id FROM dnc_blacklist WHERE lower(entity) = ?
+                """, (clean,)).fetchone()
+                return dnc_row is not None
+            else:
+                row = conn.execute("""
+                    SELECT id FROM suppressed_entities WHERE lower(entity) = ? OR lower(entity) = ?
+                """, (clean, domain)).fetchone()
+                if row:
+                    return True
+
+                dnc_row = conn.execute("""
+                    SELECT id FROM dnc_blacklist WHERE lower(entity) = ? OR lower(entity) = ?
+                """, (clean, domain)).fetchone()
+                return dnc_row is not None
 
     def is_blacklisted(self, email_or_domain: str) -> bool:
         """Alias for is_suppressed to check blacklisted / suppressed recipients."""
@@ -163,6 +184,13 @@ class IMAPReplyListener:
         reason: str,
         operator_id: Optional[str]
     ) -> None:
+        # Never store or suppress root public email provider domains (e.g. gmail.com)
+        if "@" not in clean and clean in PUBLIC_EMAIL_DOMAINS:
+            return
+
+        domain = clean.split("@")[-1] if "@" in clean else clean
+        is_pub = is_public_email_domain(domain)
+
         # 1. Insert into suppressed_entities
         conn.execute("""
             INSERT OR IGNORE INTO suppressed_entities (entity, entity_type, reason, operator_id)
@@ -182,20 +210,35 @@ class IMAPReplyListener:
             WHERE normalized_key = ?
         """, (clean,))
 
-        # 4. Terminate followup sequences
-        conn.execute("""
-            UPDATE followup_sequences
-            SET status = 'TERMINATED'
-            WHERE lower(recipient_email) = ? OR lower(recipient_email) LIKE ?
-        """, (clean, f"%@{clean}"))
+        # 4. Terminate followup sequences (exact for public domains, wildcard for custom corporate domains)
+        if is_pub or "@" in clean:
+            conn.execute("""
+                UPDATE followup_sequences
+                SET status = 'TERMINATED'
+                WHERE lower(recipient_email) = ?
+            """, (clean,))
+        else:
+            conn.execute("""
+                UPDATE followup_sequences
+                SET status = 'TERMINATED'
+                WHERE lower(recipient_email) = ? OR lower(recipient_email) LIKE ?
+            """, (clean, f"%@{clean}"))
 
-        # 5. Suppress pending items in outreach queue
-        conn.execute("""
-            UPDATE outreach_queue
-            SET status = 'SUPPRESSED'
-            WHERE (lower(recipient) = ? OR lower(recipient) LIKE ?)
-              AND status IN ('PENDING_APPROVAL', 'APPROVED', 'SCHEDULED')
-        """, (clean, f"%@{clean}"))
+        # 5. Suppress pending items in outreach queue and strip scheduled_for
+        if is_pub or "@" in clean:
+            conn.execute("""
+                UPDATE outreach_queue
+                SET status = 'SUPPRESSED', scheduled_for = NULL, bounce_reason = ?
+                WHERE lower(recipient) = ?
+                  AND status IN ('PENDING_APPROVAL', 'APPROVED', 'SCHEDULED')
+            """, (f"Suppressed: {reason}", clean))
+        else:
+            conn.execute("""
+                UPDATE outreach_queue
+                SET status = 'SUPPRESSED', scheduled_for = NULL, bounce_reason = ?
+                WHERE (lower(recipient) = ? OR lower(recipient) LIKE ?)
+                  AND status IN ('PENDING_APPROVAL', 'APPROVED', 'SCHEDULED')
+            """, (f"Suppressed: {reason}", clean, f"%@{clean}"))
 
     def suppress_entity(
         self,
@@ -207,8 +250,14 @@ class IMAPReplyListener:
         """
         Adds entity (email or domain) to Global Suppressed Domains/Emails table.
         Terminates pending outreach and sequences.
+        Guards against suppressing root public webmail domains.
         """
+        if not entity:
+            return
         clean = entity.strip().lower()
+        if "@" not in clean and clean in PUBLIC_EMAIL_DOMAINS:
+            return
+
         entity_type = "email" if "@" in clean else "domain"
 
         if conn is not None:
@@ -319,29 +368,33 @@ class IMAPReplyListener:
                 ]
                 for br in bounced_recipients:
                     self.suppress_entity(br, reason="BOUNCE", operator_id=operator_id, conn=conn)
-                    br_dom = br.split("@")[-1]
-                    self.suppress_entity(br_dom, reason="BOUNCE", operator_id=operator_id, conn=conn)
+                    br_dom = br.split("@")[-1] if "@" in br else ""
+                    if br_dom and not is_public_email_domain(br_dom):
+                        self.suppress_entity(br_dom, reason="BOUNCE", operator_id=operator_id, conn=conn)
                     conn.execute("""
                         UPDATE outreach_queue
                         SET status = 'BOUNCED',
+                            scheduled_for = NULL,
                             bounced_at = CURRENT_TIMESTAMP,
                             bounce_reason = ?
                         WHERE lower(recipient) = ?
                     """, (subject[:100], br))
 
                 self.suppress_entity(clean_sender, reason="BOUNCE", operator_id=operator_id, conn=conn)
-                self.suppress_entity(domain_part, reason="BOUNCE", operator_id=operator_id, conn=conn)
+                if domain_part and not is_public_email_domain(domain_part):
+                    self.suppress_entity(domain_part, reason="BOUNCE", operator_id=operator_id, conn=conn)
 
                 if matching_qid:
                     conn.execute("""
                         UPDATE outreach_queue
-                        SET status = 'BOUNCED', bounced_at = CURRENT_TIMESTAMP, bounce_reason = ?
+                        SET status = 'BOUNCED', scheduled_for = NULL, bounced_at = CURRENT_TIMESTAMP, bounce_reason = ?
                         WHERE id = ?
                     """, (subject[:100], matching_qid))
 
                 conn.execute("""
                     UPDATE outreach_queue
                     SET status = 'BOUNCED',
+                        scheduled_for = NULL,
                         bounced_at = CURRENT_TIMESTAMP,
                         bounce_reason = ?
                     WHERE lower(recipient) = ?
@@ -350,7 +403,8 @@ class IMAPReplyListener:
             # Case 2: UNSUBSCRIBE / OPT-OUT
             elif classification == "UNSUBSCRIBE":
                 self.suppress_entity(clean_sender, reason="UNSUBSCRIBE", operator_id=operator_id, conn=conn)
-                self.suppress_entity(domain_part, reason="UNSUBSCRIBE", operator_id=operator_id, conn=conn)
+                if domain_part and not is_public_email_domain(domain_part):
+                    self.suppress_entity(domain_part, reason="UNSUBSCRIBE", operator_id=operator_id, conn=conn)
 
                 try:
                     existing_bl = conn.execute("SELECT id FROM blacklist_rules WHERE lower(pattern) = ?", (clean_sender,)).fetchone()
@@ -365,13 +419,13 @@ class IMAPReplyListener:
                 if matching_qid:
                     conn.execute("""
                         UPDATE outreach_queue
-                        SET status = 'SUPPRESSED'
+                        SET status = 'SUPPRESSED', scheduled_for = NULL, bounce_reason = 'Suppressed: UNSUBSCRIBE'
                         WHERE id = ?
                     """, (matching_qid,))
 
                 conn.execute("""
                     UPDATE outreach_queue
-                    SET status = 'SUPPRESSED'
+                    SET status = 'SUPPRESSED', scheduled_for = NULL, bounce_reason = 'Suppressed: UNSUBSCRIBE'
                     WHERE lower(recipient) = ?
                 """, (clean_sender,))
 

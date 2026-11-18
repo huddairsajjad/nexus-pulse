@@ -204,6 +204,80 @@ class TestTargetedFixes(unittest.TestCase):
             conn.execute("DELETE FROM blacklist_rules WHERE lower(pattern) = 'optout@example.co.uk'")
             conn.commit()
 
+    def test_public_email_provider_domain_wildcard_protection(self):
+        """Verifies @gmail.com and other public webmail domains are NEVER blocked at the root domain level."""
+        from core.outreach.blacklist_manager import is_public_email_domain
+
+        self.assertTrue(is_public_email_domain("user@gmail.com"))
+        self.assertTrue(is_public_email_domain("gmail.com"))
+        self.assertTrue(is_public_email_domain("user@yahoo.com"))
+        self.assertFalse(is_public_email_domain("commercial-builders.co.uk"))
+
+        # 1. Attempting to add root gmail.com as a domain blacklist rule must be rejected
+        with self.assertRaises(ValueError):
+            self.bl_mgr.add_rule("gmail.com", entity_type="domain", reason="Test rejection")
+
+        # 2. Suppressing user1@gmail.com should only suppress user1, NOT user2@gmail.com
+        test_email_1 = "optout_user1@gmail.com"
+        test_email_2 = "active_prospect@gmail.com"
+
+        self.listener.suppress_entity(test_email_1, reason="UNSUBSCRIBE")
+
+        # user1 is suppressed
+        self.assertTrue(self.listener.is_suppressed(test_email_1))
+
+        # user2 on gmail.com is NOT suppressed
+        self.assertFalse(self.listener.is_suppressed(test_email_2))
+
+        # Root domain gmail.com is NOT suppressed
+        self.assertFalse(self.listener.is_suppressed("gmail.com"))
+
+        # user2 is NOT blacklisted
+        is_bl_2, _ = self.bl_mgr.is_domain_blacklisted(test_email_2)
+        self.assertFalse(is_bl_2)
+
+        # Cleanup
+        with self.db.get_connection() as conn:
+            conn.execute("DELETE FROM suppressed_entities WHERE lower(entity) = ?", (test_email_1,))
+            conn.commit()
+
+    def test_unblock_lead_restores_to_approval_hold(self):
+        """Verifies unblocking a suppressed lead restores it to PENDING_APPROVAL and clears suppression."""
+        q_id = "q_test_unblock_1"
+        recip = "suppressed_lead@construction-corp.com"
+
+        with self.db.get_connection() as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO outreach_queue (
+                    id, recipient, company_name, subject, message_body,
+                    status, target_country, operator_id, bounce_reason, unsubscribed
+                ) VALUES (
+                    ?, ?, 'Corp Co', 'Tender', 'Body',
+                    'SUPPRESSED', 'United Kingdom', 'op_test', 'Suppressed: UNSUBSCRIBE', 1
+                )
+            """, (q_id, recip))
+            conn.execute("INSERT OR IGNORE INTO suppressed_entities (entity, entity_type, reason) VALUES (?, 'email', 'UNSUBSCRIBE')", (recip,))
+            conn.commit()
+
+        # Execute unblock
+        res = self.gate.unblock_lead(q_id)
+        self.assertTrue(res["success"])
+        self.assertEqual(res["status"], "PENDING_APPROVAL")
+
+        with self.db.get_connection() as conn:
+            row = conn.execute("SELECT status, bounce_reason, unsubscribed FROM outreach_queue WHERE id = ?", (q_id,)).fetchone()
+            self.assertEqual(row["status"], "PENDING_APPROVAL")
+            self.assertIsNone(row["bounce_reason"])
+            self.assertEqual(row["unsubscribed"], 0)
+
+            # Verified removed from suppressed_entities
+            sup_row = conn.execute("SELECT id FROM suppressed_entities WHERE lower(entity) = ?", (recip,)).fetchone()
+            self.assertIsNone(sup_row)
+
+            # Cleanup
+            conn.execute("DELETE FROM outreach_queue WHERE id = ?", (q_id,))
+            conn.commit()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -242,7 +242,8 @@ class DatabaseEngine:
                 ("message_id", "TEXT"),
                 ("unsubscribed", "INTEGER NOT NULL DEFAULT 0"),
                 ("replied_at", "TIMESTAMP"),
-                ("reply_snippet", "TEXT")
+                ("reply_snippet", "TEXT"),
+                ("dispatched_at", "TIMESTAMP")
             ]
             for col_name, col_def in oq_migrations:
                 if col_name not in existing_oq_cols:
@@ -461,6 +462,80 @@ class DatabaseEngine:
             """)
 
             conn.commit()
+
+        # Run startup/migration cleanup for public email provider domain wildcards
+        self.purge_public_domain_suppressions()
+
+    def purge_public_domain_suppressions(self) -> Dict[str, int]:
+        """
+        Startup & migration cleanup routine:
+        Purges any domain-level suppression, blacklist, or wildcard entries
+        for public webmail providers (gmail.com, yahoo.com, outlook.com, etc.).
+        Ensures exact recipient emails are preserved while unblocking root domains.
+        """
+        public_domains = [
+            "gmail.com", "googlemail.com", "yahoo.com", "ymail.com",
+            "outlook.com", "hotmail.com", "live.com", "msn.com",
+            "icloud.com", "me.com", "mac.com", "aol.com", "protonmail.com",
+            "proton.me", "zoho.com", "yandex.com", "mail.com", "gmx.com", "gmx.de"
+        ]
+        counts = {
+            "suppressed_entities_purged": 0,
+            "blacklist_rules_purged": 0,
+            "vault_leads_restored": 0,
+            "outreach_queue_restored": 0
+        }
+
+        try:
+            with self.get_connection() as conn:
+                for pub in public_domains:
+                    # 1. Purge root public domains from suppressed_entities
+                    r1 = conn.execute(
+                        "DELETE FROM suppressed_entities WHERE lower(entity) = ?", (pub,)
+                    ).rowcount
+                    counts["suppressed_entities_purged"] += r1
+
+                    # 2. Purge root public domain blacklist rules (preserve specific email rules)
+                    r2 = conn.execute(
+                        "DELETE FROM blacklist_rules WHERE lower(pattern) = ? AND (entity_type = 'domain' OR pattern NOT LIKE '%@%')",
+                        (pub,)
+                    ).rowcount
+                    counts["blacklist_rules_purged"] += r2
+
+                    # 3. Restore vault leads mistakenly marked unsubscribed purely because domain was a public webmail domain
+                    r3 = conn.execute("""
+                        UPDATE vault_leads
+                        SET unsubscribed = 0
+                        WHERE lower(domain) = ? AND unsubscribed = 1
+                          AND lower(primary_email) NOT IN (
+                              SELECT lower(entity) FROM suppressed_entities
+                          )
+                          AND lower(primary_email) NOT IN (
+                              SELECT lower(pattern) FROM blacklist_rules
+                          )
+                    """, (pub,)).rowcount
+                    counts["vault_leads_restored"] += r3
+
+                    # 4. Restore outreach queue leads that were erroneously marked SUPPRESSED due to domain wildcard
+                    r4 = conn.execute("""
+                        UPDATE outreach_queue
+                        SET status = 'PENDING_APPROVAL', unsubscribed = 0, bounce_reason = NULL
+                        WHERE (lower(recipient) LIKE ? OR lower(bounce_reason) LIKE ?)
+                          AND status = 'SUPPRESSED'
+                          AND lower(recipient) NOT IN (
+                              SELECT lower(entity) FROM suppressed_entities
+                          )
+                          AND lower(recipient) NOT IN (
+                              SELECT lower(pattern) FROM blacklist_rules
+                          )
+                    """, (f"%@{pub}", f"%@{pub}%")).rowcount
+                    counts["outreach_queue_restored"] += r4
+
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Error during public domain suppression purge: {e}")
+
+        return counts
 
 
 _global_db_engine = None
