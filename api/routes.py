@@ -275,6 +275,11 @@ class UnblockLeadRequest(BaseModel):
     notes: Optional[str] = None
 
 
+class UpdateLeadStatusRequest(BaseModel):
+    queue_id: str
+    status: str
+
+
 class TemplateCreateRequest(BaseModel):
     title: str
     niche: str
@@ -1368,6 +1373,11 @@ def send_hot_reply(req: DispatchHotReplyRequest, current_user: Dict[str, Any] = 
             SET status = 'RESOLVED'
             WHERE id = ?
         """, (req.reply_id,))
+        rep_row = conn.execute("SELECT lead_id, sender_email FROM inbox_replies WHERE id = ?", (req.reply_id,)).fetchone()
+        if rep_row:
+            if rep_row["lead_id"]:
+                conn.execute("UPDATE outreach_queue SET status = 'CLOSED' WHERE lead_id = ?", (rep_row["lead_id"],))
+            conn.execute("UPDATE outreach_queue SET status = 'CLOSED' WHERE lower(recipient) = ?", (rep_row["sender_email"].lower().strip(),))
         conn.commit()
 
     return {
@@ -1377,6 +1387,17 @@ def send_hot_reply(req: DispatchHotReplyRequest, current_user: Dict[str, Any] = 
         "dispatched_from": sender,
         "status": "SENT"
     }
+
+
+@router.post("/outreach/lead-status")
+def update_outreach_lead_status(req: UpdateLeadStatusRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Advances or updates the status of an outreach queue item in the Kanban CRM."""
+    db = get_db_engine()
+    new_status = req.status.upper().strip()
+    with db.get_connection() as conn:
+        conn.execute("UPDATE outreach_queue SET status = ? WHERE id = ?", (new_status, req.queue_id))
+        conn.commit()
+    return {"success": True, "queue_id": req.queue_id, "status": new_status}
 
 
 @router.post("/replies/simulate")
@@ -1454,21 +1475,21 @@ def get_deliverability_analytics(current_user: Dict[str, Any] = Depends(get_curr
         total_opened = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} opened_at IS NOT NULL", q_params).fetchone()[0]
         total_bounced = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} (status = 'BOUNCED' OR bounced_at IS NOT NULL)", q_params).fetchone()[0]
         
-        queue_replied = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status IN ('REPLIED', 'HOT_LEAD')", q_params).fetchone()[0]
-        inbox_replied = conn.execute(f"SELECT count(*) FROM inbox_replies {q_filter}", q_params).fetchone()[0]
+        queue_replied = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status IN ('REPLIED', 'HOT_LEAD', 'CLOSED')", q_params).fetchone()[0]
+        inbox_replied = conn.execute(f"SELECT count(DISTINCT lower(sender_email)) FROM inbox_replies {q_filter}", q_params).fetchone()[0]
         total_replied = max(queue_replied, inbox_replied)
 
-        queue_hot = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status = 'HOT_LEAD'", q_params).fetchone()[0]
-        inbox_hot = conn.execute(f"SELECT count(*) FROM inbox_replies {q_filter} {'AND' if q_filter else 'WHERE'} is_hot_lead = 1", q_params).fetchone()[0]
+        queue_hot = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status IN ('HOT_LEAD', 'CLOSED')", q_params).fetchone()[0]
+        inbox_hot = conn.execute(f"SELECT count(DISTINCT lower(sender_email)) FROM inbox_replies {q_filter} {'AND' if q_filter else 'WHERE'} is_hot_lead = 1", q_params).fetchone()[0]
         total_hot = max(queue_hot, inbox_hot)
 
         total_queued = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status = 'PENDING_APPROVAL'", q_params).fetchone()[0]
         total_suppressed = conn.execute("SELECT count(*) FROM suppressed_entities").fetchone()[0]
 
     delivered = max(0, total_sent - total_bounced)
-    open_rate = round((total_opened / max(1, delivered)) * 100.0, 1) if delivered > 0 else 0.0
-    bounce_rate = round((total_bounced / max(1, total_sent)) * 100.0, 1) if total_sent > 0 else 0.0
-    conversion_rate = round((total_replied / max(1, delivered)) * 100.0, 1) if delivered > 0 else 0.0
+    open_rate = min(100.0, max(0.0, round((min(total_opened, delivered) / delivered) * 100.0, 1))) if delivered > 0 else 0.0
+    bounce_rate = min(100.0, max(0.0, round((min(total_bounced, total_sent) / total_sent) * 100.0, 1))) if total_sent > 0 else 0.0
+    conversion_rate = min(100.0, max(0.0, round((min(total_replied, delivered) / delivered) * 100.0, 1))) if delivered > 0 else 0.0
 
     return {
         "total_sent": total_sent,

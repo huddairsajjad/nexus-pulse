@@ -306,6 +306,45 @@ function NexusPulseApp() {
   const [activeTab, setActiveTab] = useState("kanban");
   const [alertBanner, setAlertBanner] = useState(null);
 
+  // Workflow state machine tracking for Replied -> Hot Lead advancement
+  const [promotedToHotLeadIds, setPromotedToHotLeadIds] = useState(() => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem("nexus_promoted_hot_leads") || "[]"));
+    } catch (e) {
+      return new Set();
+    }
+  });
+
+  const handleAdvanceToHotLead = async (leadId) => {
+    setPromotedToHotLeadIds(prev => {
+      const next = new Set(prev);
+      next.add(leadId);
+      try {
+        localStorage.setItem("nexus_promoted_hot_leads", JSON.stringify(Array.from(next)));
+      } catch (e) {}
+      return next;
+    });
+    try {
+      await fetch(`${API_BASE}/api/outreach/lead-status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ queue_id: leadId, status: "HOT_LEAD" })
+      });
+      fetchData();
+    } catch (e) {}
+  };
+
+  // Strictly deduplicated active Hot Leads
+  const uniqueHotLeads = useMemo(() => {
+    const seen = new Set();
+    return (hotLeads || []).filter((hl) => {
+      const key = (hl.lead_id || hl.sender_email || hl.id || "").toLowerCase().trim();
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [hotLeads]);
+
   // ---------------------------------------------------------------------------
   // OPERATOR & SECURITY MANAGEMENT STATE
   // ---------------------------------------------------------------------------
@@ -1181,7 +1220,7 @@ function doPost(e) {
       setAlertBanner({ type: "error", message: "Failed to connect to /api/scrape endpoint." });
     } finally {
       setIsHunting(false);
-      setPulseState(hotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
+      setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
     }
   };
 
@@ -2699,8 +2738,8 @@ function doPost(e) {
           className={`np-nav-tab ${activeTab === "hot_leads" ? "active" : ""}`}
         >
           <span>🔥 Hot Leads</span>
-          {hotLeads.length > 0 && (
-            <span className="badge badge-danger text-[10px] px-1.5 py-0 animate-pulse">{hotLeads.length}</span>
+          {uniqueHotLeads.length > 0 && (
+            <span className="badge badge-danger text-[10px] px-1.5 py-0 animate-pulse">{uniqueHotLeads.length}</span>
           )}
         </button>
 
@@ -2806,7 +2845,18 @@ function doPost(e) {
             {/* Responsive Board Container */}
             <div className="flex gap-3 overflow-x-auto pb-4 scrollbar-thin">
               {KANBAN_STAGES.map((stage) => {
-                const stageLeads = kanbanItems.filter((item) => normalizeLeadStatus(item.status) === stage.key);
+                const stageLeads = kanbanItems.filter((item) => {
+                  const norm = normalizeLeadStatus(item.status);
+                  if (stage.key === "REPLIED") {
+                    // Positive replies enter Replied column first without bypassing it
+                    return norm === "REPLIED" || (norm === "HOT_LEAD" && !promotedToHotLeadIds.has(item.id));
+                  }
+                  if (stage.key === "HOT_LEAD") {
+                    // Promoted or active hot leads in Hot Lead column
+                    return norm === "HOT_LEAD" && promotedToHotLeadIds.has(item.id);
+                  }
+                  return norm === stage.key;
+                });
                 return (
                   <div key={stage.key} className="kanban-col">
                     <div className="kanban-col-header">
@@ -2957,6 +3007,32 @@ function doPost(e) {
                                   </>
                                 );
                               })()}
+
+                              {stage.key === "REPLIED" && (
+                                <div className="space-y-1.5 mt-1">
+                                  {normalizeLeadStatus(lead.status) === "HOT_LEAD" && (
+                                    <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-red-950 text-red-300 border border-red-800 flex items-center gap-1 font-semibold">
+                                      🔥 Hot Tender Inquiry
+                                    </span>
+                                  )}
+                                  <div className="flex items-center gap-1">
+                                    <button
+                                      onClick={() => handleOpenHotLeadModal(lead)}
+                                      className="btn btn-accent btn-sm flex-1 justify-center text-[10px]"
+                                      title="Open 1-Click AI Response draft"
+                                    >
+                                      ⚡ 1-Click AI Reply
+                                    </button>
+                                    <button
+                                      onClick={() => handleAdvanceToHotLead(lead.id)}
+                                      className="btn btn-danger btn-sm px-2 text-[10px]"
+                                      title="Advance to Hot Lead column"
+                                    >
+                                      ➔ Hot
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
 
                               {stage.key === "HOT_LEAD" && (
                                 <button
@@ -3187,7 +3263,7 @@ function doPost(e) {
               </p>
             </div>
 
-            {hotLeads.length === 0 ? (
+            {uniqueHotLeads.length === 0 ? (
               <div className="np-card p-12 text-center">
                 <span className="text-3xl mb-2 block">📡</span>
                 <h3 className="font-semibold text-sm text-theme-primary">IMAP Reply Listener Active</h3>
@@ -3195,7 +3271,7 @@ function doPost(e) {
               </div>
             ) : (
               <div className="space-y-3">
-                {hotLeads.map((hl) => (
+                {uniqueHotLeads.map((hl) => (
                   <div key={hl.id} className="np-card p-5 space-y-3 border-l-4 border-l-[var(--danger)]">
                     <div className="flex items-start justify-between">
                       <div>
@@ -3568,7 +3644,7 @@ function doPost(e) {
                   </div>
                   <div className="flex justify-between py-1 border-b-theme text-theme-secondary">
                     <span>High-Intent Hot Inquiries:</span>
-                    <span className="font-bold text-theme-danger">{hotLeads.length} Hot Leads</span>
+                    <span className="font-bold text-theme-danger">{uniqueHotLeads.length} Hot Leads</span>
                   </div>
                   <div className="flex justify-between py-1 border-b-theme text-theme-secondary">
                     <span>Total Entities Tracked:</span>

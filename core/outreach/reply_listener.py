@@ -542,22 +542,48 @@ class IMAPReplyListener:
                     WHERE lower(recipient) = ? AND status IN ('SENT', 'DISPATCHED', 'APPROVED', 'SCHEDULED')
                 """, (snippet, clean_sender))
 
-            # Log into inbox_replies — deduplicate by message_id (if present) or by sender+subject within 48h
+            # Log into inbox_replies — upsert in place to prevent duplicate cards
             existing_rep = None
             if message_id:
                 existing_rep = conn.execute(
-                    "SELECT id FROM inbox_replies WHERE message_id = ? LIMIT 1",
+                    "SELECT id, is_hot_lead, status FROM inbox_replies WHERE message_id = ? LIMIT 1",
                     (message_id,)
                 ).fetchone()
-            if not existing_rep:
+            if not existing_rep and lead_id:
+                existing_rep = conn.execute(
+                    "SELECT id, is_hot_lead, status FROM inbox_replies WHERE lead_id = ? ORDER BY received_at DESC LIMIT 1",
+                    (lead_id,)
+                ).fetchone()
+            if not existing_rep and clean_sender:
                 existing_rep = conn.execute("""
-                    SELECT id FROM inbox_replies
-                    WHERE lower(sender_email) = ? AND subject = ?
-                      AND received_at >= datetime('now', '-2 days')
-                    LIMIT 1
-                """, (clean_sender, subject)).fetchone()
+                    SELECT id, is_hot_lead, status FROM inbox_replies
+                    WHERE lower(sender_email) = ?
+                    ORDER BY received_at DESC LIMIT 1
+                """, (clean_sender,)).fetchone()
 
-            if not existing_rep:
+            if existing_rep:
+                reply_id = existing_rep["id"]
+                conn.execute("""
+                    UPDATE inbox_replies
+                    SET lead_id = COALESCE(?, lead_id),
+                        company_name = COALESCE(?, company_name),
+                        subject = ?,
+                        message_body = ?,
+                        classification = ?,
+                        is_hot_lead = MAX(is_hot_lead, ?),
+                        ai_suggested_reply = CASE WHEN ? != '' THEN ? ELSE ai_suggested_reply END,
+                        received_at = CURRENT_TIMESTAMP,
+                        operator_id = COALESCE(?, operator_id),
+                        message_id = COALESCE(?, message_id)
+                    WHERE id = ?
+                """, (
+                    lead_id, comp, subject, body, classification,
+                    1 if is_hot else 0,
+                    ai_reply, ai_reply,
+                    operator_id, message_id or None,
+                    reply_id
+                ))
+            else:
                 conn.execute("""
                     INSERT INTO inbox_replies (
                         id, lead_id, sender_email, company_name, subject,
@@ -788,7 +814,7 @@ class IMAPReplyListener:
         }
 
     def get_hot_lead_alerts(self, operator_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Returns hot lead replies requiring action, filtered by tenant."""
+        """Returns hot lead replies requiring action, filtered by tenant, strictly deduplicated by lead/sender."""
         with self.db.get_connection() as conn:
             if operator_id:
                 rows = conn.execute("""
@@ -808,10 +834,25 @@ class IMAPReplyListener:
                     WHERE is_hot_lead = 1
                     ORDER BY received_at DESC
                 """).fetchall()
-            return [dict(r) for r in rows]
+
+            seen = set()
+            deduped = []
+            for r in rows:
+                item = dict(r)
+                sender = (item.get("sender_email") or "").lower().strip()
+                lid = item.get("lead_id")
+                key = lid if lid else sender
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                if sender:
+                    seen.add(sender)
+                deduped.append(item)
+            return deduped
 
     def get_all_replies(self, operator_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Returns all logged replies, filtered by tenant."""
+        """Returns all logged replies, filtered by tenant, deduplicated by lead/sender."""
         with self.db.get_connection() as conn:
             if operator_id:
                 rows = conn.execute("""
@@ -830,7 +871,22 @@ class IMAPReplyListener:
                     FROM inbox_replies
                     ORDER BY received_at DESC
                 """).fetchall()
-            return [dict(r) for r in rows]
+
+            seen = set()
+            deduped = []
+            for r in rows:
+                item = dict(r)
+                sender = (item.get("sender_email") or "").lower().strip()
+                lid = item.get("lead_id")
+                key = lid if lid else sender
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                if sender:
+                    seen.add(sender)
+                deduped.append(item)
+            return deduped
 
     def get_suppressed_entities(self, operator_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Returns list of suppressed entities for CAN-SPAM / GDPR compliance."""
