@@ -409,6 +409,7 @@ function NexusPulseApp() {
   const [huntNiche, setHuntNiche] = useState("Commercial Construction");
   const [huntMaxResults, setHuntMaxResults] = useState(10);
   const [isHunting, setIsHunting] = useState(false);
+  const [huntProgress, setHuntProgress] = useState(null);
 
   const availableCountries = useMemo(() => {
     return Object.keys(GEO_REGIONS[huntRegion]?.countries || {});
@@ -1208,9 +1209,17 @@ function doPost(e) {
 
         fetchData();
         setIsHuntModalOpen(false);
+        // Feature 3: Store filter breakdown for in-modal display
+        if (data.filter_breakdown) {
+          setHuntProgress(data.filter_breakdown);
+        }
+        const fb = data.filter_breakdown;
+        const fbMsg = fb
+          ? ` | Filtered: ${fb.filtered_count} | Clean: ${fb.clean_count}`
+          : "";
         setAlertBanner({
           type: "success",
-          message: `Pipeline Completed! Scraped: ${data.scraped_count || scraped.length} | Verified: ${data.verified_count || verified.length} leads in ${effectiveCity}, ${huntCountry}.`
+          message: `Pipeline Completed! Discovered: ${fb ? fb.scraped_raw : (data.scraped_count || scraped.length)}${fbMsg} in ${effectiveCity}, ${huntCountry}.`
         });
       } else {
         alert(data.detail || "Scrape pipeline failed.");
@@ -2610,7 +2619,7 @@ function doPost(e) {
         {/* Action Controls & Theme Engine */}
         <div className="flex items-center gap-2.5 shrink-0">
           <button
-            onClick={() => setIsHuntModalOpen(true)}
+            onClick={() => { setIsHuntModalOpen(true); setHuntProgress(null); }}
             className="btn btn-primary btn-sm"
             title="Launch Targeted Lead Hunt"
           >
@@ -4941,6 +4950,24 @@ function doPost(e) {
                   <div className="np-alert np-alert-info">
                     <span className="w-2 h-2 rounded-full bg-[var(--accent)] animate-ping" />
                     <span>Executing targeted crawl for {huntNiche} in {isCustomCity ? huntCustomCity : huntCity}, {huntCountry}...</span>
+                  </div>
+                )}
+
+                {!isHunting && huntProgress && (
+                  <div className="np-alert np-alert-success mt-2">
+                    <div className="flex flex-wrap gap-3 text-sm font-medium">
+                      <span>🔍 Discovered: <strong>{huntProgress.scraped_raw || 0}</strong></span>
+                      <span>🚫 Filtered: <strong>{huntProgress.filtered_count || 0}</strong></span>
+                      <span>✅ Clean: <strong>{huntProgress.clean_count || 0}</strong></span>
+                      {huntProgress.breakdown && (
+                        <span className="text-xs text-theme-muted ml-1">
+                          ({huntProgress.breakdown.blacklisted || 0} blacklisted, {huntProgress.breakdown.duplicate || 0} dupes, {huntProgress.breakdown.no_mx || 0} no-MX)
+                        </span>
+                      )}
+                      {huntProgress.fallback_triggered && (
+                        <span className="badge badge-warning text-xs">⚡ Fallback: {huntProgress.fallback_source}</span>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>

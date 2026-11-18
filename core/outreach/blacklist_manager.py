@@ -40,6 +40,29 @@ PUBLIC_EMAIL_DOMAINS = {
 }
 
 
+def _matches_wildcard(pattern: str, domain: str) -> bool:
+    """
+    Matches wildcard suffix patterns like *.company.co.uk or *company.com against a domain.
+    Supports fnmatch glob patterns, dot-prefix suffix patterns, and leading-star suffix strips.
+    """
+    import fnmatch as _fnmatch
+    pat = pattern.strip().lower()
+    dom = domain.strip().lower()
+    # fnmatch handles *.foo.com style natively (e.g. *.example.com → sub.example.com)
+    if _fnmatch.fnmatch(dom, pat):
+        return True
+    # Dot-prefix: .example.com matches example.com and sub.example.com
+    if pat.startswith("."):
+        base = pat.lstrip(".")
+        return dom == base or dom.endswith(pat)
+    # Strip leading * and check suffix (e.g. *company.com → anycompany.com)
+    if pat.startswith("*"):
+        suffix = pat.lstrip("*")
+        if suffix:
+            return dom.endswith(suffix)
+    return False
+
+
 def is_public_email_domain(domain_or_email: str) -> bool:
     """Returns True if the domain or email belongs to a public/free webmail provider."""
     if not domain_or_email:
@@ -48,6 +71,29 @@ def is_public_email_domain(domain_or_email: str) -> bool:
     if "@" in clean:
         clean = clean.split("@")[-1]
     return clean in PUBLIC_EMAIL_DOMAINS
+
+
+def _matches_wildcard(pattern: str, domain: str) -> bool:
+    """
+    Matches wildcard suffix patterns like *.company.co.uk or *company.com
+    against a given domain.
+    pattern: the stored rule pattern (may start with * or .)
+    domain: the clean lowercase domain to test
+    """
+    import fnmatch as _fnmatch
+    pat = pattern.strip().lower()
+    dom = domain.strip().lower()
+    # fnmatch handles *.foo.com style natively
+    if _fnmatch.fnmatch(dom, pat):
+        return True
+    # Dot-prefix: .example.com matches sub.example.com and example.com
+    if pat.startswith("."):
+        return dom == pat.lstrip(".") or dom.endswith(pat)
+    # Strip leading * and check suffix
+    if pat.startswith("*"):
+        suffix = pat.lstrip("*")
+        return dom.endswith(suffix)
+    return False
 
 
 class BlacklistManager:
@@ -114,6 +160,10 @@ class BlacklistManager:
         clean_pat = pattern.strip().lower()
         if not clean_pat:
             raise ValueError("Pattern is required.")
+
+        # Auto-detect wildcard patterns (*, .) and override entity_type
+        if "*" in clean_pat or clean_pat.startswith("."):
+            entity_type = "wildcard"
 
         # Guard against blacklisting root public email provider domains (e.g. gmail.com)
         if (entity_type == "domain" or "@" not in clean_pat) and clean_pat in PUBLIC_EMAIL_DOMAINS:

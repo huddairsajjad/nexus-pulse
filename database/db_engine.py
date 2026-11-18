@@ -102,6 +102,17 @@ class DatabaseEngine:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dedup_hash ON dedup_registry(hash_fingerprint);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dedup_key ON dedup_registry(normalized_key);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dedup_status ON dedup_registry(status);")
+            # Migration: add alias_group and domain columns if not present (Feature 2)
+            try:
+                conn.execute("ALTER TABLE dedup_registry ADD COLUMN alias_group TEXT")
+                conn.commit()
+            except Exception:
+                pass  # Column already exists
+            try:
+                conn.execute("ALTER TABLE dedup_registry ADD COLUMN domain TEXT")
+                conn.commit()
+            except Exception:
+                pass  # Column already exists
 
             # 2. Vault Leads (Encrypted Record Storage)
             conn.execute("""

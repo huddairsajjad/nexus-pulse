@@ -25,6 +25,8 @@ from security.crypto_vault import get_crypto_vault
 from core.agents.localization_engine import LocalizationEngine
 from core.hygiene.zero_bounce_shield import get_hygiene_shield
 from core.agents.scraper_agent import DeepScraperAgent, SearchDiscoveryAgent
+from core.outreach.dedup_engine import is_historically_seen, register_domain_seen
+from core.outreach.mx_verifier import verify_mx_record
 from database.deduplication_shield import get_dedup_shield
 from database.db_engine import get_db_engine
 from vault.vault_manager import get_vault_manager
@@ -1687,6 +1689,78 @@ def list_suppressed_entities(current_user: Dict[str, Any] = Depends(get_current_
     return listener.get_suppressed_entities()
 
 
+# ---------------------------------------------------------------------------
+# Feature 4: Smart fallback synonym and adjacent region maps
+# ---------------------------------------------------------------------------
+_NICHE_SYNONYMS: Dict[str, List[str]] = {
+    "commercial construction": ["building contractor", "general contractor", "civil engineering", "construction firm"],
+    "gyms": ["fitness center", "health club", "sports facility", "crossfit gym"],
+    "roofing": ["roofing contractor", "roof repair", "flat roofing", "cladding contractor"],
+    "plumbing": ["plumbing contractor", "heating engineer", "drainage contractor", "mechanical contractor"],
+    "electrical": ["electrical contractor", "electrician", "electrical installation", "EV charger installer"],
+    "landscaping": ["garden design", "grounds maintenance", "landscaping company", "tree surgery"],
+    "cleaning": ["commercial cleaning", "office cleaning", "facilities management", "janitorial services"],
+    "accounting": ["chartered accountant", "bookkeeping", "tax advisory", "financial services"],
+    "legal": ["law firm", "solicitors", "legal services", "barrister"],
+    "marketing": ["digital marketing agency", "SEO agency", "advertising agency", "PR firm"],
+    "it services": ["managed IT", "IT support", "cloud services", "cybersecurity"],
+    "recruitment": ["staffing agency", "headhunter", "talent acquisition", "HR consulting"],
+    "real estate": ["property management", "estate agent", "commercial property", "property developer"],
+    "architecture": ["architectural firm", "building design", "interior architecture", "urban planning"],
+    "engineering": ["structural engineer", "mechanical engineer", "consulting engineer", "project management"],
+    "healthcare": ["medical clinic", "dental practice", "physiotherapy", "healthcare provider"],
+    "hospitality": ["hotel management", "catering company", "event venue", "restaurant group"],
+    "manufacturing": ["manufacturing firm", "industrial supplier", "precision engineering", "production facility"],
+    "logistics": ["freight company", "courier service", "warehousing", "supply chain"],
+    "education": ["training provider", "educational institute", "corporate training", "e-learning"],
+}
+
+_ADJACENT_REGIONS: Dict[str, List[str]] = {
+    "london": ["Manchester", "Birmingham", "Bristol", "Leeds", "Glasgow"],
+    "manchester": ["Leeds", "Liverpool", "Sheffield", "Bradford"],
+    "birmingham": ["Coventry", "Leicester", "Wolverhampton", "Nottingham"],
+    "new york": ["Newark", "Jersey City", "Brooklyn", "Philadelphia"],
+    "los angeles": ["San Diego", "Long Beach", "Anaheim", "Riverside"],
+    "chicago": ["Evanston", "Aurora", "Naperville", "Milwaukee"],
+    "toronto": ["Mississauga", "Brampton", "Markham", "Hamilton"],
+    "sydney": ["Melbourne", "Brisbane", "Gold Coast", "Newcastle"],
+    "melbourne": ["Sydney", "Geelong", "Ballarat", "Brisbane"],
+    "dubai": ["Abu Dhabi", "Sharjah", "Ajman"],
+    "madrid": ["Barcelona", "Valencia", "Seville", "Bilbao"],
+    "paris": ["Lyon", "Marseille", "Bordeaux", "Toulouse"],
+    "berlin": ["Hamburg", "Munich", "Frankfurt", "Cologne"],
+    "amsterdam": ["Rotterdam", "Utrecht", "The Hague", "Eindhoven"],
+    "singapore": ["Kuala Lumpur", "Jakarta", "Bangkok"],
+    "hong kong": ["Shenzhen", "Guangzhou", "Macau"],
+    "karachi": ["Lahore", "Islamabad", "Rawalpindi", "Faisalabad"],
+    "lahore": ["Karachi", "Islamabad", "Faisalabad", "Multan"],
+    "islamabad": ["Rawalpindi", "Lahore", "Peshawar"],
+}
+
+
+def _get_niche_synonyms(niche: str) -> List[str]:
+    """Returns synonym keywords for a given niche for smart fallback sourcing."""
+    key = niche.strip().lower()
+    if key in _NICHE_SYNONYMS:
+        return _NICHE_SYNONYMS[key]
+    # Partial substring match
+    for k, v in _NICHE_SYNONYMS.items():
+        if k in key or key in k:
+            return v
+    return []
+
+
+def _get_adjacent_regions(city: str, country: str) -> List[str]:
+    """Returns adjacent cities/regions for regional fallback sourcing."""
+    key = city.strip().lower()
+    if key in _ADJACENT_REGIONS:
+        return _ADJACENT_REGIONS[key]
+    for k, v in _ADJACENT_REGIONS.items():
+        if k in key or key in k:
+            return v
+    return []
+
+
 # -------------------------------------------------------------
 # 13. LIVE SCRAPE PIPELINE (ZERO-SEED PRODUCTION)
 # -------------------------------------------------------------
@@ -1719,6 +1793,8 @@ async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any
 
     # Determine target URLs: either explicit seeds or autonomous multi-engine discovery
     target_urls: List[str] = [u.strip() for u in (req.target_urls or []) if u.strip()]
+    fallback_triggered = False
+    fallback_source = None
     if not target_urls:
         logger.info(f"[HUNT] No seed URLs provided. Generating localized B2B queries for {country} ({city_override})...")
         queries = LocalizationEngine.generate_localized_queries(country, city_override, niche)
@@ -1731,6 +1807,62 @@ async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any
             niche=niche
         )
         logger.info(f"[HUNT] Autonomous search discovery found {len(target_urls)} candidate domains.")
+
+        # Feature 4: Smart keyword & regional fallback
+        # Trigger when primary discovery yields < 40% of requested quota
+        fallback_threshold = max(2, int(limit * 0.4))
+        if len(target_urls) < fallback_threshold:
+            logger.info(f"[HUNT-FALLBACK] Only {len(target_urls)} URLs found (threshold={fallback_threshold}). Triggering smart fallback...")
+            fallback_triggered = True
+            seen_urls: set = set(target_urls)
+
+            # Niche synonym fallback — try related keywords for same region
+            niche_synonyms = _get_niche_synonyms(niche)
+            for syn_niche in niche_synonyms[:3]:
+                if len(target_urls) >= fallback_threshold:
+                    break
+                try:
+                    syn_queries = LocalizationEngine.generate_localized_queries(country, city_override, syn_niche)
+                    syn_urls = await discovery_agent.discover_candidate_urls(
+                        queries=syn_queries,
+                        limit=limit - len(target_urls),
+                        country=country,
+                        city=city_override,
+                        niche=syn_niche
+                    )
+                    new_urls = [u for u in syn_urls if u not in seen_urls]
+                    target_urls.extend(new_urls)
+                    seen_urls.update(new_urls)
+                    fallback_source = f"niche_synonym:{syn_niche}"
+                    logger.info(f"[HUNT-FALLBACK] Synonym '{syn_niche}' yielded {len(new_urls)} additional URLs")
+                except Exception as _fb_e:
+                    logger.warning(f"[HUNT-FALLBACK] Synonym fallback error for '{syn_niche}': {_fb_e}")
+
+            # Regional adjacency fallback — if still insufficient, try nearby cities
+            if len(target_urls) < fallback_threshold:
+                adj_regions = _get_adjacent_regions(city_override, country)
+                for adj_city in adj_regions[:2]:
+                    if len(target_urls) >= fallback_threshold:
+                        break
+                    try:
+                        adj_queries = LocalizationEngine.generate_localized_queries(country, adj_city, niche)
+                        adj_urls = await discovery_agent.discover_candidate_urls(
+                            queries=adj_queries,
+                            limit=limit - len(target_urls),
+                            country=country,
+                            city=adj_city,
+                            niche=niche
+                        )
+                        new_urls = [u for u in adj_urls if u not in seen_urls]
+                        target_urls.extend(new_urls)
+                        seen_urls.update(new_urls)
+                        fallback_source = f"adjacent_city:{adj_city}"
+                        logger.info(f"[HUNT-FALLBACK] Adjacent city '{adj_city}' yielded {len(new_urls)} additional URLs")
+                    except Exception as _fb_e:
+                        logger.warning(f"[HUNT-FALLBACK] Adjacent region fallback error for '{adj_city}': {_fb_e}")
+
+            logger.info(f"[HUNT-FALLBACK] Final URL pool after fallback: {len(target_urls)} (source={fallback_source})")
+
 
     scraped_leads_summary = []
     verified_leads = []
@@ -1757,6 +1889,24 @@ async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any
         if reply_listener.is_suppressed(domain_part):
             logger.info(f"[HUNT] Domain '{domain_part}' blocked by Suppression List")
             rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "SUPPRESSION_BLOCKED", "details": "Domain in suppression list"})
+            continue
+
+        # Feature 2: Historical dedup check — skip domains/emails previously processed
+        try:
+            with db.get_connection() as _dedup_conn:
+                _hist_seen, _hist_reason = is_historically_seen(domain_part, "", _dedup_conn)
+            if _hist_seen:
+                logger.info(f"[HUNT] Domain '{domain_part}' skipped by historical dedup: {_hist_reason}")
+                rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "HISTORICAL_DUPLICATE", "details": _hist_reason})
+                continue
+        except Exception as _dedup_err:
+            logger.debug(f"[HUNT] Dedup check error for '{domain_part}': {_dedup_err}")
+
+        # Feature 5: MX Record verification — skip domains without live mail infrastructure
+        mx_result = verify_mx_record(domain_part, timeout=5)
+        if not mx_result.get("deliverable", True):
+            logger.info(f"[HUNT] Domain '{domain_part}' rejected by MX verification: {mx_result.get('error', 'No MX record')}")
+            rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "NO_MX_RECORD", "details": mx_result.get("error", "No MX record")})
             continue
 
         logger.info(f"[HUNT] Scraping target: {clean_url}")
@@ -1802,6 +1952,12 @@ async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any
             )
             if q_res.get("queue_id"):
                 verified_leads.append(pres)
+                # Feature 2: Register verified lead domain in dedup registry
+                try:
+                    with db.get_connection() as _reg_conn:
+                        register_domain_seen(lead.domain, lead.primary_email, pres.get("lead_id"), _reg_conn)
+                except Exception as _reg_err:
+                    logger.debug(f"[HUNT] Dedup register error for '{lead.domain}': {_reg_err}")
             else:
                 logger.info(f"[HUNT] Lead blocked from gate by Deduplication Guard: {pres['primary_email']} ({q_res.get('reason')})")
                 rejected_leads.append({
@@ -1821,14 +1977,50 @@ async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any
                 "status": pres.get("status")
             })
 
+    scraped_raw_count = len(target_urls)
     scraped_count = len(scraped_leads_summary)
     verified_count = len(verified_leads)
     rejected_count = len(rejected_leads)
 
-    logger.info(f"[HUNT] Pipeline complete: Scraped: {scraped_count} | Verified: {verified_count} | Rejected: {rejected_count}")
+    # Feature 3: Compute filter breakdown counters
+    filter_reasons: Dict[str, int] = {}
+    for r in rejected_leads:
+        reason_key = (r.get("reason") or "UNKNOWN").upper()
+        filter_reasons[reason_key] = filter_reasons.get(reason_key, 0) + 1
+
+    blacklisted_count = filter_reasons.get("BLACKLIST_BLOCKED", 0) + filter_reasons.get("SUPPRESSION_BLOCKED", 0)
+    duplicate_count = (filter_reasons.get("HISTORICAL_DUPLICATE", 0) +
+                       filter_reasons.get("GATE_REJECTED", 0) +
+                       filter_reasons.get("DUPLICATE", 0))
+    no_mx_count = filter_reasons.get("NO_MX_RECORD", 0)
+    no_contacts_count = filter_reasons.get("NO_CONTACTS_FOUND", 0)
+    hygiene_count = max(0, rejected_count - blacklisted_count - duplicate_count - no_mx_count - no_contacts_count)
+
+    filter_breakdown = {
+        "scraped_raw": scraped_raw_count,
+        "filtered_count": rejected_count,
+        "clean_count": verified_count,
+        "breakdown": {
+            "blacklisted": blacklisted_count,
+            "duplicate": duplicate_count,
+            "no_mx": no_mx_count,
+            "no_contacts": no_contacts_count,
+            "hygiene_rejected": hygiene_count,
+        },
+        "fallback_triggered": fallback_triggered,
+        "fallback_source": fallback_source,
+    }
+
+    logger.info(
+        f"[HUNT] Pipeline complete: Discovered={scraped_raw_count} | Scraped={scraped_count} | "
+        f"Verified={verified_count} | Filtered={rejected_count} "
+        f"(blacklist={blacklisted_count}, dedup={duplicate_count}, no_mx={no_mx_count}, no_contacts={no_contacts_count}) "
+        f"| Fallback={'YES:' + str(fallback_source) if fallback_triggered else 'NO'}"
+    )
 
     if verified_count > 0:
-        msg = f"Hunt & Verify executed for {country} ({niche}). {scraped_count} scraped, {verified_count} verified leads queued in Approval Gate."
+        msg = (f"Hunt & Verify executed for {country} ({niche}). "
+               f"{scraped_raw_count} discovered → {rejected_count} filtered → {verified_count} verified leads queued in Approval Gate.")
     elif scraped_count > 0:
         msg = f"Hunt scraped {scraped_count} candidate leads, but 0 passed zero-bounce verification. Check hygiene diagnostics."
     else:
@@ -1845,6 +2037,7 @@ async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any
         "verified_leads": verified_leads,
         "rejected_leads": rejected_leads,
         "processed_leads": verified_leads,
+        "filter_breakdown": filter_breakdown,
         "message": msg
     }
 
