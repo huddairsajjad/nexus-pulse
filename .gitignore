@@ -29,3 +29,15 @@ ENV/
 # OS metadata
 .DS_Store
 Thumbs.db
+
+# Generated test artifacts
+vault/backups/*.csv
+vault/backups/*.json
+vault/backups/*.xlsx
+vault/partitions/**
+!vault/partitions/.gitkeep
+# Fix scripts
+fix_*.py
+cleanup_*.py
+verify_*.py
+

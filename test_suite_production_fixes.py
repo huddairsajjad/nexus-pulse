@@ -257,6 +257,134 @@ class TestProductionFixes(unittest.TestCase):
         self.assertEqual(data_after["total_replied"], initial_replied + 1)
         self.assertEqual(data_after["total_hot_leads"], initial_hot + 1)
 
+    # =========================================================================
+    # 6. OFF-NICHE DOMAIN & DUMMY EMAIL BLOCKING
+    # =========================================================================
+    def test_06_off_niche_domain_and_dummy_email_blocking(self):
+        """Verifies off-niche magazine/directory domains and dummy emails are strictly rejected."""
+        off_domains = [
+            "sqmagazine.com", "sqmagazine.co.uk", "fashionmagazine.net",
+            "construction-news-blog.org", "businessdirectory.co", "techreviews.com"
+        ]
+        for dom in off_domains:
+            is_off, reason = LeadValidationFilter.is_off_niche_domain(dom)
+            self.assertTrue(is_off, f"Domain {dom} must be detected as off-niche: {reason}")
+            is_allowed, blocker_reason = LeadValidationFilter.check_role_and_domain_blocker(f"editor@{dom}", dom)
+            self.assertFalse(is_allowed, f"Domain {dom} must be blocked by check_role_and_domain_blocker: {blocker_reason}")
+
+        dummy_emails = [
+            "you@company.com", "user@example.com", "email@example.com",
+            "test@example.com", "test@test.com", "placeholder@company.com"
+        ]
+        for dem in dummy_emails:
+            is_valid, _, reason = LeadValidationFilter.sanitize_and_validate_email(dem)
+            self.assertFalse(is_valid, f"Dummy email {dem} must be rejected: {reason}")
+            is_allowed, blocker_reason = LeadValidationFilter.check_role_and_domain_blocker(dem, dem.split("@")[-1])
+            self.assertFalse(is_allowed, f"Dummy email {dem} must be blocked: {blocker_reason}")
+
+    # =========================================================================
+    # 7. COMPANY NAME SHORT FRAGMENT ('AI') NORMALIZATION
+    # =========================================================================
+    def test_07_company_name_ai_fragment_normalization(self):
+        """Verifies raw fragments like 'AI' or short abbreviations normalize into clean names from domain."""
+        cleaned_ai = LeadValidationFilter.clean_company_name("AI", domain="jasper.ai")
+        self.assertNotEqual(cleaned_ai, "AI")
+        self.assertTrue("Jasper" in cleaned_ai)
+
+        cleaned_title = LeadValidationFilter.clean_company_name("AI | Enterprise Automation", domain="synthflow.ai")
+        self.assertNotEqual(cleaned_title, "AI")
+
+        is_valid, name, reason = LeadValidationFilter.evaluate_page_title("AI", domain="anthropic.com")
+        self.assertTrue(is_valid)
+        self.assertEqual(name, "Anthropic")
+
+    # =========================================================================
+    # 8. PER-OPERATOR INDEPENDENT QUOTAS & LICENSE EXTENSION
+    # =========================================================================
+    def test_08_per_operator_quotas_and_license_extension(self):
+        """Verifies admin can set 1000 daily scrape quota and extend days for an operator."""
+        admin_token = create_access_token(user_id="admin_test_id", username="admin_tester", role="admin", full_name="Admin Tester")
+        headers = {"Authorization": f"Bearer {admin_token}"}
+
+        # Create test operator
+        op_res = self.um.create_operator_account(
+            username=f"op_{uuid.uuid4().hex[:6]}",
+            password="TestPassword123!",
+            full_name="Quota Test Operator",
+            email="quotatest@example-domain.org",
+            daily_scrape_quota=200,
+            daily_send_quota=50
+        )
+        op_id = op_res["user_id"]
+
+        try:
+            # Update quota to 1000/day and extend 30 days
+            resp = self.client.put(
+                f"/api/operators/{op_id}/quotas",
+                headers=headers,
+                json={
+                    "extend_days": 30,
+                    "daily_scrape_quota": 1000,
+                    "daily_send_quota": 250
+                }
+            )
+            self.assertEqual(resp.status_code, 200, f"Quota update failed: {resp.text}")
+            data = resp.json()
+            self.assertTrue(data["success"])
+            self.assertEqual(data["daily_scrape_quota"], 1000)
+            self.assertEqual(data["daily_send_quota"], 250)
+
+            # Verify in DB
+            with self.db.get_connection() as conn:
+                row = conn.execute("SELECT daily_scrape_quota, daily_send_quota FROM users WHERE id = ?", (op_id,)).fetchone()
+                self.assertEqual(row["daily_scrape_quota"], 1000)
+                self.assertEqual(row["daily_send_quota"], 250)
+        finally:
+            with self.db.get_connection() as conn:
+                conn.execute("DELETE FROM users WHERE id = ?", (op_id,))
+                conn.commit()
+
+    # =========================================================================
+    # 9. UNSUBSCRIBE FULL URL & RECIPIENT OVERRIDE ACCURACY
+    # =========================================================================
+    def test_09_unsubscribe_full_url_and_recipient_override(self):
+        """Verifies unsubscribe links use full base URL and override recipient email when edited."""
+        os.environ["APP_BASE_URL"] = "https://nexus-pulse-production.up.railway.app"
+        q_res = self.gate.queue_outreach(
+            lead_id="test_lead_unsub_1",
+            recipient="original@clientfirm.de",
+            company_name="Client Firm GmbH",
+            country="Germany",
+            niche="Enterprise SaaS",
+            custom_subject="Initial Subject {{unsubscribe_link}}",
+            custom_body="Please review {{unsubscribe_link}}"
+        )
+        q_id = q_res["queue_id"]
+
+        try:
+            with self.db.get_connection() as conn:
+                row = conn.execute("SELECT message_body FROM outreach_queue WHERE id = ?", (q_id,)).fetchone()
+                self.assertIn("https://nexus-pulse-production.up.railway.app/api/unsubscribe", row["message_body"])
+                self.assertIn("email=original%40clientfirm.de", row["message_body"])
+
+            # Edit recipient in approval gate
+            appr_res = self.gate.approve_outreach_item(
+                queue_id=q_id,
+                approver="admin",
+                edited_recipient="override@clientfirm.de"
+            )
+            self.assertTrue(appr_res["success"])
+
+            with self.db.get_connection() as conn:
+                row = conn.execute("SELECT recipient, message_body FROM outreach_queue WHERE id = ?", (q_id,)).fetchone()
+                self.assertEqual(row["recipient"], "override@clientfirm.de")
+                self.assertIn("email=override%40clientfirm.de", row["message_body"])
+                self.assertNotIn("email=original%40clientfirm.de", row["message_body"])
+        finally:
+            with self.db.get_connection() as conn:
+                conn.execute("DELETE FROM outreach_queue WHERE id = ?", (q_id,))
+                conn.commit()
+
 
 if __name__ == "__main__":
     unittest.main()

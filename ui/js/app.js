@@ -334,16 +334,31 @@ function NexusPulseApp() {
     } catch (e) {}
   };
 
-  // Strictly deduplicated active Hot Leads
+  // Single consistent source of truth for active Hot Leads across top tabs, alerts & board
   const uniqueHotLeads = useMemo(() => {
     const seen = new Set();
-    return (hotLeads || []).filter((hl) => {
-      const key = (hl.lead_id || hl.sender_email || hl.id || "").toLowerCase().trim();
-      if (!key || seen.has(key)) return false;
-      seen.add(key);
-      return true;
+    const result = [];
+    // 1. Hot leads from incoming IMAP replies
+    (hotLeads || []).forEach((hl) => {
+      const key = (hl.lead_id || hl.sender_email || hl.recipient || hl.id || "").toLowerCase().trim();
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        result.push(hl);
+      }
     });
-  }, [hotLeads]);
+    // 2. Hot leads from pipeline Kanban items
+    (kanbanItems || []).forEach((item) => {
+      const norm = normalizeLeadStatus(item.status);
+      if (norm === "HOT_LEAD" || promotedToHotLeadIds.has(item.id)) {
+        const key = (item.recipient || item.id || "").toLowerCase().trim();
+        if (key && !seen.has(key)) {
+          seen.add(key);
+          result.push(item);
+        }
+      }
+    });
+    return result;
+  }, [hotLeads, kanbanItems, promotedToHotLeadIds]);
 
   // ---------------------------------------------------------------------------
   // OPERATOR & SECURITY MANAGEMENT STATE
@@ -410,6 +425,17 @@ function NexusPulseApp() {
   const [huntMaxResults, setHuntMaxResults] = useState(10);
   const [isHunting, setIsHunting] = useState(false);
   const [huntProgress, setHuntProgress] = useState(null);
+  const [activeScrapeJobId, setActiveScrapeJobId] = useState(null);
+  const scrapePollTimerRef = useRef(null);
+  const scrapeAbortControllerRef = useRef(null);
+
+  // Clean up any running timers and abort controllers on unmount
+  useEffect(() => {
+    return () => {
+      if (scrapePollTimerRef.current) clearInterval(scrapePollTimerRef.current);
+      if (scrapeAbortControllerRef.current) scrapeAbortControllerRef.current.abort();
+    };
+  }, []);
 
   const availableCountries = useMemo(() => {
     return Object.keys(GEO_REGIONS[huntRegion]?.countries || {});
@@ -445,6 +471,7 @@ function NexusPulseApp() {
 
   const [selectedHotLead, setSelectedHotLead] = useState(null);
   const [hotLeadReplyBody, setHotLeadReplyBody] = useState("");
+  const [incomingInquiryText, setIncomingInquiryText] = useState("");
 
   // Mailbox management modals
   const [isAddMailboxOpen, setIsAddMailboxOpen] = useState(false);
@@ -1155,14 +1182,50 @@ function doPost(e) {
   };
 
   // ---------------------------------------------------------------------------
-  // HUNT & VERIFY LEAD ENGINE
+  // HUNT & VERIFY LEAD ENGINE: BACKGROUND JOBS, POLLING & TRUE CANCELLATION
   // ---------------------------------------------------------------------------
+  const handleCancelScrape = async () => {
+    if (scrapeAbortControllerRef.current) {
+      try { scrapeAbortControllerRef.current.abort(); } catch (e) {}
+      scrapeAbortControllerRef.current = null;
+    }
+    if (scrapePollTimerRef.current) {
+      clearInterval(scrapePollTimerRef.current);
+      scrapePollTimerRef.current = null;
+    }
+    const jobId = activeScrapeJobId;
+    setActiveScrapeJobId(null);
+    setIsHunting(false);
+    setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
+    setIsHuntModalOpen(false);
+
+    if (jobId) {
+      try {
+        await fetch(`${API_BASE}/api/scrape/cancel/${jobId}`, {
+          method: "POST",
+          headers: token ? { Authorization: `Bearer ${token}` } : {}
+        });
+      } catch (e) {
+        console.warn("Cancel job request error:", e);
+      }
+    }
+    setAlertBanner({
+      type: "info",
+      message: "Lead hunt cancelled. Ongoing operations stopped cleanly."
+    });
+  };
+
   const handleLaunchScrapePipeline = async (e) => {
     if (e) e.preventDefault();
+    if (isHunting) return;
+
     setIsHunting(true);
     setPulseState("HUNTING");
+    setHuntProgress(null);
 
     const effectiveCity = isCustomCity ? (huntCustomCity.trim() || huntCity) : huntCity;
+    const controller = new AbortController();
+    scrapeAbortControllerRef.current = controller;
 
     setAlertBanner({
       type: "info",
@@ -1172,6 +1235,7 @@ function doPost(e) {
     try {
       const resp = await fetch(`${API_BASE}/api/scrape`, {
         method: "POST",
+        signal: controller.signal,
         headers: {
           "Content-Type": "application/json",
           ...(token ? { Authorization: `Bearer ${token}` } : {})
@@ -1186,21 +1250,113 @@ function doPost(e) {
         })
       });
 
-      const data = await resp.json();
+      let data;
+      try {
+        data = await resp.json();
+      } catch (parseErr) {
+        setIsHunting(false);
+        setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
+        setAlertBanner({
+          type: "danger",
+          message: `Server returned non-JSON response (${resp.status}). Background operations may still be running or Railway gateway timed out.`
+        });
+        return;
+      }
 
-      if (resp.ok) {
-        setSystemHealth(prev => prev ? {
-          ...prev,
-          active_configuration: {
-            ...prev.active_configuration,
-            target_country: huntCountry,
-            industry_niche: huntNiche
+      if (!resp.ok) {
+        setIsHunting(false);
+        setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
+        setAlertBanner({
+          type: "danger",
+          message: data.detail || "Scrape pipeline initiation failed."
+        });
+        return;
+      }
+
+      const jobId = data.job_id;
+      if (jobId) {
+        setActiveScrapeJobId(jobId);
+        setAlertBanner({
+          type: "info",
+          message: `Deep crawl running in background (Job: ${jobId.slice(0, 8)}...). Status polling active.`
+        });
+
+        // Clear any prior poll timer
+        if (scrapePollTimerRef.current) clearInterval(scrapePollTimerRef.current);
+
+        const pollTimer = setInterval(async () => {
+          try {
+            const statusResp = await fetch(`${API_BASE}/api/scrape/status/${jobId}`, {
+              headers: token ? { Authorization: `Bearer ${token}` } : {}
+            });
+            let statusData;
+            try {
+              statusData = await statusResp.json();
+            } catch (pErr) {
+              return;
+            }
+
+            if (statusData.status === "COMPLETED") {
+              clearInterval(pollTimer);
+              scrapePollTimerRef.current = null;
+              setActiveScrapeJobId(null);
+              setIsHunting(false);
+              setPulseState("RUNNING");
+              setIsHuntModalOpen(false);
+
+              const resObj = statusData.result || {};
+              const scraped = resObj.scraped_leads || [];
+              const verified = resObj.verified_leads || [];
+              const fb = resObj.filter_breakdown;
+              if (fb) setHuntProgress(fb);
+
+              setKanbanItems(prev => {
+                const existingIds = new Set(prev.map(i => i.id));
+                const newItems = [...scraped, ...verified].filter(i => !existingIds.has(i.id));
+                return [...newItems, ...prev];
+              });
+
+              fetchData();
+              const fbMsg = fb ? ` | Filtered: ${fb.filtered_count} | Clean: ${fb.clean_count}` : "";
+              setAlertBanner({
+                type: "success",
+                message: `Pipeline Completed! Discovered: ${fb ? fb.scraped_raw : (resObj.scraped_count || scraped.length)}${fbMsg} in ${effectiveCity}, ${huntCountry}.`
+              });
+            } else if (statusData.status === "CANCELLED") {
+              clearInterval(pollTimer);
+              scrapePollTimerRef.current = null;
+              setActiveScrapeJobId(null);
+              setIsHunting(false);
+              setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
+              setIsHuntModalOpen(false);
+              setAlertBanner({ type: "info", message: "Crawl was cancelled." });
+            } else if (statusData.status === "ERROR") {
+              clearInterval(pollTimer);
+              scrapePollTimerRef.current = null;
+              setActiveScrapeJobId(null);
+              setIsHunting(false);
+              setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
+              setAlertBanner({ type: "danger", message: `Scrape error: ${statusData.error || "Unknown error"}` });
+            } else {
+              // IN_PROGRESS: update progress if available
+              if (statusData.progress) {
+                setHuntProgress(prev => ({ ...(prev || {}), ...statusData.progress }));
+              }
+            }
+          } catch (pollErr) {
+            console.warn("Status poll error:", pollErr);
           }
-        } : prev);
+        }, 2000);
+
+        scrapePollTimerRef.current = pollTimer;
+      } else {
+        // Synchronous fallback response
+        setIsHunting(false);
+        setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
+        setIsHuntModalOpen(false);
 
         const scraped = data.scraped_leads || [];
         const verified = data.verified_leads || [];
-
         setKanbanItems(prev => {
           const existingIds = new Set(prev.map(i => i.id));
           const newItems = [...scraped, ...verified].filter(i => !existingIds.has(i.id));
@@ -1208,26 +1364,18 @@ function doPost(e) {
         });
 
         fetchData();
-        setIsHuntModalOpen(false);
-        // Feature 3: Store filter breakdown for in-modal display
-        if (data.filter_breakdown) {
-          setHuntProgress(data.filter_breakdown);
-        }
-        const fb = data.filter_breakdown;
-        const fbMsg = fb
-          ? ` | Filtered: ${fb.filtered_count} | Clean: ${fb.clean_count}`
-          : "";
         setAlertBanner({
           type: "success",
-          message: `Pipeline Completed! Discovered: ${fb ? fb.scraped_raw : (data.scraped_count || scraped.length)}${fbMsg} in ${effectiveCity}, ${huntCountry}.`
+          message: `Pipeline Completed! Discovered: ${scraped.length} leads in ${effectiveCity}, ${huntCountry}.`
         });
-      } else {
-        alert(data.detail || "Scrape pipeline failed.");
       }
     } catch (err) {
-      console.error("Scrape error:", err);
-      setAlertBanner({ type: "error", message: "Failed to connect to /api/scrape endpoint." });
-    } finally {
+      if (err.name === "AbortError") {
+        setAlertBanner({ type: "info", message: "Hunt cancelled by user." });
+      } else {
+        console.error("Scrape error:", err);
+        setAlertBanner({ type: "danger", message: "Failed to connect to /api/scrape endpoint." });
+      }
       setIsHunting(false);
       setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
     }
@@ -1534,25 +1682,50 @@ function doPost(e) {
   // ---------------------------------------------------------------------------
   const handleOpenHotLeadModal = (lead) => {
     setSelectedHotLead(lead);
-    setHotLeadReplyBody(lead.ai_suggested_reply || "");
+    const inquiryText = lead.reply_snippet || lead.incoming_message || lead.last_reply_body || "";
+    setIncomingInquiryText(inquiryText);
+    const aiDraft = lead.ai_suggested_reply || (inquiryText
+      ? `Thank you for your inquiry regarding ${lead.company_name || "your project"}.\n\nWe'd be happy to arrange a call to discuss next steps. Please let us know your availability.\n\nBest regards`
+      : "");
+    setHotLeadReplyBody(aiDraft);
   };
 
-  const handleDispatchHotLeadReply = async (replyId, recipient, responseBody) => {
+  const handleDispatchHotLeadReply = async (replyId, recipientArg, responseBody) => {
+    // Validation: refuse empty body
+    if (!responseBody || !responseBody.trim()) {
+      setAlertBanner({ type: "danger", message: "Response body cannot be empty. Please draft a message before dispatching." });
+      return;
+    }
+    // Resolve actual recipient
+    const recipient = selectedHotLead?.recipient || selectedHotLead?.sender_email || selectedHotLead?.primary_email || recipientArg;
     try {
       const resp = await fetch(`${API_BASE}/api/outreach/send-hot-reply`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
         body: JSON.stringify({ reply_id: replyId, recipient, response_body: responseBody })
       });
-      const data = await resp.json();
+      let data = {};
+      try { data = await resp.json(); } catch (_) {}
+      if (!resp.ok) {
+        setAlertBanner({ type: "danger", message: data.detail || "Failed to dispatch response." });
+        return;
+      }
       setSelectedHotLead(null);
       setAlertBanner({
         type: "success",
-        message: `Executive Response dispatched to ${recipient} via ${data.dispatched_via}!`
+        message: `Executive Response dispatched to ${data.recipient || recipient} via ${data.dispatched_via || data.inbox_used || "SMTP"}!`
       });
+      // Sync lead to Converted/CLOSED in kanban + remove from hot leads
+      setHotLeads(prev => prev.filter(h =>
+        h.id !== replyId && h.lead_id !== selectedHotLead?.lead_id
+      ));
+      setKanbanItems(prev => prev.map(item =>
+        (item.id === selectedHotLead?.id || item.lead_id === selectedHotLead?.lead_id)
+          ? { ...item, status: "CLOSED" } : item
+      ));
       fetchData();
     } catch (e) {
-      alert("Error sending response.");
+      setAlertBanner({ type: "danger", message: "Network error while dispatching response." });
     }
   };
 
@@ -1893,11 +2066,12 @@ function doPost(e) {
           daily_send_quota: parseInt(inlineSendQuota, 10) || 50
         })
       });
-      const data = await resp.json();
+      let data = {};
+      try { data = await resp.json(); } catch (_) { /* non-JSON 502 guard */ }
       if (resp.ok) {
         setAlertBanner({
           type: "success",
-          message: `Quotas updated for ${data.username}! New Expiry: ${data.new_expiry_date || "Perpetual"}`
+          message: `Quotas updated for ${data.username || "operator"}! Scrape: ${data.daily_scrape_quota}/day, Send: ${data.daily_send_quota}/day. Expiry: ${data.new_expiry_date || "Perpetual"}`
         });
         setExpandedOperatorId(null);
         fetchData();
@@ -4778,9 +4952,8 @@ function doPost(e) {
                 </p>
               </div>
               <button
-                onClick={() => !isHunting && setIsHuntModalOpen(false)}
+                onClick={() => isHunting ? handleCancelScrape() : setIsHuntModalOpen(false)}
                 className="text-theme-secondary hover:text-theme-primary font-bold"
-                disabled={isHunting}
               >
                 ✕
               </button>
@@ -4975,11 +5148,10 @@ function doPost(e) {
               <div className="np-modal-footer">
                 <button
                   type="button"
-                  onClick={() => setIsHuntModalOpen(false)}
-                  disabled={isHunting}
+                  onClick={() => isHunting ? handleCancelScrape() : setIsHuntModalOpen(false)}
                   className="btn btn-ghost btn-sm"
                 >
-                  Cancel
+                  {isHunting ? "⛔ Stop Hunt" : "Cancel"}
                 </button>
                 <button
                   type="submit"
@@ -5024,9 +5196,9 @@ function doPost(e) {
                   onChange={(e) => handleTemplateSwitch(e.target.value)}
                   className="np-input font-mono bg-elevated"
                 >
-                  <option value="Commercial Construction">Commercial Construction</option>
-                  <option value="Enterprise SaaS">Enterprise SaaS</option>
-                  <option value="Gym Equipment">Gym Equipment</option>
+                  {[...INDUSTRY_PRESETS, ...(templatesList || []).map(t => t.niche).filter(n => n && !INDUSTRY_PRESETS.includes(n))].map(n => (
+                    <option key={n} value={n}>{n}</option>
+                  ))}
                 </select>
               </div>
 
@@ -5089,7 +5261,7 @@ function doPost(e) {
                 >
                   Cancel
                 </button>
-                {user.role === "admin" ? (
+                {user ? (
                   <>
                     <button
                       onClick={() => handleApproveOutreach(selectedApproval.id, approvalSubject, approvalBody, approvalRecipient, approvalCompanyName)}
@@ -5108,11 +5280,7 @@ function doPost(e) {
                       <span>⚡ Authorize & Dispatch Now</span>
                     </button>
                   </>
-                ) : (
-                  <span className="text-xs text-theme-danger">
-                    Restricted: Only Admin can authorize.
-                  </span>
-                )}
+                ) : null}
               </div>
             </div>
           </div>
@@ -5143,7 +5311,7 @@ function doPost(e) {
             <div className="np-modal-body space-y-3">
               <div className="bg-elevated p-3 rounded border-theme text-xs font-mono">
                 <div className="text-theme-secondary font-semibold">Incoming Inquiry:</div>
-                <div className="text-theme-primary mt-1">{selectedHotLead.message_body}</div>
+                <div className="text-theme-primary mt-1">{incomingInquiryText || selectedHotLead.reply_snippet || selectedHotLead.message_body || "(No reply text available)"}</div>
               </div>
 
               <div>
@@ -5165,7 +5333,7 @@ function doPost(e) {
                 Dismiss
               </button>
               <button
-                onClick={() => handleDispatchHotLeadReply(selectedHotLead.id, selectedHotLead.sender_email, hotLeadReplyBody)}
+                onClick={() => handleDispatchHotLeadReply(selectedHotLead.id, selectedHotLead.recipient || selectedHotLead.sender_email || selectedHotLead.primary_email, hotLeadReplyBody)}
                 className="btn btn-danger btn-sm"
               >
                 Dispatch Response Now ➔

@@ -6,17 +6,69 @@ Inbox Rotator with Auto-Switching, Regional Working Hours Engine, IMAP Bounce Li
 CAN-SPAM / GDPR Unsubscribe Compliance, Global Blacklist Manager, and Deliverability Analytics.
 """
 
+import asyncio
 import os
 import json
 import uuid
 import time
 import re
+import threading
 from datetime import datetime, timezone
 import logging
 from typing import Dict, Any, List, Optional
-from fastapi import APIRouter, HTTPException, Header, Depends, Query, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Header, Depends, Query, Request
 from fastapi.responses import FileResponse, Response, HTMLResponse
 from pydantic import BaseModel, Field
+
+# ---------------------------------------------------------------------------
+# Background Job Registry — tracks async scrape jobs per operator
+# ---------------------------------------------------------------------------
+_scrape_jobs: Dict[str, Dict[str, Any]] = {}
+_scrape_jobs_lock = threading.Lock()
+
+
+def _register_job(job_id: str, op_id: str) -> None:
+    with _scrape_jobs_lock:
+        _scrape_jobs[job_id] = {
+            "job_id": job_id,
+            "operator_id": op_id,
+            "status": "RUNNING",
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "completed_at": None,
+            "result": None,
+            "error": None,
+            "cancelled": False,
+        }
+
+
+def _update_job(job_id: str, **kwargs) -> None:
+    with _scrape_jobs_lock:
+        if job_id in _scrape_jobs:
+            _scrape_jobs[job_id].update(kwargs)
+
+
+def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    with _scrape_jobs_lock:
+        return dict(_scrape_jobs.get(job_id, {}))
+
+
+def _is_job_cancelled(job_id: str) -> bool:
+    with _scrape_jobs_lock:
+        job = _scrape_jobs.get(job_id)
+        return bool(job and job.get("cancelled"))
+
+
+def _prune_old_jobs(max_age_seconds: int = 7200) -> None:
+    """Remove jobs older than max_age_seconds to prevent memory leak."""
+    cutoff = datetime.now(timezone.utc).timestamp() - max_age_seconds
+    with _scrape_jobs_lock:
+        expired = [
+            jid for jid, j in _scrape_jobs.items()
+            if j.get("completed_at") and
+            datetime.fromisoformat(j["completed_at"]).timestamp() < cutoff
+        ]
+        for jid in expired:
+            del _scrape_jobs[jid]
 
 from config.config_manager import get_config
 from security.machine_fingerprint import generate_machine_fingerprint
@@ -416,7 +468,7 @@ def update_operator_quotas(user_id: str, req: ModifyQuotaRequest, admin_user: Di
     """Modifies quotas, device lock, and subscription period for an operator."""
     um = get_user_manager()
     try:
-        return um.modify_operator_quota_and_expiry(
+        return um.modify_license_and_quotas(
             user_id=user_id,
             extend_days=req.extend_days,
             daily_scrape_quota=req.daily_scrape_quota,
@@ -1387,7 +1439,10 @@ def send_hot_reply(req: DispatchHotReplyRequest, current_user: Dict[str, Any] = 
         "reply_id": req.reply_id,
         "recipient": req.recipient,
         "dispatched_from": sender,
-        "status": "SENT"
+        "dispatched_via": "WEBHOOK" if dispatched and not (smtp_user and smtp_pwd) else "SMTP",
+        "inbox_used": sender,
+        "status": "SENT",
+        "stage": "Converted"
     }
 
 
@@ -1762,16 +1817,18 @@ def _get_adjacent_regions(city: str, country: str) -> List[str]:
 
 
 # -------------------------------------------------------------
-# 13. LIVE SCRAPE PIPELINE (ZERO-SEED PRODUCTION)
+# 13. LIVE SCRAPE PIPELINE — ASYNC BACKGROUND JOB (ZERO-SEED)
 # -------------------------------------------------------------
-@router.post("/scrape")
-async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
+
+async def _run_scrape_job(
+    job_id: str,
+    req: "ScrapeRequest",
+    op_id: str,
+) -> None:
     """
-    Hunt & Verify pipeline:
-    Extracts real company leads from target URLs or localized queries.
-    Zero-Seed Policy: NO fake or synthetic companies are generated.
-    Auto-matches detected niche to the operator's custom service template.
-    Enforces blacklist rules and suppression filtering before persisting.
+    Async background worker that runs the full Hunt & Verify pipeline.
+    Checks for cancellation between URL scrapes so abort is clean/instant.
+    Updates _scrape_jobs registry with live status and final result.
     """
     cfg = get_config()
     cfg.update({"target_country": req.country, "industry_niche": req.niche})
@@ -1781,264 +1838,231 @@ async def launch_scrape_pipeline(req: ScrapeRequest, current_user: Dict[str, Any
     gate = get_approval_gate()
     blacklist_mgr = get_blacklist_manager()
     reply_listener = get_reply_listener()
-    template_mgr = get_template_manager()
 
     country = req.country.strip()
     niche = req.niche.strip()
     city_override = (req.city or "").strip() or "London"
     limit = max(1, min(req.max_results or 20, 100))
-    op_id = current_user["id"]
 
-    logger.info(f"[HUNT] Launching scrape pipeline: country='{country}', city='{city_override}', niche='{niche}', limit={limit}, operator='{op_id}', seed_urls={req.target_urls}")
+    logger.info(f"[HUNT:{job_id}] Launching scrape pipeline: country='{country}', city='{city_override}', niche='{niche}', limit={limit}, operator='{op_id}'")
 
-    # Determine target URLs: either explicit seeds or autonomous multi-engine discovery
-    target_urls: List[str] = [u.strip() for u in (req.target_urls or []) if u.strip()]
-    fallback_triggered = False
-    fallback_source = None
-    if not target_urls:
-        logger.info(f"[HUNT] No seed URLs provided. Generating localized B2B queries for {country} ({city_override})...")
-        queries = LocalizationEngine.generate_localized_queries(country, city_override, niche)
-        discovery_agent = SearchDiscoveryAgent(timeout_seconds=float(cfg.get("crawler.request_timeout_seconds", 12.0)))
-        target_urls = await discovery_agent.discover_candidate_urls(
-            queries=queries,
-            limit=limit,
-            country=country,
-            city=city_override,
-            niche=niche
-        )
-        logger.info(f"[HUNT] Autonomous search discovery found {len(target_urls)} candidate domains.")
+    try:
+        target_urls: List[str] = [u.strip() for u in (req.target_urls or []) if u.strip()]
+        fallback_triggered = False
+        fallback_source = None
 
-        # Feature 4: Smart keyword & regional fallback
-        # Trigger when primary discovery yields < 40% of requested quota
-        fallback_threshold = max(2, int(limit * 0.4))
-        if len(target_urls) < fallback_threshold:
-            logger.info(f"[HUNT-FALLBACK] Only {len(target_urls)} URLs found (threshold={fallback_threshold}). Triggering smart fallback...")
-            fallback_triggered = True
-            seen_urls: set = set(target_urls)
+        if not target_urls:
+            queries = LocalizationEngine.generate_localized_queries(country, city_override, niche)
+            discovery_agent = SearchDiscoveryAgent(timeout_seconds=float(cfg.get("crawler.request_timeout_seconds", 12.0)))
+            target_urls = await discovery_agent.discover_candidate_urls(
+                queries=queries, limit=limit, country=country, city=city_override, niche=niche
+            )
+            logger.info(f"[HUNT:{job_id}] Discovery found {len(target_urls)} candidate domains.")
 
-            # Niche synonym fallback — try related keywords for same region
-            niche_synonyms = _get_niche_synonyms(niche)
-            for syn_niche in niche_synonyms[:3]:
-                if len(target_urls) >= fallback_threshold:
-                    break
-                try:
-                    syn_queries = LocalizationEngine.generate_localized_queries(country, city_override, syn_niche)
-                    syn_urls = await discovery_agent.discover_candidate_urls(
-                        queries=syn_queries,
-                        limit=limit - len(target_urls),
-                        country=country,
-                        city=city_override,
-                        niche=syn_niche
-                    )
-                    new_urls = [u for u in syn_urls if u not in seen_urls]
-                    target_urls.extend(new_urls)
-                    seen_urls.update(new_urls)
-                    fallback_source = f"niche_synonym:{syn_niche}"
-                    logger.info(f"[HUNT-FALLBACK] Synonym '{syn_niche}' yielded {len(new_urls)} additional URLs")
-                except Exception as _fb_e:
-                    logger.warning(f"[HUNT-FALLBACK] Synonym fallback error for '{syn_niche}': {_fb_e}")
-
-            # Regional adjacency fallback — if still insufficient, try nearby cities
+            fallback_threshold = max(2, int(limit * 0.4))
             if len(target_urls) < fallback_threshold:
-                adj_regions = _get_adjacent_regions(city_override, country)
-                for adj_city in adj_regions[:2]:
+                fallback_triggered = True
+                seen_urls: set = set(target_urls)
+                niche_synonyms = _get_niche_synonyms(niche)
+                for syn_niche in niche_synonyms[:3]:
+                    if _is_job_cancelled(job_id):
+                        break
                     if len(target_urls) >= fallback_threshold:
                         break
                     try:
-                        adj_queries = LocalizationEngine.generate_localized_queries(country, adj_city, niche)
-                        adj_urls = await discovery_agent.discover_candidate_urls(
-                            queries=adj_queries,
-                            limit=limit - len(target_urls),
-                            country=country,
-                            city=adj_city,
-                            niche=niche
+                        syn_queries = LocalizationEngine.generate_localized_queries(country, city_override, syn_niche)
+                        syn_urls = await discovery_agent.discover_candidate_urls(
+                            queries=syn_queries, limit=limit - len(target_urls), country=country, city=city_override, niche=syn_niche
                         )
-                        new_urls = [u for u in adj_urls if u not in seen_urls]
-                        target_urls.extend(new_urls)
-                        seen_urls.update(new_urls)
-                        fallback_source = f"adjacent_city:{adj_city}"
-                        logger.info(f"[HUNT-FALLBACK] Adjacent city '{adj_city}' yielded {len(new_urls)} additional URLs")
+                        new_urls = [u for u in syn_urls if u not in seen_urls]
+                        target_urls.extend(new_urls); seen_urls.update(new_urls)
+                        fallback_source = f"niche_synonym:{syn_niche}"
                     except Exception as _fb_e:
-                        logger.warning(f"[HUNT-FALLBACK] Adjacent region fallback error for '{adj_city}': {_fb_e}")
+                        logger.warning(f"[HUNT:{job_id}] Synonym fallback error: {_fb_e}")
 
-            logger.info(f"[HUNT-FALLBACK] Final URL pool after fallback: {len(target_urls)} (source={fallback_source})")
+                if len(target_urls) < fallback_threshold:
+                    adj_regions = _get_adjacent_regions(city_override, country)
+                    for adj_city in adj_regions[:2]:
+                        if _is_job_cancelled(job_id):
+                            break
+                        if len(target_urls) >= fallback_threshold:
+                            break
+                        try:
+                            adj_queries = LocalizationEngine.generate_localized_queries(country, adj_city, niche)
+                            adj_urls = await discovery_agent.discover_candidate_urls(
+                                queries=adj_queries, limit=limit - len(target_urls), country=country, city=adj_city, niche=niche
+                            )
+                            new_urls = [u for u in adj_urls if u not in seen_urls]
+                            target_urls.extend(new_urls); seen_urls.update(new_urls)
+                            fallback_source = f"adjacent_city:{adj_city}"
+                        except Exception as _fb_e:
+                            logger.warning(f"[HUNT:{job_id}] Adjacent fallback error: {_fb_e}")
 
+        scraped_leads_summary = []
+        verified_leads = []
+        rejected_leads = []
+        timeout_sec = float(cfg.get("crawler.request_timeout_seconds", 12.0))
+        scraper = DeepScraperAgent(timeout_seconds=timeout_sec)
 
-    scraped_leads_summary = []
-    verified_leads = []
-    rejected_leads = []
+        for url in target_urls[:limit]:
+            # Abort cleanly if job was cancelled
+            if _is_job_cancelled(job_id):
+                logger.info(f"[HUNT:{job_id}] Cancelled by operator — stopping crawl cleanly.")
+                _update_job(job_id, status="CANCELLED", completed_at=datetime.now(timezone.utc).isoformat())
+                return
 
-    timeout_sec = float(cfg.get("crawler.request_timeout_seconds", 12.0))
-    scraper = DeepScraperAgent(timeout_seconds=timeout_sec)
-
-    for url in target_urls[:limit]:
-        clean_url = url.strip()
-        if not clean_url:
-            continue
-
-        domain_part = clean_url.split("/")[2] if "//" in clean_url else clean_url.split("/")[0]
-        domain_part = domain_part.replace("www.", "").split(":")[0]
-
-        # Check blacklist & suppression
-        is_bl, bl_reason = blacklist_mgr.is_domain_blacklisted(domain_part)
-        if is_bl:
-            logger.info(f"[HUNT] Domain '{domain_part}' blocked by Blacklist: {bl_reason}")
-            rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "BLACKLIST_BLOCKED", "details": bl_reason})
-            continue
-
-        if reply_listener.is_suppressed(domain_part):
-            logger.info(f"[HUNT] Domain '{domain_part}' blocked by Suppression List")
-            rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "SUPPRESSION_BLOCKED", "details": "Domain in suppression list"})
-            continue
-
-        # Feature 2: Historical dedup check — skip domains/emails previously processed
-        try:
-            with db.get_connection() as _dedup_conn:
-                _hist_seen, _hist_reason = is_historically_seen(domain_part, "", _dedup_conn)
-            if _hist_seen:
-                logger.info(f"[HUNT] Domain '{domain_part}' skipped by historical dedup: {_hist_reason}")
-                rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "HISTORICAL_DUPLICATE", "details": _hist_reason})
+            clean_url = url.strip()
+            if not clean_url:
                 continue
-        except Exception as _dedup_err:
-            logger.debug(f"[HUNT] Dedup check error for '{domain_part}': {_dedup_err}")
+            domain_part = clean_url.split("/")[2] if "//" in clean_url else clean_url.split("/")[0]
+            domain_part = domain_part.replace("www.", "").split(":")[0]
 
-        # Feature 5: MX Record verification — skip domains without live mail infrastructure
-        mx_result = verify_mx_record(domain_part, timeout=5)
-        if not mx_result.get("deliverable", True):
-            logger.info(f"[HUNT] Domain '{domain_part}' rejected by MX verification: {mx_result.get('error', 'No MX record')}")
-            rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "NO_MX_RECORD", "details": mx_result.get("error", "No MX record")})
-            continue
+            is_bl, bl_reason = blacklist_mgr.is_domain_blacklisted(domain_part)
+            if is_bl:
+                rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "BLACKLIST_BLOCKED", "details": bl_reason})
+                continue
+            if reply_listener.is_suppressed(domain_part):
+                rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "SUPPRESSION_BLOCKED", "details": "Domain in suppression list"})
+                continue
+            try:
+                with db.get_connection() as _dedup_conn:
+                    _hist_seen, _hist_reason = is_historically_seen(domain_part, "", _dedup_conn)
+                if _hist_seen:
+                    rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "HISTORICAL_DUPLICATE", "details": _hist_reason})
+                    continue
+            except Exception as _dedup_err:
+                logger.debug(f"[HUNT:{job_id}] Dedup check error: {_dedup_err}")
 
-        logger.info(f"[HUNT] Scraping target: {clean_url}")
-        lead = await scraper.scrape_url(
-            url=clean_url,
-            country=country,
-            city=city_override,
-            niche=niche
-        )
+            mx_result = verify_mx_record(domain_part, timeout=5)
+            if not mx_result.get("deliverable", True):
+                rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "NO_MX_RECORD", "details": mx_result.get("error", "No MX record")})
+                continue
 
-        if not lead:
-            logger.warning(f"[HUNT] No contact information extracted from {clean_url}")
-            rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "NO_CONTACTS_FOUND"})
-            continue
+            lead = await scraper.scrape_url(url=clean_url, country=country, city=city_override, niche=niche)
+            if not lead:
+                rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "NO_CONTACTS_FOUND"})
+                continue
 
-        lead_summary = {
-            "id": lead.id or f"{lead.domain}_{lead.primary_email}",
-            "domain": lead.domain,
-            "company_name": lead.company_name,
-            "primary_email": lead.primary_email,
-            "email_tier": lead.primary_email_tier.value,
-            "quality_tag": lead.quality_tag,
-            "priority_score": lead.priority_score,
-            "tech_stack": lead.tech_stack.raw_technologies
-        }
-        scraped_leads_summary.append(lead_summary)
-
-        # Process and preserve lead (runs hygiene, dedup, and category vault archiving)
-        pres = orchestrator.process_and_preserve_lead(lead, operator_id=op_id)
-        if pres["success"]:
-            logger.info(f"[HUNT] Lead verified and preserved: {pres['company_name']} ({pres['primary_email']})")
-            # Queue in Approval Gate with Deduplication Guard
-            q_res = gate.queue_outreach(
-                lead_id=pres["lead_id"],
-                company_name=pres["company_name"],
-                recipient=pres["primary_email"],
-                country=country,
-                niche=niche,
-                channel="EMAIL",
-                tech_stack=pres.get("tech_stack"),
-                operator_id=op_id,
-                city=city_override
-            )
-            if q_res.get("queue_id"):
-                verified_leads.append(pres)
-                # Feature 2: Register verified lead domain in dedup registry
-                try:
-                    with db.get_connection() as _reg_conn:
-                        register_domain_seen(lead.domain, lead.primary_email, pres.get("lead_id"), _reg_conn)
-                except Exception as _reg_err:
-                    logger.debug(f"[HUNT] Dedup register error for '{lead.domain}': {_reg_err}")
-            else:
-                logger.info(f"[HUNT] Lead blocked from gate by Deduplication Guard: {pres['primary_email']} ({q_res.get('reason')})")
-                rejected_leads.append({
-                    "domain": lead.domain,
-                    "email": lead.primary_email,
-                    "reason": q_res.get("status", "GATE_REJECTED"),
-                    "diagnostic": q_res.get("reason", "Lead blocked by Deduplication Guard"),
-                    "status": q_res.get("status", "DUPLICATE")
-                })
-        else:
-            logger.warning(f"[HUNT] Lead preservation rejected for {lead.domain}: {pres.get('reason')} - {pres.get('diagnostic', '')}")
-            rejected_leads.append({
+            lead_summary = {
+                "id": lead.id or f"{lead.domain}_{lead.primary_email}",
                 "domain": lead.domain,
-                "email": lead.primary_email,
-                "reason": pres.get("reason"),
-                "diagnostic": pres.get("diagnostic"),
-                "status": pres.get("status")
-            })
+                "company_name": lead.company_name,
+                "primary_email": lead.primary_email,
+                "email_tier": lead.primary_email_tier.value,
+                "quality_tag": lead.quality_tag,
+                "priority_score": lead.priority_score,
+                "tech_stack": lead.tech_stack.raw_technologies
+            }
+            scraped_leads_summary.append(lead_summary)
 
-    scraped_raw_count = len(target_urls)
-    scraped_count = len(scraped_leads_summary)
-    verified_count = len(verified_leads)
-    rejected_count = len(rejected_leads)
+            pres = orchestrator.process_and_preserve_lead(lead, operator_id=op_id)
+            if pres["success"]:
+                q_res = gate.queue_outreach(
+                    lead_id=pres["lead_id"],
+                    company_name=pres["company_name"],
+                    recipient=pres["primary_email"],
+                    country=country, niche=niche, channel="EMAIL",
+                    tech_stack=pres.get("tech_stack"),
+                    operator_id=op_id, city=city_override
+                )
+                if q_res.get("queue_id"):
+                    verified_leads.append(pres)
+                    try:
+                        with db.get_connection() as _reg_conn:
+                            register_domain_seen(lead.domain, lead.primary_email, pres.get("lead_id"), _reg_conn)
+                    except Exception:
+                        pass
+                else:
+                    rejected_leads.append({
+                        "domain": lead.domain, "email": lead.primary_email,
+                        "reason": q_res.get("status", "GATE_REJECTED"),
+                        "diagnostic": q_res.get("reason", "Lead blocked by Deduplication Guard"),
+                        "status": q_res.get("status", "DUPLICATE")
+                    })
+            else:
+                rejected_leads.append({
+                    "domain": lead.domain, "email": lead.primary_email,
+                    "reason": pres.get("reason"), "diagnostic": pres.get("diagnostic"),
+                    "status": pres.get("status")
+                })
 
-    # Feature 3: Compute filter breakdown counters
-    filter_reasons: Dict[str, int] = {}
-    for r in rejected_leads:
-        reason_key = (r.get("reason") or "UNKNOWN").upper()
-        filter_reasons[reason_key] = filter_reasons.get(reason_key, 0) + 1
+        scraped_raw_count = len(target_urls)
+        verified_count = len(verified_leads)
+        rejected_count = len(rejected_leads)
+        filter_reasons: Dict[str, int] = {}
+        for r in rejected_leads:
+            reason_key = (r.get("reason") or "UNKNOWN").upper()
+            filter_reasons[reason_key] = filter_reasons.get(reason_key, 0) + 1
 
-    blacklisted_count = filter_reasons.get("BLACKLIST_BLOCKED", 0) + filter_reasons.get("SUPPRESSION_BLOCKED", 0)
-    duplicate_count = (filter_reasons.get("HISTORICAL_DUPLICATE", 0) +
-                       filter_reasons.get("GATE_REJECTED", 0) +
-                       filter_reasons.get("DUPLICATE", 0))
-    no_mx_count = filter_reasons.get("NO_MX_RECORD", 0)
-    no_contacts_count = filter_reasons.get("NO_CONTACTS_FOUND", 0)
-    hygiene_count = max(0, rejected_count - blacklisted_count - duplicate_count - no_mx_count - no_contacts_count)
+        blacklisted_count = filter_reasons.get("BLACKLIST_BLOCKED", 0) + filter_reasons.get("SUPPRESSION_BLOCKED", 0)
+        duplicate_count = filter_reasons.get("HISTORICAL_DUPLICATE", 0) + filter_reasons.get("GATE_REJECTED", 0) + filter_reasons.get("DUPLICATE", 0)
+        no_mx_count = filter_reasons.get("NO_MX_RECORD", 0)
+        no_contacts_count = filter_reasons.get("NO_CONTACTS_FOUND", 0)
+        hygiene_count = max(0, rejected_count - blacklisted_count - duplicate_count - no_mx_count - no_contacts_count)
 
-    filter_breakdown = {
-        "scraped_raw": scraped_raw_count,
-        "filtered_count": rejected_count,
-        "clean_count": verified_count,
-        "breakdown": {
-            "blacklisted": blacklisted_count,
-            "duplicate": duplicate_count,
-            "no_mx": no_mx_count,
-            "no_contacts": no_contacts_count,
-            "hygiene_rejected": hygiene_count,
-        },
-        "fallback_triggered": fallback_triggered,
-        "fallback_source": fallback_source,
-    }
+        if verified_count > 0:
+            msg = f"Hunt & Verify executed for {country} ({niche}). {scraped_raw_count} discovered → {rejected_count} filtered → {verified_count} verified leads queued."
+        elif len(scraped_leads_summary) > 0:
+            msg = f"Hunt scraped {len(scraped_leads_summary)} candidates, but 0 passed zero-bounce verification."
+        else:
+            msg = f"Hunt completed. 0 candidates found for {niche} in {city_override}, {country}."
 
-    logger.info(
-        f"[HUNT] Pipeline complete: Discovered={scraped_raw_count} | Scraped={scraped_count} | "
-        f"Verified={verified_count} | Filtered={rejected_count} "
-        f"(blacklist={blacklisted_count}, dedup={duplicate_count}, no_mx={no_mx_count}, no_contacts={no_contacts_count}) "
-        f"| Fallback={'YES:' + str(fallback_source) if fallback_triggered else 'NO'}"
-    )
+        result = {
+            "status": "COMPLETED",
+            "target": {"country": country, "niche": niche, "city": city_override},
+            "scraped_count": len(scraped_leads_summary),
+            "verified_count": verified_count,
+            "leads_preserved_count": verified_count,
+            "leads_rejected_count": rejected_count,
+            "scraped_leads": scraped_leads_summary,
+            "verified_leads": verified_leads,
+            "rejected_leads": rejected_leads,
+            "processed_leads": verified_leads,
+            "filter_breakdown": {
+                "scraped_raw": scraped_raw_count,
+                "filtered_count": rejected_count,
+                "clean_count": verified_count,
+                "breakdown": {
+                    "blacklisted": blacklisted_count,
+                    "duplicate": duplicate_count,
+                    "no_mx": no_mx_count,
+                    "no_contacts": no_contacts_count,
+                    "hygiene_rejected": hygiene_count,
+                },
+                "fallback_triggered": fallback_triggered,
+                "fallback_source": fallback_source,
+            },
+            "message": msg
+        }
+        _update_job(job_id, status="COMPLETED", completed_at=datetime.now(timezone.utc).isoformat(), result=result)
+        _prune_old_jobs()
+        logger.info(f"[HUNT:{job_id}] Completed: verified={verified_count}, filtered={rejected_count}")
 
-    if verified_count > 0:
-        msg = (f"Hunt & Verify executed for {country} ({niche}). "
-               f"{scraped_raw_count} discovered → {rejected_count} filtered → {verified_count} verified leads queued in Approval Gate.")
-    elif scraped_count > 0:
-        msg = f"Hunt scraped {scraped_count} candidate leads, but 0 passed zero-bounce verification. Check hygiene diagnostics."
-    else:
-        msg = f"Hunt completed. 0 candidate leads found for {niche} in {city_override}, {country}. Provide target domains or refine regional keywords."
+    except Exception as exc:
+        logger.error(f"[HUNT:{job_id}] Unhandled error: {exc}", exc_info=True)
+        _update_job(job_id, status="FAILED", completed_at=datetime.now(timezone.utc).isoformat(), error=str(exc))
 
+
+@router.post("/scrape")
+async def launch_scrape_pipeline(
+    req: ScrapeRequest,
+    background_tasks: BackgroundTasks,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """
+    Hunt & Verify pipeline — runs as a tracked async background job to prevent Railway 502 timeouts.
+    Returns a job_id immediately; poll /api/scrape/status/{job_id} for completion.
+    Zero-Seed Policy: NO fake or synthetic companies are generated.
+    """
+    op_id = current_user["id"]
+    job_id = str(uuid.uuid4())
+    _register_job(job_id, op_id)
+    background_tasks.add_task(_run_scrape_job, job_id, req, op_id)
     return {
-        "status": "COMPLETED",
-        "target": {"country": country, "niche": niche, "city": city_override},
-        "scraped_count": scraped_count,
-        "verified_count": verified_count,
-        "leads_preserved_count": verified_count,
-        "leads_rejected_count": rejected_count,
-        "scraped_leads": scraped_leads_summary,
-        "verified_leads": verified_leads,
-        "rejected_leads": rejected_leads,
-        "processed_leads": verified_leads,
-        "filter_breakdown": filter_breakdown,
-        "message": msg
+        "status": "STARTED",
+        "job_id": job_id,
+        "message": f"Hunt & Verify pipeline started in background. Poll /api/scrape/status/{job_id} for results.",
+        "target": {"country": req.country, "niche": req.niche, "city": req.city or "London"}
     }
 
 
@@ -2072,6 +2096,46 @@ def run_full_pipeline_run(sample_targets: Optional[List[Dict[str, str]]] = None,
 
     pipeline_res["queued_in_approval_gate"] = queued_in_gate
     return pipeline_res
+
+
+# -------------------------------------------------------------
+# SCRAPE JOB STATUS & CANCEL (Background Job Registry)
+# -------------------------------------------------------------
+@router.get("/scrape/status/{job_id}")
+def get_scrape_job_status(job_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Poll the status of a background Hunt & Verify scrape job."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Scrape job '{job_id}' not found.")
+    # Tenant isolation: operators can only see their own jobs
+    if current_user.get("role") != "admin" and job.get("operator_id") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Access denied: job belongs to another operator.")
+    # Return full result when complete; lightweight status otherwise
+    response = {
+        "job_id": job_id,
+        "status": job.get("status"),
+        "started_at": job.get("started_at"),
+        "completed_at": job.get("completed_at"),
+        "cancelled": job.get("cancelled", False),
+        "error": job.get("error"),
+    }
+    if job.get("result"):
+        response.update(job["result"])
+    return response
+
+
+@router.post("/scrape/cancel/{job_id}")
+def cancel_scrape_job(job_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """Signal a running Hunt & Verify background job to abort cleanly."""
+    job = _get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Scrape job '{job_id}' not found.")
+    if current_user.get("role") != "admin" and job.get("operator_id") != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Access denied: job belongs to another operator.")
+    if job.get("status") not in ("RUNNING",):
+        return {"success": False, "message": f"Job is already in '{job.get('status')}' state — nothing to cancel."}
+    _update_job(job_id, cancelled=True)
+    return {"success": True, "job_id": job_id, "message": "Cancellation signal sent. The crawl will stop cleanly after the current URL."}
 
 
 # -------------------------------------------------------------

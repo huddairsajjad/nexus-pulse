@@ -594,7 +594,9 @@ class DeepScraperAgent:
         ]
 
         def is_generic_phrase(text: str) -> bool:
-            if not text or len(text.strip()) < 2:
+            if not text or len(text.strip()) <= 2:
+                return True
+            if text.strip().upper() in {"AI", "IT", "HR", "PR", "HQ", "CO", "IO", "APP", "DEV", "TECH", "THE", "AND", "OR"}:
                 return True
             t_lower = text.strip().lower()
             if any(re.search(pat, t_lower) for pat in GENERIC_SEO_PATTERNS):
@@ -893,6 +895,17 @@ class DeepScraperAgent:
         target_url = url.strip()
         if not target_url.startswith("http://") and not target_url.startswith("https://"):
             target_url = f"https://{target_url}"
+
+        # Guard against off-niche media, magazine, blog, directory domains
+        try:
+            parsed_u = urlparse(target_url)
+            dom_check = parsed_u.netloc.lower().replace("www.", "").split(":")[0]
+            is_off, off_reason = LeadValidationFilter.is_off_niche_domain(dom_check, niche)
+            if is_off:
+                logger.info(f"[SCRAPER] ⊘ Skipping off-niche domain {dom_check}: {off_reason}")
+                return None
+        except Exception:
+            pass
 
         logger.info(f"[SCRAPER] ▶ Crawling {target_url}")
 

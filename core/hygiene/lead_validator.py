@@ -32,6 +32,29 @@ INVALID_SYSTEM_PREFIXES = (
 )
 ROLE_BASED_PREFIXES = INVALID_SYSTEM_PREFIXES
 
+# Strictly blocked dummy/placeholder emails — always rejected regardless of wildcard rules
+DUMMY_PLACEHOLDER_EMAILS = {
+    "you@company.com", "user@example.com", "email@example.com",
+    "test@example.com", "hello@example.com", "info@example.com",
+    "contact@example.com", "name@company.com", "yourname@domain.com",
+}
+DUMMY_PLACEHOLDER_LOCAL_PARTS = {
+    "you", "user", "yourname", "name", "email", "someone",
+    "test", "demo", "sample", "placeholder",
+}
+DUMMY_PLACEHOLDER_DOMAINS = {
+    "example.com", "example.org", "example.net", "company.com", "domain.com",
+    "yourdomain.com", "mydomain.com", "acme.com", "test.com",
+}
+
+# Off-niche domain keywords — media, magazine, directory, blog sources never valid B2B leads
+OFF_NICHE_DOMAIN_PATTERNS = (
+    "magazine", "mag.", ".magazine", "news", "journal", "press.",
+    "blog", "blogs.", "media.", ".media", "directory", "listings",
+    "review", "reviews.", "forum", "forums.", "classifieds",
+    "advertise", "advertising", "ads.", "sqmagazine", "fashionmagazine",
+)
+
 # Layer 2: Suffixes and system / tracker / junk domains
 RESTRICTED_GOV_EDU_TLDS = (".gov", ".edu", ".mil")
 SYSTEM_TRACKER_DOMAINS = {
@@ -65,6 +88,12 @@ HTTP_ERROR_AND_BOT_SHIELD_PATTERNS = [
     r"new & used"
 ]
 BOT_SHIELD_TITLES = HTTP_ERROR_AND_BOT_SHIELD_PATTERNS
+
+# Generic raw abbreviation fragments that should never be displayed as company names
+GENERIC_SHORT_FRAGMENTS = {
+    "AI", "IT", "HR", "PR", "HQ", "CO", "IO", "APP", "DEV", "TECH",
+    "THE", "AND", "OR", "COM", "NET", "ORG", "LLC", "INC", "LTD", "CORP"
+}
 
 # Regex for stripping generic words from company names/titles
 GENERIC_WORDS_PATTERN = re.compile(
@@ -145,6 +174,24 @@ class LeadValidationFilter:
     """
 
     @classmethod
+    def is_off_niche_domain(cls, domain: str, niche: str = "") -> Tuple[bool, str]:
+        """
+        Detects and filters out off-niche media, magazine, directory, blog, and content farm domains
+        (e.g., SQ Magazine, trade magazines, tech blogs, yellow pages) when targeting B2B/SaaS/commercial niches.
+        """
+        if not domain:
+            return True, "Empty domain"
+        clean = domain.strip().lower()
+        clean = re.sub(r'^https?://', '', clean)
+        clean = re.sub(r'^www\.', '', clean)
+        clean = clean.split('/')[0].split(':')[0]
+
+        for pat in OFF_NICHE_DOMAIN_PATTERNS:
+            if pat in clean:
+                return True, f"Filtered off-niche media/magazine/directory/blog domain pattern: '{pat}' in '{clean}'"
+        return False, "Domain is valid niche target"
+
+    @classmethod
     def is_junk_domain(cls, domain: str) -> bool:
         """Checks if domain is a known junk, tracker, or sentry domain."""
         if not domain:
@@ -199,6 +246,15 @@ class LeadValidationFilter:
             if local_part == prefix or local_part.startswith(prefix):
                 return False, None, f"Auto-rejected invalid/system email prefix: '{local_part}@'"
 
+        # 4b. Block dummy/placeholder emails unconditionally
+        full_email_check = f"{local_part}@{domain_part}"
+        if full_email_check in DUMMY_PLACEHOLDER_EMAILS:
+            return False, None, f"Rejected dummy/placeholder email: '{full_email_check}'"
+        if domain_part in DUMMY_PLACEHOLDER_DOMAINS:
+            return False, None, f"Rejected dummy/placeholder domain: '{domain_part}'"
+        if local_part in DUMMY_PLACEHOLDER_LOCAL_PARTS:
+            return False, None, f"Rejected dummy/placeholder local-part: '{local_part}@'"
+
         # 5. Check for junk/tracker domains (wixpress.com, sentry-next.wixpress.com, sentry.io)
         if cls.is_junk_domain(domain_part):
             return False, None, f"Auto-rejected junk/tracker domain in email: '{domain_part}'"
@@ -245,6 +301,19 @@ class LeadValidationFilter:
             if local_part == role or local_part.startswith(role + ".") or local_part.startswith(role + "-") or local_part.startswith(role + "_") or local_part.startswith(role):
                 return False, f"Auto-rejected invalid/system email prefix: '{local_part}@'"
 
+        # 1b. Dummy / placeholder email and domain rejection
+        if clean_email in DUMMY_PLACEHOLDER_EMAILS or email_dom in DUMMY_PLACEHOLDER_DOMAINS or local_part in DUMMY_PLACEHOLDER_LOCAL_PARTS:
+            return False, f"Auto-rejected dummy/placeholder email: '{clean_email}'"
+
+        # 1c. Off-niche media, magazine, blog, directory domain rejection
+        is_off, off_reason = cls.is_off_niche_domain(clean_domain)
+        if is_off:
+            return False, off_reason
+        if email_dom:
+            is_off_em, off_reason_em = cls.is_off_niche_domain(email_dom)
+            if is_off_em:
+                return False, off_reason_em
+
         # 2. Governmental, Educational, and Military domains rejection
         if any(clean_domain.endswith(suffix) for suffix in RESTRICTED_GOV_EDU_TLDS):
             return False, f"Auto-rejected restricted governmental/educational/military domain: '{clean_domain}'"
@@ -279,11 +348,11 @@ class LeadValidationFilter:
             if re.search(pat, title_lower):
                 return False, "", f"HTTP error or bot-shield detected in title: '{title}'"
 
-        # 2. Check if title is purely generic navigation
+        # 2. Check if title is purely generic navigation or short raw fragment
         cleaned_for_nav = re.sub(r'[^a-z\s]', '', title_lower).strip()
-        if not title or len(title) < 2 or cleaned_for_nav in GENERIC_NAV_TITLES:
+        if not title or len(title) <= 2 or title.upper() in GENERIC_SHORT_FRAGMENTS or cleaned_for_nav in GENERIC_NAV_TITLES:
             extracted_brand = cls.extract_brand_name_from_domain(domain)
-            return True, extracted_brand, f"Generic navigation title replaced with domain brand: '{extracted_brand}'"
+            return True, extracted_brand, f"Generic navigation or short title replaced with domain brand: '{extracted_brand}'"
 
         # 3. Clean extracted company names using regex to remove HTML title separators
         # (|, -, –, —, :, •) and generic words ("Home", "Welcome to", "Official Site")
@@ -294,7 +363,7 @@ class LeadValidationFilter:
             cleaned = GENERIC_WORDS_PATTERN.sub('', seg)
             # Remove leftover title separators and strip punctuation/whitespace
             cleaned = re.sub(r'\s+', ' ', cleaned).strip(' -–—:|•.,\t\r\n"\'')
-            if len(cleaned) >= 2 and cleaned.lower() not in GENERIC_NAV_TITLES:
+            if len(cleaned) > 2 and cleaned.upper() not in GENERIC_SHORT_FRAGMENTS and cleaned.lower() not in GENERIC_NAV_TITLES:
                 valid_candidates.append(cleaned)
 
         if valid_candidates:
@@ -310,13 +379,14 @@ class LeadValidationFilter:
         """
         Cleans an extracted company name by removing HTML title separators (|, -, –, :)
         and generic words ('Home', 'Welcome to', 'Official Site').
+        Normalizes short raw fragments like 'AI' into clean brand names from domain.
         """
         if not name or not isinstance(name, str):
             return cls.extract_brand_name_from_domain(domain) if domain else ""
         cleaned = TITLE_SEPARATORS_PATTERN.split(name)[0]
         cleaned = GENERIC_WORDS_PATTERN.sub('', cleaned)
         cleaned = re.sub(r'\s+', ' ', cleaned).strip(' -–—:|•.,\t\r\n"\'')
-        if len(cleaned) < 2 and domain:
+        if (len(cleaned) <= 2 or cleaned.upper() in GENERIC_SHORT_FRAGMENTS) and domain:
             return cls.extract_brand_name_from_domain(domain)
         return cleaned or (cls.extract_brand_name_from_domain(domain) if domain else name)
 

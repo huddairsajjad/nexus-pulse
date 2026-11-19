@@ -28,10 +28,12 @@ import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, Depends, Query, Header, Response
+from fastapi import FastAPI, HTTPException, Depends, Query, Header, Response, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .routes import router, health_check, get_current_user
 from security.machine_fingerprint import generate_machine_fingerprint
@@ -124,6 +126,28 @@ def create_app() -> FastAPI:
 
     # Mount API routes
     app.include_router(router)
+
+    # Global JSON Exception Handlers (ensures API always returns valid JSON, never raw HTML / 502 text)
+    @app.exception_handler(StarletteHTTPException)
+    async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail, "status_code": exc.status_code}
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_exception_handler(request: Request, exc: RequestValidationError):
+        return JSONResponse(
+            status_code=422,
+            content={"detail": str(exc), "errors": exc.errors(), "status_code": 422}
+        )
+
+    @app.exception_handler(Exception)
+    async def generic_exception_handler(request: Request, exc: Exception):
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Internal server error: {str(exc)}", "status_code": 500}
+        )
 
     # Mount UI Static directory
     if UI_DIR.exists():

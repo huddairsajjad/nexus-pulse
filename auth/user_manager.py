@@ -1029,17 +1029,17 @@ class UserManager:
     ) -> Dict[str, Any]:
         """
         Admin issues, modifies, or extends subscription expiry dates
-        and daily scraping/sending quotas.
+        and daily scraping/sending quotas. Works with either user UUID or username.
         """
         with self.db.get_connection() as conn:
             row = conn.execute("""
-                SELECT username, full_name, expiry_date, daily_scrape_quota,
+                SELECT id, username, full_name, expiry_date, daily_scrape_quota,
                        daily_send_quota, device_lock_id
-                FROM users WHERE id = ?
-            """, (user_id,)).fetchone()
+                FROM users WHERE id = ? OR username = ?
+            """, (user_id, user_id)).fetchone()
 
             if not row:
-                raise ValueError("User not found.")
+                raise ValueError(f"User '{user_id}' not found.")
 
             updates = []
             params = []
@@ -1073,11 +1073,11 @@ class UserManager:
 
             if daily_scrape_quota is not None:
                 updates.append("daily_scrape_quota = ?")
-                params.append(daily_scrape_quota)
+                params.append(int(daily_scrape_quota))
 
             if daily_send_quota is not None:
                 updates.append("daily_send_quota = ?")
-                params.append(daily_send_quota)
+                params.append(int(daily_send_quota))
 
             if device_lock_id is not None:
                 updates.append("device_lock_id = ?")
@@ -1088,18 +1088,38 @@ class UserManager:
                 params.append(1 if device_lock_enabled else 0)
 
             if updates:
-                params.append(user_id)
+                params.append(row["id"])
                 conn.execute(f"UPDATE users SET {', '.join(updates)} WHERE id = ?", params)
                 conn.commit()
 
             return {
                 "success": True,
+                "user_id": row["id"],
                 "username": row["username"],
                 "new_expiry_date": new_exp_str,
-                "daily_scrape_quota": daily_scrape_quota or row["daily_scrape_quota"],
-                "daily_send_quota": daily_send_quota or row["daily_send_quota"],
+                "daily_scrape_quota": int(daily_scrape_quota) if daily_scrape_quota is not None else row["daily_scrape_quota"],
+                "daily_send_quota": int(daily_send_quota) if daily_send_quota is not None else row["daily_send_quota"],
                 "message": "License & Quotas successfully updated."
             }
+
+    def modify_operator_quota_and_expiry(
+        self,
+        user_id: str,
+        extend_days: Optional[int] = None,
+        daily_scrape_quota: Optional[int] = None,
+        daily_send_quota: Optional[int] = None,
+        device_lock_id: Optional[str] = None,
+        device_lock_enabled: Optional[bool] = None
+    ) -> Dict[str, Any]:
+        """Alias for modify_license_and_quotas for cross-module compatibility."""
+        return self.modify_license_and_quotas(
+            user_id=user_id,
+            extend_days=extend_days,
+            daily_scrape_quota=daily_scrape_quota,
+            daily_send_quota=daily_send_quota,
+            device_lock_id=device_lock_id,
+            device_lock_enabled=device_lock_enabled
+        )
 
     # -------------------------------------------------------------
     # REQUIREMENT 4: 2-Day Free Trial & Subscription Paywall

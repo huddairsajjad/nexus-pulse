@@ -10,6 +10,7 @@ and Timezone Smart Scheduler.
 import os
 import re
 import uuid
+import urllib.parse
 import smtplib
 import logging
 from email.mime.text import MIMEText
@@ -198,7 +199,12 @@ class HumanApprovalGate:
 
         queue_id = str(uuid.uuid4())
         tracking_id = str(uuid.uuid4())
-        unsub_link = f"/api/unsubscribe?token={tracking_id}&email={recipient}"
+        # Use full application base URL so unsubscribe links work outside Railway's proxy
+        _app_base = os.getenv("APP_BASE_URL", os.getenv("RAILWAY_PUBLIC_DOMAIN", "")).strip()
+        if _app_base and not _app_base.startswith("http"):
+            _app_base = f"https://{_app_base}"
+        _unsub_email = urllib.parse.quote(recipient, safe="")
+        unsub_link = f"{_app_base}/api/unsubscribe?token={tracking_id}&email={_unsub_email}" if _app_base else f"/api/unsubscribe?token={tracking_id}&email={_unsub_email}"
 
         # 3. Dynamic Template & Mailbox Matching
         if custom_subject and custom_body:
@@ -281,6 +287,17 @@ class HumanApprovalGate:
             body = edited_body if edited_body is not None else row["message_body"]
             recipient = edited_recipient.strip() if edited_recipient and edited_recipient.strip() else row["recipient"]
             company = edited_company_name.strip() if edited_company_name and edited_company_name.strip() else row["company_name"]
+
+            # If recipient was edited, update unsubscribe link in message body so it reflects actual recipient
+            if edited_recipient and edited_recipient.strip() and edited_recipient.strip().lower() != row["recipient"].strip().lower():
+                old_enc = urllib.parse.quote(row["recipient"].strip(), safe="")
+                new_enc = urllib.parse.quote(recipient, safe="")
+                if f"email={old_enc}" in body:
+                    body = body.replace(f"email={old_enc}", f"email={new_enc}")
+                elif f"email={row['recipient'].strip()}" in body:
+                    body = body.replace(f"email={row['recipient'].strip()}", f"email={new_enc}")
+                else:
+                    body = re.sub(r'(api/unsubscribe\?[^"\s\n]*email=)[^"&\s\n]+', rf'\g<1>{new_enc}', body)
 
             conn.execute("""
                 UPDATE outreach_queue
@@ -375,7 +392,7 @@ class HumanApprovalGate:
         self,
         queue_id: str,
         operator_id: Optional[str] = None,
-        bypass_window: bool = False
+        bypass_window: bool = True
     ) -> Dict[str, Any]:
         """
         Dispatches an approved outreach item.
@@ -515,9 +532,20 @@ class HumanApprovalGate:
             smtp_pwd = re.sub(r'\s+', '', raw_pwd)
             display_name = (mb.get("display_name") or "").strip()
 
-            # Unsubscribe / Opt-Out Compliance Footer
+            # Unsubscribe / Opt-Out Compliance Footer & Base URL / Recipient Email Accuracy
+            _app_base = os.getenv("APP_BASE_URL", os.getenv("RAILWAY_PUBLIC_DOMAIN", "")).strip()
+            if _app_base and not _app_base.startswith("http"):
+                _app_base = f"https://{_app_base}"
+            recip_actual = recip_clean
+            recip_encoded = urllib.parse.quote(recip_actual, safe="")
+
             opt_out_footer = '\n\n---\nNot interested? Reply "STOP" and we will immediately remove you from our outreach list.'
             msg_body = row["message_body"] or ""
+            if _app_base and "/api/unsubscribe" in msg_body:
+                msg_body = re.sub(r'(?<!https?://[^\s/])(?<!/)/api/unsubscribe', f"{_app_base}/api/unsubscribe", msg_body)
+            if "api/unsubscribe?" in msg_body:
+                msg_body = re.sub(r'(api/unsubscribe\?[^"\s\n]*email=)[^"&\s\n]+', rf'\g<1>{recip_encoded}', msg_body)
+
             if 'Reply "STOP"' not in msg_body and 'reply "stop"' not in msg_body.lower():
                 msg_body = msg_body.rstrip() + opt_out_footer
 
@@ -527,7 +555,7 @@ class HumanApprovalGate:
                 msg["From"] = f"{display_name} <{sender_email}>"
             else:
                 msg["From"] = sender_email
-            msg["To"] = row["recipient"].strip()
+            msg["To"] = recip_actual
             msg["Subject"] = row["subject"]
             msg["Date"] = formatdate(localtime=True)
             sender_domain = sender_email.split("@")[-1] if "@" in sender_email else "gmail.com"
