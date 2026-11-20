@@ -13,6 +13,8 @@ Search Discovery: Cascading multi-provider pipeline that is Railway cloud-resili
 Zero-Seed Policy: Never returns hardcoded or fake lead data.
 """
 
+from __future__ import annotations
+
 import asyncio
 import base64
 import html
@@ -20,7 +22,7 @@ import logging
 import re
 import time
 import urllib.parse
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 import httpx
