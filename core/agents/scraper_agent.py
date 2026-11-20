@@ -67,14 +67,16 @@ PHONE_REGEX = re.compile(
 DISCARD_DOMAINS = {
     "google.", "duckduckgo.", "bing.", "yahoo.", "microsoft.",
     "facebook.", "instagram.", "twitter.", "x.com", "linkedin.",
-    "youtube.", "wikipedia.", "reddit.", "amazon.", "apple.",
-    "github.", "pinterest.", "tiktok.", "medium.", "quora.",
-    "tripadvisor.", "yelp.", "w3schools.", "stackoverflow.", "t.me",
+    "youtube.", "wikipedia.", "wikimedia.", "reddit.", "amazon.", "apple.",
+    "github.", "pinterest.", "tiktok.", "medium.", "quora.", "zhihu.",
+    "tripadvisor.", "yelp.", "w3schools.", "stackoverflow.", "t.me", "whatsapp.",
     "wixpress.com", "sentry-next.wixpress.com", "sentry.io",
-    "lexisnexis.com", "m-w.com", "f6s.com",
+    "lexisnexis.com", "m-w.com", "f6s.com", "imdb.com", "rottentomatoes.com",
     "yellowpages.", "houzz.", "checkatrade.", "bark.com",
     "clutch.co", "trustpilot.", "glassdoor.", "indeed.", "example.com",
-    "aeroleads.", "hunter.io", "apollo.io",
+    "aeroleads.", "hunter.io", "apollo.io", "openai.", "chatgpt.",
+    "merriam-webster.", "dictionary.", "thefreedictionary.", "vocabulary.com",
+    "cambridge.org", "collinsdictionary.", "oxfordlearnersdictionaries.", "britannica.",
 }
 
 # Junk email domains / prefixes handled by LeadValidationFilter but also
@@ -127,18 +129,24 @@ def _rotated_headers(accept_language: str = "en-US,en;q=0.9") -> Dict[str, str]:
 DEFAULT_HEADERS = _rotated_headers()
 
 # ---------------------------------------------------------------------------
-# Contact subpage discovery keywords
+# Contact subpage discovery keywords (multilingual & global)
 # ---------------------------------------------------------------------------
 CONTACT_SUBPAGE_KEYWORDS = [
     "kontakt", "contact", "impressum", "about", "ueber-uns", "uber-uns",
     "ansprechpartner", "team", "our-team", "leadership", "people", "staff", "mentions", "mentions-legales", "legal",
-    "contacto", "contatti", "contacts", "direction", "firmensitz", "standort"
+    "contacto", "contatti", "contacts", "direction", "firmensitz", "standort", "imprint",
+    "qui-sommes-nous", "chi-siamo", "quienes-somos", "fale-conosco", "faleconosco", "over-ons",
+    "equipo", "management", "directors", "inquiries", "enquiries", "location", "sede"
 ]
 COMMON_SUBPATHS = [
     "/contact", "/contact/", "/contact-us", "/contact-us/",
     "/about", "/about-us", "/about-us/", "/about/",
     "/team", "/team/", "/our-team", "/our-team/",
     "/kontakt", "/kontakt/", "/impressum", "/impressum/",
+    "/contacto", "/contacto/", "/contatti", "/contatti/",
+    "/contactez-nous", "/contactez-nous/",
+    "/imprint", "/imprint/", "/legal", "/legal/",
+    "/contato", "/contato/", "/over-ons", "/over-ons/",
 ]
 
 
@@ -262,6 +270,21 @@ class SearchDiscoveryAgent:
             except Exception:
                 pass
 
+        # Yahoo redirect /RU=.../RK=
+        if "r.search.yahoo.com" in raw_url and "/RU=" in raw_url:
+            try:
+                ru_param = raw_url.split("/RU=")[1].split("/RK=")[0]
+                raw_url = urllib.parse.unquote(ru_param)
+            except Exception:
+                pass
+
+        # Google redirect /url?q=...
+        if "google.com/url" in raw_url and "q=" in raw_url:
+            try:
+                raw_url = urllib.parse.unquote(raw_url.split("q=")[1].split("&")[0])
+            except Exception:
+                pass
+
         if not raw_url.startswith("http://") and not raw_url.startswith("https://"):
             return None
 
@@ -320,7 +343,7 @@ class SearchDiscoveryAgent:
     # ------------------------------------------------------------------
     # Provider 1: DDGS library (ddgs / duckduckgo-search)
     # ------------------------------------------------------------------
-    def _ddgs_search(self, query: str, max_results: int = 10) -> List[str]:
+    def _ddgs_search(self, query: str, max_results: int = 15) -> List[str]:
         """
         Runs a synchronous DDGS text search with lite→html backend fallback.
         Returns list of raw result URLs (before clean_candidate_url).
@@ -330,7 +353,7 @@ class SearchDiscoveryAgent:
             return []
 
         urls: List[str] = []
-        for backend in ("lite", "html"):
+        for backend in ("html", "lite"):
             try:
                 logger.info(f"[PROVIDER-1 DDGS] backend='{backend}' query='{query}'")
                 with _DDGS(timeout=int(self.timeout)) as ddgs_client:
@@ -344,76 +367,138 @@ class SearchDiscoveryAgent:
                     logger.info(f"[PROVIDER-1 DDGS] backend='{backend}' succeeded: {len(urls)} candidate URLs")
                     return urls
             except Exception as ex:
-                logger.warning(f"[PROVIDER-1 DDGS] backend='{backend}' exception: {ex}")
+                logger.debug(f"[PROVIDER-1 DDGS] backend='{backend}' exception: {ex}")
 
-        logger.warning("[PROVIDER-1 DDGS] All backends exhausted — no results")
         return []
 
     # ------------------------------------------------------------------
-    # Provider 2: Bing HTML Scraper (async)
+    # Provider 2: Bing HTML Scraper (multi-page async pagination)
     # ------------------------------------------------------------------
-    async def _bing_search(self, query: str, client: httpx.AsyncClient, max_results: int = 10) -> List[str]:
+    async def _bing_search(self, query: str, client: httpx.AsyncClient, max_results: int = 30) -> List[str]:
         """
-        Performs a Bing web search and extracts organic result URLs.
+        Performs a Bing web search and extracts organic result URLs across multiple pages.
         Handles Bing's base64-encoded redirect links (/ck/a?!).
         """
         clean_q = self.sanitize_search_query(query)
         urls: List[str] = []
-        try:
-            logger.info(f"[PROVIDER-2 BING] query='{clean_q}'")
-            resp = await client.get(
-                "https://www.bing.com/search",
-                params={"q": clean_q, "count": str(max_results)},
-            )
-            if resp.status_code != 200:
-                logger.warning(f"[PROVIDER-2 BING] HTTP {resp.status_code} for '{clean_q}'")
-                return []
+        page_offsets = [1, 11, 21, 31][:max(1, min((max_results + 9) // 10, 4))]
 
-            soup = BeautifulSoup(resp.text, "html.parser")
-            # Multiple selectors to handle Bing layout variations
-            selectors = [
-                "li.b_algo h2 a",
-                "li.b_algo .b_title a",
-                "h2 a[href^='http']",
-            ]
-            anchors = []
-            for sel in selectors:
-                anchors = soup.select(sel)
-                if anchors:
+        for first_offset in page_offsets:
+            try:
+                resp = await client.get(
+                    "https://www.bing.com/search",
+                    params={"q": clean_q, "first": str(first_offset), "setlang": "en"},
+                )
+                if resp.status_code != 200:
                     break
 
-            for a in anchors:
-                href = a.get("href", "")
-                if href:
-                    urls.append(href)
+                soup = BeautifulSoup(resp.text, "html.parser")
+                selectors = [
+                    "li.b_algo h2 a",
+                    "li.b_algo .b_title a",
+                    "h2 a[href^='http']",
+                    "li.b_algo p a",
+                ]
+                page_found = 0
+                for sel in selectors:
+                    anchors = soup.select(sel)
+                    for a in anchors:
+                        href = a.get("href", "").strip()
+                        if href and href not in urls:
+                            urls.append(href)
+                            page_found += 1
+                    if page_found >= 10:
+                        break
 
-            logger.info(f"[PROVIDER-2 BING] Extracted {len(urls)} raw anchors for '{clean_q}'")
-        except Exception as ex:
-            logger.warning(f"[PROVIDER-2 BING] Exception for '{clean_q}': {ex}")
+                if page_found == 0:
+                    break
+            except Exception as ex:
+                logger.debug(f"[PROVIDER-2 BING] offset={first_offset} exception: {ex}")
+                break
 
+        logger.info(f"[PROVIDER-2 BING] Extracted {len(urls)} raw anchors for '{clean_q}'")
         return urls
 
     # ------------------------------------------------------------------
-    # Provider 3: DuckDuckGo Lite HTTP POST (legacy, async)
+    # Provider 3: Yahoo Search HTML (async)
     # ------------------------------------------------------------------
-    async def _ddg_lite_post(self, query: str, client: httpx.AsyncClient) -> List[str]:
-        """Legacy DDG Lite POST fallback (rate-limited from datacenters, but useful as tertiary)."""
+    async def _yahoo_search(self, query: str, client: httpx.AsyncClient, max_results: int = 20) -> List[str]:
+        """Performs a Yahoo search and extracts organic result URLs."""
         clean_q = self.sanitize_search_query(query)
         urls: List[str] = []
         try:
-            logger.info(f"[PROVIDER-3 DDG-LITE] POST query='{clean_q}'")
+            resp = await client.get(
+                "https://search.yahoo.com/search",
+                params={"p": clean_q, "n": str(max_results)},
+            )
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                selectors = [
+                    "div.compTitle h3 a",
+                    "ol.searchCenterMiddle li h3 a",
+                    "div.algo h3 a",
+                    "h3.title a",
+                ]
+                for sel in selectors:
+                    anchors = soup.select(sel)
+                    for a in anchors:
+                        href = a.get("href", "").strip()
+                        if href and href not in urls:
+                            urls.append(href)
+                logger.info(f"[PROVIDER-3 YAHOO] Extracted {len(urls)} raw anchors for '{clean_q}'")
+        except Exception as ex:
+            logger.debug(f"[PROVIDER-3 YAHOO] Exception: {ex}")
+        return urls
+
+    # ------------------------------------------------------------------
+    # Provider 4: Brave Search HTML (async)
+    # ------------------------------------------------------------------
+    async def _brave_search(self, query: str, client: httpx.AsyncClient, max_results: int = 20) -> List[str]:
+        """Performs a Brave web search and extracts organic result URLs."""
+        clean_q = self.sanitize_search_query(query)
+        urls: List[str] = []
+        try:
+            resp = await client.get(
+                "https://search.brave.com/search",
+                params={"q": clean_q, "source": "web"},
+            )
+            if resp.status_code == 200:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                selectors = [
+                    "a.heading-link",
+                    "a.snippet",
+                    "div.snippet a[href^='http']",
+                    "a[data-test-id='result-link']",
+                ]
+                for sel in selectors:
+                    anchors = soup.select(sel)
+                    for a in anchors:
+                        href = a.get("href", "").strip()
+                        if href and href not in urls:
+                            urls.append(href)
+                logger.info(f"[PROVIDER-4 BRAVE] Extracted {len(urls)} raw anchors for '{clean_q}'")
+        except Exception as ex:
+            logger.debug(f"[PROVIDER-4 BRAVE] Exception: {ex}")
+        return urls
+
+    # ------------------------------------------------------------------
+    # Provider 5: DuckDuckGo Lite HTTP POST (legacy, async)
+    # ------------------------------------------------------------------
+    async def _ddg_lite_post(self, query: str, client: httpx.AsyncClient) -> List[str]:
+        """Legacy DDG Lite POST fallback (useful backup)."""
+        clean_q = self.sanitize_search_query(query)
+        urls: List[str] = []
+        try:
             resp = await client.post("https://lite.duckduckgo.com/lite/", data={"q": clean_q})
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, "html.parser")
                 for a_tag in soup.select(".result-link"):
                     href = a_tag.get("href", "")
-                    if href:
+                    if href and href not in urls:
                         urls.append(href)
-                logger.info(f"[PROVIDER-3 DDG-LITE] Returned {len(urls)} raw links for '{clean_q}'")
-            else:
-                logger.warning(f"[PROVIDER-3 DDG-LITE] HTTP {resp.status_code} for '{clean_q}'")
+                logger.info(f"[PROVIDER-5 DDG-LITE] Returned {len(urls)} raw links for '{clean_q}'")
         except Exception as ex:
-            logger.warning(f"[PROVIDER-3 DDG-LITE] Exception for '{clean_q}': {ex}")
+            logger.debug(f"[PROVIDER-5 DDG-LITE] Exception: {ex}")
         return urls
 
     # ------------------------------------------------------------------
@@ -432,7 +517,8 @@ class SearchDiscoveryAgent:
         construction_keywords = (
             "construction", "contractor", "hochbau", "tiefbau", "bâtiment",
             "building", "roofing", "mep", "tga", "civil", "infrastructure",
-            "architecture", "architect", "engineering", "plumbing", "electrical"
+            "architecture", "architect", "engineering", "plumbing", "electrical",
+            "bauunternehmen", "travaux", "edificación", "general contractors"
         )
         is_construction = any(ck in n_lower for ck in construction_keywords)
 
@@ -440,8 +526,8 @@ class SearchDiscoveryAgent:
             return [
                 # Variation 1: direct intent with estimating/tenders signal
                 f'"{n}" "{c}" "estimating" OR "tenders" contact email',
-                # Variation 2: contractor + @ symbol (surfaces mailto: pages)
-                f'"{n}" contractor "{c}" "@"',
+                # Variation 2: contractor + contact
+                f'"{n}" contractors "{c}" contact email',
                 # Variation 3: simple unquoted — broadest fallback
                 f'{n} general contractors {c} contact email',
                 # Variation 4: "contact us" page targeting
@@ -449,13 +535,13 @@ class SearchDiscoveryAgent:
                 # Variation 5: commercial company/firm inquiries
                 f'"{n}" firms "{c}" contact phone email',
                 # Variation 6: B2B services directory / company profile
-                f'{n} company "{c}" about us contact',
+                f'{n} company "{c}" "{country}" contact',
                 # Variation 7: commercial solutions & suppliers
                 f'"{n}" suppliers "{c}" "{country}" email',
                 # Variation 8: quotation / RFP / proposals
                 f'"{n}" "{c}" "request a quote" OR "commercial proposal" email',
                 # Variation 9: specialized industry providers
-                f'"{n}" specialists in "{c}" contact info',
+                f'"{n}" specialists in "{c}" official website contact',
             ]
         else:
             return [
@@ -464,15 +550,17 @@ class SearchDiscoveryAgent:
                 f'"{n}" "{c}" "contact us" email',
                 f'"{n}" agency OR company OR firm "{c}" email',
                 f'"{n}" "{c}" inurl:contact',
-                f'"{n}" "{c}" inquiries email phone',
+                f'"{n}" "{c}" ("inquiries" OR "office") email',
+                f'{n} {c} contact email',
                 f'{n} "{c}" "{country}" contact us',
-                f'"{n}" "{c}" official website email',
+                f'"{n}" "{c}" official website contact',
                 f'"{n}" "{c}" "info@" OR "contact@"',
-                f'"{n}" specialists "{c}" contact info',
+                f'"{n}" specialists "{c}" contact phone',
+                f'"{n}" directory OR members "{c}" contact',
             ]
 
     # ------------------------------------------------------------------
-    # Main discovery entry point
+    # Main discovery entry point (Parallel Multi-Source)
     # ------------------------------------------------------------------
     async def discover_candidate_urls(
         self,
@@ -485,9 +573,9 @@ class SearchDiscoveryAgent:
         is_cancelled: Optional[Any] = None,
     ) -> List[str]:
         """
-        Runs the cascading 3-provider search pipeline and returns
-        up to `limit` unique company root-domain URLs, automatically
-        excluding already captured/seen domains.
+        Runs the parallel multi-source search pipeline across Bing, DDGS, Yahoo, Brave, and DDG-Lite,
+        returning up to `limit` unique company root-domain URLs, automatically excluding already
+        captured/seen domains.
         """
         discovered_urls: List[str] = []
         seen_domains: Set[str] = set()
@@ -507,7 +595,7 @@ class SearchDiscoveryAgent:
                 raw_q = q_item.strip()
             else:
                 raw_q = str(q_item).strip()
-            if raw_q:
+            if raw_q and raw_q not in all_queries:
                 all_queries.append(raw_q)
 
         variation_queries = self.build_query_variations(niche, city, country)
@@ -516,7 +604,7 @@ class SearchDiscoveryAgent:
                 all_queries.append(vq)
 
         logger.info(
-            f"[DISCOVERY] Starting multi-provider search | niche='{niche}' | city='{city}' "
+            f"[DISCOVERY] Starting multi-source parallel search | niche='{niche}' | city='{city}' "
             f"| country='{country}' | queries={len(all_queries)} | limit={limit} | excluded={len(excluded)}"
         )
 
@@ -524,6 +612,8 @@ class SearchDiscoveryAgent:
             """Cleans and deduplicates raw URLs; returns count of new additions."""
             added = 0
             for raw_url in raw_list:
+                if not raw_url:
+                    continue
                 u = self.clean_candidate_url(raw_url)
                 if not u:
                     continue
@@ -531,7 +621,6 @@ class SearchDiscoveryAgent:
                 if not domain:
                     continue
                 if domain in excluded:
-                    logger.debug(f"[DISCOVERY] ⊘ Skipping already-captured domain {domain}")
                     continue
                 if domain not in seen_domains:
                     seen_domains.add(domain)
@@ -558,46 +647,42 @@ class SearchDiscoveryAgent:
 
                 logger.info(f"[DISCOVERY] ━━ Processing query: '{query_str[:80]}...' ━━")
 
-                # ── Provider 1: DDGS library (synchronous, run in thread pool) ──
-                try:
-                    p1_raw = await asyncio.get_event_loop().run_in_executor(
+                # Launch search providers in parallel for maximum recall
+                tasks = [
+                    asyncio.get_event_loop().run_in_executor(
                         None, self._ddgs_search, query_str, max(limit * 2, 20)
-                    )
-                except Exception as ex:
-                    p1_raw = []
-                    logger.warning(f"[PROVIDER-1 DDGS] run_in_executor error: {ex}")
+                    ),
+                    self._bing_search(query_str, client, max_results=max(limit * 2, 25)),
+                    self._yahoo_search(query_str, client, max_results=max(limit, 15)),
+                    self._brave_search(query_str, client, max_results=max(limit, 15)),
+                ]
 
-                p1_added = _register_urls(p1_raw, "DDGS")
-                logger.info(f"[PROVIDER-1 DDGS] Added {p1_added} new unique domains from query")
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # Process results from all successful providers
+                p_names = ["DDGS", "BING", "YAHOO", "BRAVE"]
+                for i, res in enumerate(results):
+                    if isinstance(res, list) and res:
+                        _register_urls(res, p_names[i])
+                        if len(discovered_urls) >= limit:
+                            break
+
+                # If still under limit and all 4 yielded few, query DDG Lite
+                if len(discovered_urls) < limit:
+                    lite_res = await self._ddg_lite_post(query_str, client)
+                    if lite_res:
+                        _register_urls(lite_res, "DDG-LITE")
 
                 if is_cancelled and is_cancelled():
                     break
                 if len(discovered_urls) >= limit:
                     break
 
-                # ── Provider 2: Bing HTML (only if DDGS returned nothing useful) ──
-                if p1_added == 0:
-                    p2_raw = await self._bing_search(query_str, client, max_results=max(limit * 2, 20))
-                    p2_added = _register_urls(p2_raw, "BING")
-                    logger.info(f"[PROVIDER-2 BING] Added {p2_added} new unique domains from query")
-
-                    # ── Provider 3: DDG Lite POST (only if Bing also returned nothing) ──
-                    if p2_added == 0 and len(discovered_urls) < limit:
-                        p3_raw = await self._ddg_lite_post(query_str, client)
-                        p3_added = _register_urls(p3_raw, "DDG-LITE")
-                        logger.info(f"[PROVIDER-3 DDG-LITE] Added {p3_added} new unique domains from query")
-
         total = len(discovered_urls)
         logger.info(
-            f"[DISCOVERY] ✅ Pipeline complete — {total} unique candidate domains discovered "
+            f"[DISCOVERY] ✅ Multi-source search complete — {total} unique candidate domains discovered "
             f"(limit={limit})"
         )
-        if total == 0:
-            logger.warning(
-                "[DISCOVERY] ⚠ Zero domains found across all providers. "
-                "No seed data injected — returning empty list as per Zero-Seed Policy."
-            )
-
         return discovered_urls[:limit]
 
 
@@ -1083,8 +1168,8 @@ class DeepScraperAgent:
                     if guess_url not in candidate_subpages and guess_url != base_url:
                         candidate_subpages.append(guess_url)
 
-                # Limit to 3 subpages to respect timeout budget
-                candidate_subpages = candidate_subpages[:3]
+                # Limit to 4 subpages to respect timeout budget
+                candidate_subpages = candidate_subpages[:4]
                 logger.info(
                     f"[SCRAPER] {len(candidate_subpages)} contact subpage(s) queued for "
                     f"{base_domain}: {candidate_subpages}"
@@ -1105,25 +1190,28 @@ class DeepScraperAgent:
                 except Exception:
                     pass
 
-                for sub_url in candidate_subpages:
+                # Fetch candidate subpages concurrently with tight per-subpage timeout
+                async def _fetch_subpage(sub_url: str):
                     if is_cancelled and is_cancelled():
                         return None
                     try:
-                        sub_resp = None
-                        for retry_attempt in range(2):
-                            try:
-                                sub_resp = await client.get(sub_url)
-                                if sub_resp.status_code in (429, 502, 503, 504):
-                                    await asyncio.sleep(1.0 * (2 ** retry_attempt))
-                                    continue
-                                break
-                            except (httpx.RequestError, httpx.TimeoutException):
-                                if retry_attempt == 0:
-                                    await asyncio.sleep(1.0)
-                                    continue
-                                raise
+                        sub_to = httpx.Timeout(connect=2.5, read=3.5, write=3.0, pool=3.0)
+                        sub_resp = await client.get(sub_url, timeout=sub_to)
+                        if sub_resp.status_code < 400:
+                            return (sub_url, sub_resp)
+                    except Exception as sub_err:
+                        logger.debug(f"[SCRAPER] Subpage fetch error for {sub_url}: {sub_err}")
+                    return None
 
-                        if sub_resp and sub_resp.status_code < 400:
+                subpage_tasks = [_fetch_subpage(su) for su in candidate_subpages]
+                sub_results = await asyncio.gather(*subpage_tasks, return_exceptions=True)
+
+                for res in sub_results:
+                    if is_cancelled and is_cancelled():
+                        return None
+                    if isinstance(res, tuple) and res[1] is not None:
+                        sub_url, sub_resp = res
+                        try:
                             sub_lead = self.parse_html_content(
                                 html_content=sub_resp.text,
                                 source_url=str(sub_resp.url),
@@ -1143,9 +1231,9 @@ class DeepScraperAgent:
                                     sub_lead.company_name = lead.company_name
                                 return sub_lead
                             else:
-                                logger.info(f"[SCRAPER] No valid emails on subpage {sub_url}")
-                    except Exception as sub_err:
-                        logger.debug(f"[SCRAPER] Subpage fetch error for {sub_url}: {sub_err}")
+                                logger.debug(f"[SCRAPER] No valid emails on subpage {sub_url}")
+                        except Exception as parse_err:
+                            logger.debug(f"[SCRAPER] Subpage parsing error for {sub_url}: {parse_err}")
 
                 logger.warning(
                     f"[SCRAPER] ✗ Discarding {target_url}: "

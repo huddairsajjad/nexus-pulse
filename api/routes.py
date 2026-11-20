@@ -253,6 +253,7 @@ class ScrapeRequest(BaseModel):
     niche: str = "Commercial Construction"
     max_results: Optional[int] = 10
     target_urls: Optional[List[str]] = None
+    seed_urls: Optional[List[str]] = None
 
 
 class MailboxCreateRequest(BaseModel):
@@ -1817,6 +1818,13 @@ def _get_adjacent_regions(city: str, country: str) -> List[str]:
     for k, v in _ADJACENT_REGIONS.items():
         if k in key or key in k:
             return v
+    try:
+        prof = LocalizationEngine.resolve_country_profile(country)
+        other_cities = [c for c in prof.major_cities if c.lower() != key]
+        if other_cities:
+            return other_cities
+    except Exception:
+        pass
     return []
 
 
@@ -1833,6 +1841,7 @@ async def _run_scrape_job(
     Async background worker that runs the full Hunt & Verify pipeline.
     Checks for cancellation between URL scrapes so abort is clean/instant.
     Updates _scrape_jobs registry with live status and final result.
+    Dynamically scales discovery queries and concurrent scraping to meet target limit.
     """
     cfg = get_config()
     cfg.update({"target_country": req.country, "industry_niche": req.niche})
@@ -1845,10 +1854,20 @@ async def _run_scrape_job(
 
     country = req.country.strip()
     niche = req.niche.strip()
-    city_override = (req.city or "").strip() or "London"
+    country_prof = LocalizationEngine.resolve_country_profile(country)
+    city_override = (req.city or "").strip()
+    if not city_override:
+        city_override = country_prof.major_cities[0] if country_prof.major_cities else "Capital"
+    region = (getattr(req, "region", None) or "").strip()
+    if not region:
+        region = country_prof.region or "Global"
+
     limit = max(1, min(req.max_results or 20, 100))
 
-    logger.info(f"[HUNT:{job_id}] Launching scrape pipeline: country='{country}', city='{city_override}', niche='{niche}', limit={limit}, operator='{op_id}'")
+    logger.info(
+        f"[HUNT:{job_id}] Launching scrape pipeline: region='{region}', country='{country}', "
+        f"city='{city_override}', niche='{niche}', limit={limit}, operator='{op_id}'"
+    )
 
     # ── Pre-load known domains for zero-dup discovery exclusion ─────────────
     _existing_domains: set = set()
@@ -1870,74 +1889,48 @@ async def _run_scrape_job(
         return _is_job_cancelled(job_id)
 
     try:
-        target_urls: List[str] = [u.strip() for u in (req.target_urls or []) if u.strip()]
+        start_time = time.time()
+        timeout_budget = 160.0  # Safe execution budget
+
+        # Combine explicit seed/target URLs if provided
+        initial_seeds = [u.strip() for u in (req.target_urls or []) if u.strip()]
+        if hasattr(req, "seed_urls") and req.seed_urls:
+            initial_seeds.extend([u.strip() for u in req.seed_urls if u.strip()])
+
+        candidate_domains_queue: List[str] = list(initial_seeds)
+        seen_candidate_urls: set = {u.lower() for u in initial_seeds}
+
+        queries_run = 0
+        total_domains_found = len(candidate_domains_queue)
+        total_emails_extracted = 0
+
         fallback_triggered = False
         fallback_source = None
-        discovery_target = max(limit * 2, 25)
-
-        if not target_urls:
-            queries = LocalizationEngine.generate_localized_queries(country, city_override, niche)
-            discovery_agent = SearchDiscoveryAgent(timeout_seconds=min(float(cfg.get("crawler.request_timeout_seconds", 12.0)), 5.0))
-            target_urls = await discovery_agent.discover_candidate_urls(
-                queries=queries, limit=discovery_target, country=country, city=city_override, niche=niche,
-                excluded_domains=_existing_domains,
-                is_cancelled=_cancelled,
-            )
-            logger.info(f"[HUNT:{job_id}] Discovery found {len(target_urls)} candidate domains.")
-
-            fallback_threshold = max(3, int(limit * 0.6))
-            if len(target_urls) < fallback_threshold:
-                fallback_triggered = True
-                seen_urls: set = set(target_urls)
-                niche_synonyms = _get_niche_synonyms(niche)
-                for syn_niche in niche_synonyms[:3]:
-                    if _is_job_cancelled(job_id):
-                        break
-                    if len(target_urls) >= fallback_threshold:
-                        break
-                    try:
-                        syn_queries = LocalizationEngine.generate_localized_queries(country, city_override, syn_niche)
-                        syn_urls = await discovery_agent.discover_candidate_urls(
-                            queries=syn_queries, limit=discovery_target - len(target_urls), country=country, city=city_override, niche=syn_niche,
-                            excluded_domains=_existing_domains,
-                            is_cancelled=_cancelled,
-                        )
-                        new_urls = [u for u in syn_urls if u not in seen_urls]
-                        target_urls.extend(new_urls); seen_urls.update(new_urls)
-                        fallback_source = f"niche_synonym:{syn_niche}"
-                    except Exception as _fb_e:
-                        logger.warning(f"[HUNT:{job_id}] Synonym fallback error: {_fb_e}")
-
-                if len(target_urls) < fallback_threshold:
-                    adj_regions = _get_adjacent_regions(city_override, country)
-                    for adj_city in adj_regions[:2]:
-                        if _is_job_cancelled(job_id):
-                            break
-                        if len(target_urls) >= fallback_threshold:
-                            break
-                        try:
-                            adj_queries = LocalizationEngine.generate_localized_queries(country, adj_city, niche)
-                            adj_urls = await discovery_agent.discover_candidate_urls(
-                                queries=adj_queries, limit=discovery_target - len(target_urls), country=country, city=adj_city, niche=niche,
-                                excluded_domains=_existing_domains,
-                                is_cancelled=_cancelled,
-                            )
-                            new_urls = [u for u in adj_urls if u not in seen_urls]
-                            target_urls.extend(new_urls); seen_urls.update(new_urls)
-                            fallback_source = f"adjacent_city:{adj_city}"
-                        except Exception as _fb_e:
-                            logger.warning(f"[HUNT:{job_id}] Adjacent fallback error: {_fb_e}")
 
         scraped_leads_summary = []
         verified_leads = []
         rejected_leads = []
+
+        discovery_agent = SearchDiscoveryAgent(timeout_seconds=min(float(cfg.get("crawler.request_timeout_seconds", 12.0)), 5.0))
         scraper = DeepScraperAgent(timeout_seconds=5.0)
 
-        # High-Speed Bounded Concurrent Scrape Pipeline
-        crawl_sem = asyncio.Semaphore(4)
+        crawl_sem = asyncio.Semaphore(6)
         db_lock = asyncio.Lock()
 
+        # Build progressive query batches
+        query_batches: List[List[str]] = LocalizationEngine.generate_query_batches(country, city_override, niche, batch_size=3)
+        if not query_batches:
+            single_queries = LocalizationEngine.generate_localized_queries(country, city_override, niche)
+            query_batches = [single_queries] if single_queries else []
+
+        # Prepare fallback sources
+        niche_synonyms = _get_niche_synonyms(niche)
+        synonym_idx = 0
+        adjacent_cities = _get_adjacent_regions(city_override, country)
+        adj_idx = 0
+
         async def _scrape_candidate(url: str):
+            nonlocal total_emails_extracted
             if _cancelled() or len(verified_leads) >= limit:
                 return
 
@@ -1945,7 +1938,7 @@ async def _run_scrape_job(
             if not clean_url:
                 return
             domain_part = clean_url.split("/")[2] if "//" in clean_url else clean_url.split("/")[0]
-            domain_part = domain_part.replace("www.", "").split(":")[0]
+            domain_part = domain_part.replace("www.", "").split(":")[0].lower()
 
             is_bl, bl_reason = blacklist_mgr.is_domain_blacklisted(domain_part)
             if is_bl:
@@ -1981,7 +1974,7 @@ async def _run_scrape_job(
 
             if _cancelled():
                 return
-            if not lead:
+            if not lead or not lead.all_emails:
                 async with db_lock:
                     rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "NO_CONTACTS_FOUND"})
                 return
@@ -1990,6 +1983,7 @@ async def _run_scrape_job(
                 if _cancelled() or len(verified_leads) >= limit:
                     return
 
+                total_emails_extracted += len(lead.all_emails)
                 lead_summary = {
                     "id": lead.id or f"{lead.domain}_{lead.primary_email}",
                     "domain": lead.domain,
@@ -2042,19 +2036,95 @@ async def _run_scrape_job(
                     "target_lead_count": limit
                 })
 
-        batch_size = 4
-        for idx in range(0, len(target_urls), batch_size):
-            if _cancelled():
-                logger.info(f"[HUNT:{job_id}] Cancelled by operator — stopping crawl cleanly.")
-                _update_job(job_id, status="CANCELLED", completed_at=datetime.now(timezone.utc).isoformat())
-                return
-            if len(verified_leads) >= limit:
-                logger.info(f"[HUNT:{job_id}] Target lead limit reached ({len(verified_leads)}/{limit}) — stopping hunt.")
-                break
-            batch = target_urls[idx:idx + batch_size]
-            await asyncio.gather(*[_scrape_candidate(u) for u in batch])
+        # Dynamic Target-Scaling Discovery & Concurrent Crawl Loop
+        while len(verified_leads) < limit and not _cancelled() and (time.time() - start_time < timeout_budget):
+            # If queue has candidates, crawl a batch concurrently
+            if candidate_domains_queue:
+                batch_chunk = []
+                while candidate_domains_queue and len(batch_chunk) < 6:
+                    cand = candidate_domains_queue.pop(0)
+                    batch_chunk.append(cand)
 
-        scraped_raw_count = len(target_urls)
+                if batch_chunk:
+                    await asyncio.gather(*[_scrape_candidate(u) for u in batch_chunk])
+
+                # Log progress audit
+                logger.info(
+                    f"[HUNT:{job_id}] region='{region}', country='{country}', city='{city_override}', "
+                    f"niche='{niche}', queries_run={queries_run}, domains_found={total_domains_found}, "
+                    f"emails_extracted={total_emails_extracted}, verified_saved={len(verified_leads)}/{limit}"
+                )
+
+                if _cancelled():
+                    break
+                if len(verified_leads) >= limit:
+                    break
+                continue
+
+            # Need more candidate domains — fetch next discovery batch
+            next_queries: List[str] = []
+            if query_batches:
+                next_queries = query_batches.pop(0)
+            elif synonym_idx < len(niche_synonyms):
+                syn_niche = niche_synonyms[synonym_idx]
+                synonym_idx += 1
+                fallback_triggered = True
+                fallback_source = f"niche_synonym:{syn_niche}"
+                syn_batches = LocalizationEngine.generate_query_batches(country, city_override, syn_niche, batch_size=3)
+                if syn_batches:
+                    next_queries = syn_batches.pop(0)
+                    query_batches.extend(syn_batches)
+            elif adj_idx < len(adjacent_cities):
+                adj_city = adjacent_cities[adj_idx]
+                adj_idx += 1
+                fallback_triggered = True
+                fallback_source = f"adjacent_city:{adj_city}"
+                adj_batches = LocalizationEngine.generate_query_batches(country, adj_city, niche, batch_size=3)
+                if adj_batches:
+                    next_queries = adj_batches.pop(0)
+                    query_batches.extend(adj_batches)
+            else:
+                # All queries and fallbacks exhausted
+                logger.info(f"[HUNT:{job_id}] All query tiers exhausted — finishing hunt.")
+                break
+
+            if next_queries:
+                queries_run += len(next_queries)
+                needed_discovery = max((limit - len(verified_leads)) * 3, 15)
+                logger.info(f"[HUNT:{job_id}] Discovering with queries: {next_queries[:2]} (target {needed_discovery} domains)")
+                discovered = await discovery_agent.discover_candidate_urls(
+                    queries=next_queries,
+                    limit=needed_discovery,
+                    country=country,
+                    city=city_override,
+                    niche=niche,
+                    excluded_domains=_existing_domains,
+                    is_cancelled=_cancelled,
+                )
+                new_candidates = [u for u in discovered if u.lower() not in seen_candidate_urls]
+                for u in new_candidates:
+                    seen_candidate_urls.add(u.lower())
+                    candidate_domains_queue.append(u)
+                total_domains_found += len(new_candidates)
+                logger.info(f"[HUNT:{job_id}] Added {len(new_candidates)} fresh candidates (queue size: {len(candidate_domains_queue)})")
+
+                # If discovery returned 0 candidates on this batch and queue empty, continue to next query
+                if not candidate_domains_queue and not query_batches and synonym_idx >= len(niche_synonyms) and adj_idx >= len(adjacent_cities):
+                    break
+
+        if _cancelled():
+            logger.info(f"[HUNT:{job_id}] Cancelled by operator — stopping crawl cleanly.")
+            _update_job(job_id, status="CANCELLED", completed_at=datetime.now(timezone.utc).isoformat())
+            return
+
+        # Final audit logging
+        logger.info(
+            f"[HUNT:{job_id}] region='{region}', country='{country}', city='{city_override}', "
+            f"niche='{niche}', queries_run={queries_run}, domains_found={total_domains_found}, "
+            f"emails_extracted={total_emails_extracted}, verified_saved={len(verified_leads)}/{limit}"
+        )
+
+        scraped_raw_count = total_domains_found or len(scraped_leads_summary)
         verified_count = len(verified_leads)
         rejected_count = len(rejected_leads)
         filter_reasons: Dict[str, int] = {}
@@ -2077,7 +2147,7 @@ async def _run_scrape_job(
 
         result = {
             "status": "COMPLETED",
-            "target": {"country": country, "niche": niche, "city": city_override},
+            "target": {"country": country, "niche": niche, "city": city_override, "region": region},
             "scraped_count": len(scraped_leads_summary),
             "verified_count": verified_count,
             "leads_preserved_count": verified_count,
