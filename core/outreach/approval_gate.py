@@ -200,11 +200,11 @@ class HumanApprovalGate:
         queue_id = str(uuid.uuid4())
         tracking_id = str(uuid.uuid4())
         # Use full application base URL so unsubscribe links work outside Railway's proxy
-        _app_base = os.getenv("APP_BASE_URL", os.getenv("RAILWAY_PUBLIC_DOMAIN", "")).strip()
+        _app_base = os.getenv("APP_BASE_URL", os.getenv("RAILWAY_PUBLIC_DOMAIN", os.getenv("RAILWAY_STATIC_URL", "nexus-pulse-production.up.railway.app"))).strip()
         if _app_base and not _app_base.startswith("http"):
             _app_base = f"https://{_app_base}"
         _unsub_email = urllib.parse.quote(recipient, safe="")
-        unsub_link = f"{_app_base}/api/unsubscribe?token={tracking_id}&email={_unsub_email}" if _app_base else f"/api/unsubscribe?token={tracking_id}&email={_unsub_email}"
+        unsub_link = f"{_app_base}/api/unsubscribe?token={tracking_id}&email={_unsub_email}"
 
         # 3. Dynamic Template & Mailbox Matching
         if custom_subject and custom_body:
@@ -233,12 +233,12 @@ class HumanApprovalGate:
                 INSERT INTO outreach_queue (
                     id, lead_id, channel, recipient, company_name, subject, message_body,
                     status, target_country, target_timezone, scheduled_for, operator_id,
-                    tracking_id, mailbox_used
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?, ?, ?, ?, ?)
+                    tracking_id, mailbox_used, industry_niche
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?, ?, ?, ?, ?, ?)
             """, (
                 queue_id, lead_id, channel, recipient, company_name, subject, body,
                 country, tz_info["timezone_code"], scheduled_for, operator_id,
-                tracking_id, mailbox_assigned
+                tracking_id, mailbox_assigned, niche
             ))
             conn.commit()
 
@@ -542,7 +542,11 @@ class HumanApprovalGate:
             opt_out_footer = '\n\n---\nNot interested? Reply "STOP" and we will immediately remove you from our outreach list.'
             msg_body = row["message_body"] or ""
             if _app_base and "/api/unsubscribe" in msg_body:
-                msg_body = re.sub(r'(?<!https?://[^\s/])(?<!/)/api/unsubscribe', f"{_app_base}/api/unsubscribe", msg_body)
+                msg_body = re.sub(
+                    r'(https?://[^\s"\'<>]+)?/api/unsubscribe',
+                    lambda m: m.group(0) if (m.group(1) and m.group(1).startswith("http")) else f"{_app_base}/api/unsubscribe",
+                    msg_body
+                )
             if "api/unsubscribe?" in msg_body:
                 msg_body = re.sub(r'(api/unsubscribe\?[^"\s\n]*email=)[^"&\s\n]+', rf'\g<1>{recip_encoded}', msg_body)
 
@@ -845,7 +849,9 @@ class HumanApprovalGate:
                 rows = conn.execute("""
                     SELECT id, lead_id, channel, recipient, company_name, subject,
                            message_body, status, target_country, target_timezone,
-                           scheduled_for, operator_id, created_at
+                           scheduled_for, operator_id, created_at,
+                           COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
+                           COALESCE(industry_niche, 'Commercial Construction') as niche
                     FROM outreach_queue
                     WHERE status = 'PENDING_APPROVAL' AND (operator_id = ? OR operator_id IS NULL)
                     ORDER BY created_at DESC
@@ -854,7 +860,9 @@ class HumanApprovalGate:
                 rows = conn.execute("""
                     SELECT id, lead_id, channel, recipient, company_name, subject,
                            message_body, status, target_country, target_timezone,
-                           scheduled_for, operator_id, created_at
+                           scheduled_for, operator_id, created_at,
+                           COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
+                           COALESCE(industry_niche, 'Commercial Construction') as niche
                     FROM outreach_queue
                     WHERE status = 'PENDING_APPROVAL'
                     ORDER BY created_at DESC
@@ -869,7 +877,9 @@ class HumanApprovalGate:
                     SELECT id, lead_id, channel, recipient, company_name, subject,
                            message_body, status, target_country, scheduled_for,
                            approved_by, sent_at, mailbox_used, operator_id,
-                           opened_at, bounced_at, bounce_reason, created_at
+                           opened_at, bounced_at, bounce_reason, created_at,
+                           COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
+                           COALESCE(industry_niche, 'Commercial Construction') as niche
                     FROM outreach_queue
                     WHERE operator_id = ? OR operator_id IS NULL
                     ORDER BY created_at DESC
@@ -879,7 +889,9 @@ class HumanApprovalGate:
                     SELECT id, lead_id, channel, recipient, company_name, subject,
                            message_body, status, target_country, scheduled_for,
                            approved_by, sent_at, mailbox_used, operator_id,
-                           opened_at, bounced_at, bounce_reason, created_at
+                           opened_at, bounced_at, bounce_reason, created_at,
+                           COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
+                           COALESCE(industry_niche, 'Commercial Construction') as niche
                     FROM outreach_queue
                     ORDER BY created_at DESC
                 """).fetchall()

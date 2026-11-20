@@ -909,7 +909,9 @@ def get_kanban_leads(
                 SELECT id, lead_id, channel, recipient, company_name, subject,
                        message_body, status, target_country, scheduled_for,
                        approved_by, sent_at, mailbox_used, operator_id,
-                       opened_at, bounced_at, bounce_reason, replied_at, reply_snippet, created_at
+                       opened_at, bounced_at, bounce_reason, replied_at, reply_snippet, created_at,
+                       COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
+                       COALESCE(industry_niche, 'Commercial Construction') as niche
                 FROM outreach_queue
                 WHERE operator_id = ? OR operator_id IS NULL
                 ORDER BY created_at DESC
@@ -919,7 +921,9 @@ def get_kanban_leads(
                 SELECT id, lead_id, channel, recipient, company_name, subject,
                        message_body, status, target_country, scheduled_for,
                        approved_by, sent_at, mailbox_used, operator_id,
-                       opened_at, bounced_at, bounce_reason, replied_at, reply_snippet, created_at
+                       opened_at, bounced_at, bounce_reason, replied_at, reply_snippet, created_at,
+                       COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
+                       COALESCE(industry_niche, 'Commercial Construction') as niche
                 FROM outreach_queue
                 ORDER BY created_at DESC
             """).fetchall()
@@ -1846,6 +1850,25 @@ async def _run_scrape_job(
 
     logger.info(f"[HUNT:{job_id}] Launching scrape pipeline: country='{country}', city='{city_override}', niche='{niche}', limit={limit}, operator='{op_id}'")
 
+    # ── Pre-load known domains for zero-dup discovery exclusion ─────────────
+    _existing_domains: set = set()
+    try:
+        with db.get_connection() as _pre_conn:
+            _d_rows = _pre_conn.execute(
+                "SELECT normalized_key FROM dedup_registry WHERE entity_type='domain'"
+            ).fetchall()
+            _existing_domains = {r[0].strip().lower() for r in _d_rows if r[0]}
+            _q_rows = _pre_conn.execute(
+                "SELECT DISTINCT lower(substr(recipient, instr(recipient,'@')+1)) FROM outreach_queue WHERE status != 'BOUNCED'"
+            ).fetchall()
+            _existing_domains.update(r[0] for r in _q_rows if r[0])
+        logger.info(f"[HUNT:{job_id}] Pre-loaded {len(_existing_domains)} known domains for dedup exclusion.")
+    except Exception as _pre_e:
+        logger.warning(f"[HUNT:{job_id}] Pre-load dedup error: {_pre_e}")
+
+    def _cancelled() -> bool:
+        return _is_job_cancelled(job_id)
+
     try:
         target_urls: List[str] = [u.strip() for u in (req.target_urls or []) if u.strip()]
         fallback_triggered = False
@@ -1853,9 +1876,11 @@ async def _run_scrape_job(
 
         if not target_urls:
             queries = LocalizationEngine.generate_localized_queries(country, city_override, niche)
-            discovery_agent = SearchDiscoveryAgent(timeout_seconds=float(cfg.get("crawler.request_timeout_seconds", 12.0)))
+            discovery_agent = SearchDiscoveryAgent(timeout_seconds=min(float(cfg.get("crawler.request_timeout_seconds", 12.0)), 5.0))
             target_urls = await discovery_agent.discover_candidate_urls(
-                queries=queries, limit=limit, country=country, city=city_override, niche=niche
+                queries=queries, limit=limit, country=country, city=city_override, niche=niche,
+                excluded_domains=_existing_domains,
+                is_cancelled=_cancelled,
             )
             logger.info(f"[HUNT:{job_id}] Discovery found {len(target_urls)} candidate domains.")
 
@@ -1872,7 +1897,9 @@ async def _run_scrape_job(
                     try:
                         syn_queries = LocalizationEngine.generate_localized_queries(country, city_override, syn_niche)
                         syn_urls = await discovery_agent.discover_candidate_urls(
-                            queries=syn_queries, limit=limit - len(target_urls), country=country, city=city_override, niche=syn_niche
+                            queries=syn_queries, limit=limit - len(target_urls), country=country, city=city_override, niche=syn_niche,
+                            excluded_domains=_existing_domains,
+                            is_cancelled=_cancelled,
                         )
                         new_urls = [u for u in syn_urls if u not in seen_urls]
                         target_urls.extend(new_urls); seen_urls.update(new_urls)
@@ -1890,7 +1917,9 @@ async def _run_scrape_job(
                         try:
                             adj_queries = LocalizationEngine.generate_localized_queries(country, adj_city, niche)
                             adj_urls = await discovery_agent.discover_candidate_urls(
-                                queries=adj_queries, limit=limit - len(target_urls), country=country, city=adj_city, niche=niche
+                                queries=adj_queries, limit=limit - len(target_urls), country=country, city=adj_city, niche=niche,
+                                excluded_domains=_existing_domains,
+                                is_cancelled=_cancelled,
                             )
                             new_urls = [u for u in adj_urls if u not in seen_urls]
                             target_urls.extend(new_urls); seen_urls.update(new_urls)
@@ -1901,8 +1930,7 @@ async def _run_scrape_job(
         scraped_leads_summary = []
         verified_leads = []
         rejected_leads = []
-        timeout_sec = float(cfg.get("crawler.request_timeout_seconds", 12.0))
-        scraper = DeepScraperAgent(timeout_seconds=timeout_sec)
+        scraper = DeepScraperAgent(timeout_seconds=5.0)
 
         for url in target_urls[:limit]:
             # Abort cleanly if job was cancelled
@@ -1938,7 +1966,11 @@ async def _run_scrape_job(
                 rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "NO_MX_RECORD", "details": mx_result.get("error", "No MX record")})
                 continue
 
-            lead = await scraper.scrape_url(url=clean_url, country=country, city=city_override, niche=niche)
+            lead = await scraper.scrape_url(url=clean_url, country=country, city=city_override, niche=niche, is_cancelled=_cancelled)
+            if _is_job_cancelled(job_id):
+                logger.info(f"[HUNT:{job_id}] Cancelled after scrape — discarding lead, stopping cleanly.")
+                _update_job(job_id, status="CANCELLED", completed_at=datetime.now(timezone.utc).isoformat())
+                return
             if not lead:
                 rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "NO_CONTACTS_FOUND"})
                 continue
@@ -1954,6 +1986,11 @@ async def _run_scrape_job(
                 "tech_stack": lead.tech_stack.raw_technologies
             }
             scraped_leads_summary.append(lead_summary)
+
+            if _is_job_cancelled(job_id):
+                logger.info(f"[HUNT:{job_id}] Cancelled before save — discarding lead, stopping cleanly.")
+                _update_job(job_id, status="CANCELLED", completed_at=datetime.now(timezone.utc).isoformat())
+                return
 
             pres = orchestrator.process_and_preserve_lead(lead, operator_id=op_id)
             if pres["success"]:
@@ -1972,6 +2009,7 @@ async def _run_scrape_job(
                             register_domain_seen(lead.domain, lead.primary_email, pres.get("lead_id"), _reg_conn)
                     except Exception:
                         pass
+                    _existing_domains.add(lead.domain.lower())
                 else:
                     rejected_leads.append({
                         "domain": lead.domain, "email": lead.primary_email,

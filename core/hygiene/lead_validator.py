@@ -248,11 +248,29 @@ class LeadValidationFilter:
 
         # 4b. Block dummy/placeholder emails unconditionally
         full_email_check = f"{local_part}@{domain_part}"
-        if full_email_check in DUMMY_PLACEHOLDER_EMAILS:
+        if (
+            full_email_check in DUMMY_PLACEHOLDER_EMAILS
+            or full_email_check.startswith("you@")
+            or full_email_check.startswith("test@")
+            or full_email_check.startswith("noreply@")
+            or full_email_check.startswith("no-reply@")
+        ):
             return False, None, f"Rejected dummy/placeholder email: '{full_email_check}'"
-        if domain_part in DUMMY_PLACEHOLDER_DOMAINS:
+        if (
+            domain_part in DUMMY_PLACEHOLDER_DOMAINS
+            or domain_part == "example.com"
+            or domain_part.endswith(".example.com")
+            or domain_part.startswith("example.")
+            or domain_part.startswith("example-")
+            or domain_part.endswith(".example")
+        ):
             return False, None, f"Rejected dummy/placeholder domain: '{domain_part}'"
-        if local_part in DUMMY_PLACEHOLDER_LOCAL_PARTS:
+        if (
+            local_part in DUMMY_PLACEHOLDER_LOCAL_PARTS
+            or local_part.startswith("test")
+            or local_part.startswith("noreply")
+            or local_part.startswith("no-reply")
+        ):
             return False, None, f"Rejected dummy/placeholder local-part: '{local_part}@'"
 
         # 5. Check for junk/tracker domains (wixpress.com, sentry-next.wixpress.com, sentry.io)
@@ -302,7 +320,22 @@ class LeadValidationFilter:
                 return False, f"Auto-rejected invalid/system email prefix: '{local_part}@'"
 
         # 1b. Dummy / placeholder email and domain rejection
-        if clean_email in DUMMY_PLACEHOLDER_EMAILS or email_dom in DUMMY_PLACEHOLDER_DOMAINS or local_part in DUMMY_PLACEHOLDER_LOCAL_PARTS:
+        if (
+            clean_email in DUMMY_PLACEHOLDER_EMAILS
+            or clean_email.startswith("you@")
+            or clean_email.startswith("test@")
+            or clean_email.startswith("noreply@")
+            or clean_email.startswith("no-reply@")
+            or email_dom in DUMMY_PLACEHOLDER_DOMAINS
+            or email_dom == "example.com"
+            or email_dom.endswith(".example.com")
+            or email_dom.startswith("example.")
+            or email_dom.startswith("example-")
+            or local_part in DUMMY_PLACEHOLDER_LOCAL_PARTS
+            or local_part.startswith("test")
+            or local_part.startswith("noreply")
+            or local_part.startswith("no-reply")
+        ):
             return False, f"Auto-rejected dummy/placeholder email: '{clean_email}'"
 
         # 1c. Off-niche media, magazine, blog, directory domain rejection
@@ -379,15 +412,39 @@ class LeadValidationFilter:
         """
         Cleans an extracted company name by removing HTML title separators (|, -, –, :)
         and generic words ('Home', 'Welcome to', 'Official Site').
-        Normalizes short raw fragments like 'AI' into clean brand names from domain.
+        Normalizes short raw fragments like 'AI' into clean brand names from domain/title/metadata.
         """
         if not name or not isinstance(name, str):
             return cls.extract_brand_name_from_domain(domain) if domain else ""
+
+        # Inspect all segments of title to find valid company brand (e.g. 'AI | Acme Platform' -> 'Acme Platform')
+        segments = TITLE_SEPARATORS_PATTERN.split(name)
+        valid_candidates = []
+        for seg in segments:
+            seg_clean = GENERIC_WORDS_PATTERN.sub('', seg)
+            seg_clean = re.sub(r'\s+', ' ', seg_clean).strip(' -–—:|•.,\t\r\n"\'')
+            if len(seg_clean) > 2 and seg_clean.upper() not in GENERIC_SHORT_FRAGMENTS and seg_clean.lower() not in GENERIC_NAV_TITLES:
+                valid_candidates.append(seg_clean)
+
+        if valid_candidates:
+            if domain:
+                dom_brand = cls.extract_brand_name_from_domain(domain).lower()
+                for c in valid_candidates:
+                    if dom_brand in c.lower() or c.lower() in dom_brand:
+                        return c
+            return valid_candidates[0]
+
         cleaned = TITLE_SEPARATORS_PATTERN.split(name)[0]
         cleaned = GENERIC_WORDS_PATTERN.sub('', cleaned)
         cleaned = re.sub(r'\s+', ' ', cleaned).strip(' -–—:|•.,\t\r\n"\'')
         if (len(cleaned) <= 2 or cleaned.upper() in GENERIC_SHORT_FRAGMENTS) and domain:
-            return cls.extract_brand_name_from_domain(domain)
+            dom_brand = cls.extract_brand_name_from_domain(domain)
+            if dom_brand and dom_brand.upper() not in GENERIC_SHORT_FRAGMENTS and len(dom_brand) > 2:
+                return dom_brand
+            stem = re.sub(r'\.(?:co\.[a-z]{2}|com\.[a-z]{2}|org\.[a-z]{2}|[a-z]{2,8})$', '', domain.strip().lower().replace("www.", ""))
+            if stem and len(stem) > 2:
+                return stem.replace("-", " ").replace(".", " ").title()
+            return f"{cleaned.upper()} Platform" if cleaned.upper() == "AI" else dom_brand
         return cleaned or (cls.extract_brand_name_from_domain(domain) if domain else name)
 
     @classmethod

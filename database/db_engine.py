@@ -254,7 +254,8 @@ class DatabaseEngine:
                 ("unsubscribed", "INTEGER NOT NULL DEFAULT 0"),
                 ("replied_at", "TIMESTAMP"),
                 ("reply_snippet", "TEXT"),
-                ("dispatched_at", "TIMESTAMP")
+                ("dispatched_at", "TIMESTAMP"),
+                ("industry_niche", "TEXT DEFAULT 'Commercial Construction'")
             ]
             for col_name, col_def in oq_migrations:
                 if col_name not in existing_oq_cols:

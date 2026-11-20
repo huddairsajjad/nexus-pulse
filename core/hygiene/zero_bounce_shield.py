@@ -128,6 +128,23 @@ class ZeroBounceHygieneShield:
             if prefix == p or prefix.startswith(p):
                 return False, False, f"Automated dead-end or invalid system prefix detected: {prefix}@"
 
+        # Check dummy/placeholder emails and domains unconditionally
+        if (
+            clean in {"you@company.com", "user@example.com", "email@example.com", "test@example.com"}
+            or clean.startswith("you@")
+            or clean.startswith("test@")
+            or clean.startswith("noreply@")
+            or clean.startswith("no-reply@")
+            or domain in {"example.com", "example.org", "example.net", "company.com", "domain.com", "test.com"}
+            or domain.endswith(".example.com")
+            or domain.startswith("example.")
+            or domain.startswith("example-")
+            or domain.endswith(".example")
+            or prefix in {"you", "user", "yourname", "name", "email", "someone", "test", "demo", "sample", "placeholder"}
+            or prefix.startswith("test")
+        ):
+            return False, False, f"Rejected dummy/placeholder email: '{clean}'"
+
         if domain in DISPOSABLE_DOMAINS or any(domain == d or domain.endswith("." + d) for d in ("wixpress.com", "sentry.io", "sentry-next.wixpress.com")):
             return True, True, f"Disposable or junk tracker domain detected: {domain}"
 

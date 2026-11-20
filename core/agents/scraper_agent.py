@@ -265,6 +265,28 @@ class SearchDiscoveryAgent:
         if not domain or any(d in domain for d in DISCARD_DOMAINS):
             return None
 
+        # Filter out placeholder seed domains (like example-contractor.de)
+        if (
+            domain.startswith("example-")
+            or domain == "example.com"
+            or domain.endswith(".example.com")
+            or domain.startswith("example.")
+            or domain.endswith(".example")
+            or "example-contractor" in domain
+            or domain.startswith("test-")
+            or domain.startswith("dummy-")
+            or domain == "test.com"
+        ):
+            return None
+
+        # Filter out off-niche media, magazine, blog, directory domains
+        try:
+            is_off, _ = LeadValidationFilter.is_off_niche_domain(domain)
+            if is_off:
+                return None
+        except Exception:
+            pass
+
         # Delegate .gov/.edu/.mil and system tracker blocks to LeadValidationFilter
         try:
             is_allowed, _ = LeadValidationFilter.check_role_and_domain_blocker("check@" + domain, domain)
@@ -395,8 +417,8 @@ class SearchDiscoveryAgent:
     @staticmethod
     def build_query_variations(niche: str, city: str, country: str) -> List[str]:
         """
-        Generates 4 query variations designed to surface real B2B company
-        contact pages rather than directories or social networks.
+        Generates diverse query variations designed to surface real B2B company
+        contact pages rather than directories, blogs, or social networks.
         """
         n = niche.strip()
         c = city.strip()
@@ -408,7 +430,17 @@ class SearchDiscoveryAgent:
             # Variation 3: simple unquoted — broadest fallback
             f'{n} general contractors {c} contact email',
             # Variation 4: "contact us" page targeting
-            f'{n} {c} "contact us" email site:.co.uk OR site:.com',
+            f'{n} {c} "contact us" email site:.co.uk OR site:.com OR site:.de',
+            # Variation 5: commercial company/firm inquiries
+            f'"{n}" firms "{c}" contact phone email',
+            # Variation 6: B2B services directory / company profile
+            f'{n} company "{c}" about us contact',
+            # Variation 7: commercial solutions & suppliers
+            f'"{n}" suppliers "{c}" "{country}" email',
+            # Variation 8: quotation / RFP / proposals
+            f'"{n}" "{c}" "request a quote" OR "commercial proposal" email',
+            # Variation 9: specialized industry providers
+            f'"{n}" specialists in "{c}" contact info',
         ]
 
     # ------------------------------------------------------------------
@@ -421,24 +453,32 @@ class SearchDiscoveryAgent:
         country: str = "United Kingdom",
         city: str = "London",
         niche: str = "Commercial Construction",
+        excluded_domains: Optional[Set[str]] = None,
+        is_cancelled: Optional[Any] = None,
     ) -> List[str]:
         """
         Runs the cascading 3-provider search pipeline and returns
-        up to `limit` unique company root-domain URLs.
-
-        Logging is comprehensive so Railway Deploy Logs show:
-        - which provider ran
-        - how many candidate URLs were found
-        - which domains were discarded and why
+        up to `limit` unique company root-domain URLs, automatically
+        excluding already captured/seen domains.
         """
         discovered_urls: List[str] = []
         seen_domains: Set[str] = set()
+        excluded: Set[str] = {d.strip().lower() for d in (excluded_domains or set()) if d}
+
+        if is_cancelled and is_cancelled():
+            logger.info("[DISCOVERY] Cancellation signal observed before start — aborting discovery.")
+            return []
 
         # Build the full query list: existing localised queries first, then
         # add our own commercial intent variations as extra fallback queries.
         all_queries: List[str] = []
         for q_item in queries:
-            raw_q = q_item.get("query", "")
+            if isinstance(q_item, dict):
+                raw_q = q_item.get("query", "")
+            elif isinstance(q_item, str):
+                raw_q = q_item.strip()
+            else:
+                raw_q = str(q_item).strip()
             if raw_q:
                 all_queries.append(raw_q)
 
@@ -449,7 +489,7 @@ class SearchDiscoveryAgent:
 
         logger.info(
             f"[DISCOVERY] Starting multi-provider search | niche='{niche}' | city='{city}' "
-            f"| country='{country}' | queries={len(all_queries)} | limit={limit}"
+            f"| country='{country}' | queries={len(all_queries)} | limit={limit} | excluded={len(excluded)}"
         )
 
         def _register_urls(raw_list: List[str], provider_name: str) -> int:
@@ -460,7 +500,12 @@ class SearchDiscoveryAgent:
                 if not u:
                     continue
                 domain = urlparse(u).netloc.replace("www.", "").lower()
-                if domain and domain not in seen_domains:
+                if not domain:
+                    continue
+                if domain in excluded:
+                    logger.debug(f"[DISCOVERY] ⊘ Skipping already-captured domain {domain}")
+                    continue
+                if domain not in seen_domains:
                     seen_domains.add(domain)
                     discovered_urls.append(u)
                     added += 1
@@ -477,6 +522,9 @@ class SearchDiscoveryAgent:
         ) as client:
 
             for query_str in all_queries:
+                if is_cancelled and is_cancelled():
+                    logger.info("[DISCOVERY] Cancellation signal observed — stopping discovery.")
+                    break
                 if len(discovered_urls) >= limit:
                     break
 
@@ -485,7 +533,7 @@ class SearchDiscoveryAgent:
                 # ── Provider 1: DDGS library (synchronous, run in thread pool) ──
                 try:
                     p1_raw = await asyncio.get_event_loop().run_in_executor(
-                        None, self._ddgs_search, query_str, limit
+                        None, self._ddgs_search, query_str, max(limit * 2, 20)
                     )
                 except Exception as ex:
                     p1_raw = []
@@ -494,12 +542,14 @@ class SearchDiscoveryAgent:
                 p1_added = _register_urls(p1_raw, "DDGS")
                 logger.info(f"[PROVIDER-1 DDGS] Added {p1_added} new unique domains from query")
 
+                if is_cancelled and is_cancelled():
+                    break
                 if len(discovered_urls) >= limit:
                     break
 
                 # ── Provider 2: Bing HTML (only if DDGS returned nothing useful) ──
                 if p1_added == 0:
-                    p2_raw = await self._bing_search(query_str, client, max_results=limit)
+                    p2_raw = await self._bing_search(query_str, client, max_results=max(limit * 2, 20))
                     p2_added = _register_urls(p2_raw, "BING")
                     logger.info(f"[PROVIDER-2 BING] Added {p2_added} new unique domains from query")
 
@@ -834,8 +884,8 @@ class DeepScraperAgent:
         if not primary:
             return None
 
-        if not company_name or len(company_name) < 2:
-            company_name = LeadValidationFilter.extract_brand_name_from_domain(domain)
+        if not company_name or len(company_name) <= 2 or company_name.upper().strip() in {"AI", "IT", "HR", "PR", "HQ", "CO", "IO", "APP", "DEV", "TECH"}:
+            company_name = LeadValidationFilter.clean_company_name(company_name, domain)
 
         # Extract phone numbers from tel: links
         phones: Set[str] = set()
@@ -883,23 +933,35 @@ class DeepScraperAgent:
         country: str = "United Kingdom",
         city: str = "London",
         niche: str = "Commercial Construction",
+        is_cancelled: Optional[Any] = None,
     ) -> Optional[Lead]:
         """
-        Asynchronously scrapes a target company URL.
-        Crawl strategy:
-          1. Fetch root page → parse for emails
-          2. If no emails: discover contact/about/impressum subpages via DOM anchors
-          3. Also try up to 2 common subpath guesses (/contact, /about-us, etc.)
-          4. Crawl up to 3 subpages; return first successful Lead
+        Asynchronously scrapes a target company URL with strict short connect/read timeouts.
+        Immediately skips dead/unreachable placeholder seed domains (like example-contractor.de).
+        Honors cancellation tokens so aborted crawls stop cleanly and never insert zombie leads.
         """
+        if is_cancelled and is_cancelled():
+            return None
+
         target_url = url.strip()
         if not target_url.startswith("http://") and not target_url.startswith("https://"):
             target_url = f"https://{target_url}"
 
-        # Guard against off-niche media, magazine, blog, directory domains
+        # Immediately skip placeholder, dummy, or off-niche media/blog/directory domains
         try:
             parsed_u = urlparse(target_url)
             dom_check = parsed_u.netloc.lower().replace("www.", "").split(":")[0]
+            if (
+                dom_check in {"example.com", "company.com", "domain.com", "test.com"}
+                or dom_check.startswith("example-")
+                or "example" in dom_check
+                or dom_check.endswith(".example")
+                or "placeholder" in dom_check
+                or "example-contractor" in dom_check
+            ):
+                logger.info(f"[SCRAPER] ⊘ Immediately skipping placeholder seed domain: {dom_check}")
+                return None
+
             is_off, off_reason = LeadValidationFilter.is_off_niche_domain(dom_check, niche)
             if is_off:
                 logger.info(f"[SCRAPER] ⊘ Skipping off-niche domain {dom_check}: {off_reason}")
@@ -909,30 +971,27 @@ class DeepScraperAgent:
 
         logger.info(f"[SCRAPER] ▶ Crawling {target_url}")
 
+        req_timeout = httpx.Timeout(connect=3.0, read=min(self.timeout, 5.0), write=5.0, pool=5.0)
         try:
             async with httpx.AsyncClient(
                 headers=_rotated_headers(),
-                timeout=self.timeout,
+                timeout=req_timeout,
                 follow_redirects=True,
                 verify=False,
             ) as client:
+                if is_cancelled and is_cancelled():
+                    return None
 
                 # ── Attempt 1: Root page ──────────────────────────────
                 resp = None
                 try:
                     resp = await client.get(target_url)
                 except Exception as fetch_err:
-                    logger.warning(f"[SCRAPER] HTTPS fetch failed for {target_url}: {fetch_err}")
-                    if target_url.startswith("https://"):
-                        fallback = "http://" + target_url[8:]
-                        logger.info(f"[SCRAPER] Trying HTTP fallback: {fallback}")
-                        try:
-                            resp = await client.get(fallback)
-                        except Exception as fb_err:
-                            logger.warning(f"[SCRAPER] HTTP fallback also failed for {fallback}: {fb_err}")
+                    logger.debug(f"[SCRAPER] Fetch failed for {target_url}: {fetch_err}")
+                    return None  # Fast abort for unreachable domains
 
                 if not resp or resp.status_code >= 400:
-                    logger.warning(
+                    logger.debug(
                         f"[SCRAPER] {target_url} non-success: "
                         f"{resp.status_code if resp else 'NO_RESPONSE'}"
                     )
@@ -1010,6 +1069,8 @@ class DeepScraperAgent:
                     pass
 
                 for sub_url in candidate_subpages:
+                    if is_cancelled and is_cancelled():
+                        return None
                     try:
                         sub_resp = None
                         for retry_attempt in range(2):
