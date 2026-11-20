@@ -82,10 +82,13 @@ DISCARD_DOMAINS = {
 JUNK_EMAIL_PREFIXES = (
     "noreply", "no-reply", "support", "privacy", "webmaster",
     "sentry", "mailer-daemon", "donotreply", "do-not-reply",
-    "bounce", "admin", "careers", "press",
+    "bounce", "admin", "careers", "press", "example", "test",
+    "demo", "sample", "placeholder", "user", "you"
 )
 JUNK_EMAIL_DOMAINS = {
-    "example.com", "facebook.com", "linkedin.com", "yelp.com",
+    "example.com", "email.com", "sample.com", "domain.com", "test.com",
+    "company.com", "yourdomain.com", "mydomain.com",
+    "facebook.com", "linkedin.com", "yelp.com",
     "yellowpages.com", "houzz.com", "checkatrade.com", "bark.com",
 }
 
@@ -421,29 +424,52 @@ class SearchDiscoveryAgent:
         """
         Generates diverse query variations designed to surface real B2B company
         contact pages rather than directories, blogs, or social networks.
+        Dynamically adapts between construction-specific and universal multi-niche commercial queries.
         """
         n = niche.strip()
         c = city.strip()
-        return [
-            # Variation 1: direct intent with estimating/tenders signal
-            f'"{n}" "{c}" "estimating" OR "tenders" contact email',
-            # Variation 2: contractor + @ symbol (surfaces mailto: pages)
-            f'"{n}" contractor "{c}" "@"',
-            # Variation 3: simple unquoted — broadest fallback
-            f'{n} general contractors {c} contact email',
-            # Variation 4: "contact us" page targeting
-            f'{n} {c} "contact us" email site:.co.uk OR site:.com OR site:.de',
-            # Variation 5: commercial company/firm inquiries
-            f'"{n}" firms "{c}" contact phone email',
-            # Variation 6: B2B services directory / company profile
-            f'{n} company "{c}" about us contact',
-            # Variation 7: commercial solutions & suppliers
-            f'"{n}" suppliers "{c}" "{country}" email',
-            # Variation 8: quotation / RFP / proposals
-            f'"{n}" "{c}" "request a quote" OR "commercial proposal" email',
-            # Variation 9: specialized industry providers
-            f'"{n}" specialists in "{c}" contact info',
-        ]
+        n_lower = n.lower()
+        construction_keywords = (
+            "construction", "contractor", "hochbau", "tiefbau", "bâtiment",
+            "building", "roofing", "mep", "tga", "civil", "infrastructure",
+            "architecture", "architect", "engineering", "plumbing", "electrical"
+        )
+        is_construction = any(ck in n_lower for ck in construction_keywords)
+
+        if is_construction:
+            return [
+                # Variation 1: direct intent with estimating/tenders signal
+                f'"{n}" "{c}" "estimating" OR "tenders" contact email',
+                # Variation 2: contractor + @ symbol (surfaces mailto: pages)
+                f'"{n}" contractor "{c}" "@"',
+                # Variation 3: simple unquoted — broadest fallback
+                f'{n} general contractors {c} contact email',
+                # Variation 4: "contact us" page targeting
+                f'{n} {c} "contact us" email',
+                # Variation 5: commercial company/firm inquiries
+                f'"{n}" firms "{c}" contact phone email',
+                # Variation 6: B2B services directory / company profile
+                f'{n} company "{c}" about us contact',
+                # Variation 7: commercial solutions & suppliers
+                f'"{n}" suppliers "{c}" "{country}" email',
+                # Variation 8: quotation / RFP / proposals
+                f'"{n}" "{c}" "request a quote" OR "commercial proposal" email',
+                # Variation 9: specialized industry providers
+                f'"{n}" specialists in "{c}" contact info',
+            ]
+        else:
+            return [
+                # Universal multi-niche commercial query variations
+                f'"{n}" "{c}" contact email',
+                f'"{n}" "{c}" "contact us" email',
+                f'"{n}" agency OR company OR firm "{c}" email',
+                f'"{n}" "{c}" inurl:contact',
+                f'"{n}" "{c}" inquiries email phone',
+                f'{n} "{c}" "{country}" contact us',
+                f'"{n}" "{c}" official website email',
+                f'"{n}" "{c}" "info@" OR "contact@"',
+                f'"{n}" specialists "{c}" contact info',
+            ]
 
     # ------------------------------------------------------------------
     # Main discovery entry point
@@ -599,6 +625,15 @@ class DeepScraperAgent:
         if not email or "@" not in email:
             return True
         local, domain = email.lower().split("@", 1)
+        # Strict dummy / placeholder / example checks
+        if local in {"example", "test", "demo", "sample", "placeholder", "user", "you", "yourname", "name", "someone"}:
+            return True
+        if domain in {"email.com", "example.com", "sample.com", "domain.com", "company.com", "test.com", "yourdomain.com", "mydomain.com"}:
+            return True
+        if domain.startswith("example.") or domain.startswith("example-") or domain.startswith("test-"):
+            return True
+        if local.startswith("example") or local.startswith("test-") or local.startswith("noreply") or local.startswith("no-reply"):
+            return True
         # Junk domains
         if any(domain == jd or domain.endswith("." + jd) for jd in JUNK_EMAIL_DOMAINS):
             return True

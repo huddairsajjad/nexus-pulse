@@ -37,14 +37,15 @@ DUMMY_PLACEHOLDER_EMAILS = {
     "you@company.com", "user@example.com", "email@example.com",
     "test@example.com", "hello@example.com", "info@example.com",
     "contact@example.com", "name@company.com", "yourname@domain.com",
+    "example@email.com", "user@email.com", "test@email.com", "admin@email.com",
 }
 DUMMY_PLACEHOLDER_LOCAL_PARTS = {
     "you", "user", "yourname", "name", "email", "someone",
-    "test", "demo", "sample", "placeholder",
+    "test", "demo", "sample", "placeholder", "example",
 }
 DUMMY_PLACEHOLDER_DOMAINS = {
     "example.com", "example.org", "example.net", "company.com", "domain.com",
-    "yourdomain.com", "mydomain.com", "acme.com", "test.com",
+    "yourdomain.com", "mydomain.com", "acme.com", "test.com", "email.com", "sample.com",
 }
 
 # Off-niche domain keywords — media, magazine, directory, blog sources never valid B2B leads
@@ -252,6 +253,7 @@ class LeadValidationFilter:
             full_email_check in DUMMY_PLACEHOLDER_EMAILS
             or full_email_check.startswith("you@")
             or full_email_check.startswith("test@")
+            or full_email_check.startswith("example@")
             or full_email_check.startswith("noreply@")
             or full_email_check.startswith("no-reply@")
         ):
@@ -259,6 +261,7 @@ class LeadValidationFilter:
         if (
             domain_part in DUMMY_PLACEHOLDER_DOMAINS
             or domain_part == "example.com"
+            or domain_part == "email.com"
             or domain_part.endswith(".example.com")
             or domain_part.startswith("example.")
             or domain_part.startswith("example-")
@@ -267,6 +270,7 @@ class LeadValidationFilter:
             return False, None, f"Rejected dummy/placeholder domain: '{domain_part}'"
         if (
             local_part in DUMMY_PLACEHOLDER_LOCAL_PARTS
+            or local_part == "example"
             or local_part.startswith("test")
             or local_part.startswith("noreply")
             or local_part.startswith("no-reply")
@@ -324,14 +328,17 @@ class LeadValidationFilter:
             clean_email in DUMMY_PLACEHOLDER_EMAILS
             or clean_email.startswith("you@")
             or clean_email.startswith("test@")
+            or clean_email.startswith("example@")
             or clean_email.startswith("noreply@")
             or clean_email.startswith("no-reply@")
             or email_dom in DUMMY_PLACEHOLDER_DOMAINS
             or email_dom == "example.com"
+            or email_dom == "email.com"
             or email_dom.endswith(".example.com")
             or email_dom.startswith("example.")
             or email_dom.startswith("example-")
             or local_part in DUMMY_PLACEHOLDER_LOCAL_PARTS
+            or local_part == "example"
             or local_part.startswith("test")
             or local_part.startswith("noreply")
             or local_part.startswith("no-reply")

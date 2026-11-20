@@ -131,16 +131,76 @@ class ReplyClassifier:
         return "NEUTRAL", False
 
     @classmethod
-    def draft_1click_response(cls, sender_email: str, company_name: str, incoming_body: str) -> str:
-        """Generates dynamic AI response template ready for 1-click dispatch."""
-        return (
-            f"Dear Commercial Team at {company_name},\n\n"
-            f"Thank you for your response. We would be pleased to review the tender specifications.\n\n"
-            f"Please forward the bill of quantities / drawings to this address or provide access to your procurement portal.\n\n"
-            f"Our team will turn around an estimate within 48-72 hours.\n\n"
-            f"Best regards,\n"
-            f"H.Huddair Commercial Estimating Team"
-        )
+    def clean_incoming_inquiry_body(cls, text: str) -> str:
+        """
+        Removes quoted previous email thread lines (> ...), reply headers
+        (On ... wrote:), and email disclaimers so only the new message remains.
+        """
+        if not text:
+            return ""
+        lines = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            # Stop or skip quoted lines
+            if stripped.startswith(">"):
+                continue
+            if re.match(r'^-+\s*(?:original message|forwarded message)\s*-+', stripped, re.IGNORECASE):
+                break
+            if re.match(r'^on\s+.+wrote\s*:\s*$', stripped, re.IGNORECASE):
+                break
+            if re.match(r'^(?:from|sent|to|subject)\s*:\s*.+', stripped, re.IGNORECASE) and len(lines) > 0:
+                break
+            lines.append(line)
+        cleaned = "\n".join(lines).strip()
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+        return cleaned or text.strip()
+
+    @classmethod
+    def draft_1click_response(cls, sender_email: str, company_name: str, incoming_body: str, niche: Optional[str] = None) -> str:
+        """Generates dynamic AI response template adapted to lead's niche and inquiry."""
+        clean_inquiry = cls.clean_incoming_inquiry_body(incoming_body)
+        n = (niche or "").strip().lower()
+
+        if "real estate" in n or "property" in n or "brokerage" in n:
+            return (
+                f"Dear Team at {company_name},\n\n"
+                f"Thank you for reaching out regarding luxury property opportunities. We would be delighted to provide full portfolio details, availability, and arrange a private consultation.\n\n"
+                f"Please let us know your preferred timeline and specific requirements so we can tailor our presentation.\n\n"
+                f"Best regards,\n"
+                f"H.Huddair Executive Client Advisory"
+            )
+        elif "saas" in n or "software" in n or "tech" in n or "api" in n:
+            return (
+                f"Dear Team at {company_name},\n\n"
+                f"Thank you for your response. We would be pleased to schedule a 15-minute product walkthrough to explore how our workflow automation aligns with your product goals.\n\n"
+                f"Please let us know your availability this week for a brief call.\n\n"
+                f"Best regards,\n"
+                f"H.Huddair Strategic Accounts Team"
+            )
+        elif "gym" in n or "fitness" in n:
+            return (
+                f"Dear Commercial Procurement Team at {company_name},\n\n"
+                f"Thank you for your response regarding commercial fitness outfitting and supply. We would be pleased to share our commercial catalog and trade volume pricing.\n\n"
+                f"Please let us know if you have upcoming facility upgrades or specific equipment needs.\n\n"
+                f"Best regards,\n"
+                f"H.Huddair Commercial Fitness Team"
+            )
+        elif "construction" in n or "contractor" in n or "mep" in n or "roofing" in n:
+            return (
+                f"Dear Commercial Team at {company_name},\n\n"
+                f"Thank you for your response. We would be pleased to review the tender specifications and project requirements.\n\n"
+                f"Please forward the bill of quantities or project scope, and our team will turn around an estimate within 48-72 hours.\n\n"
+                f"Best regards,\n"
+                f"H.Huddair Commercial Estimating Team"
+            )
+        else:
+            return (
+                f"Dear Team at {company_name},\n\n"
+                f"Thank you for your response. We would be delighted to connect and explore commercial collaboration opportunities with {company_name}.\n\n"
+                f"Please let us know your availability for a brief 10-15 minute introductory conversation this week.\n\n"
+                f"Best regards,\n"
+                f"H.Huddair Commercial Executive Team"
+            )
 
 
 class IMAPReplyListener:
@@ -346,7 +406,12 @@ class IMAPReplyListener:
         """
         clean_sender = sender_email.strip().lower()
         domain_part = clean_sender.split("@")[-1] if "@" in clean_sender else clean_sender
-        comp = company_name or domain_part.capitalize()
+        public_providers = {"gmail.com", "googlemail.com", "yahoo.com", "ymail.com", "outlook.com", "hotmail.com", "live.com", "icloud.com", "aol.com", "mail.com", "proton.me", "protonmail.com"}
+        if domain_part in public_providers:
+            local_user = clean_sender.split("@")[0].replace(".", " ").replace("_", " ").replace("-", " ").title()
+            comp = company_name or (f"{local_user} (Direct Inquirer)" if len(local_user) > 2 else "Direct Commercial Inquirer")
+        else:
+            comp = company_name or domain_part.capitalize()
         clean_subject = re.sub(r'^(?:(?:re|aw|wg|fwd|fw|antwort)\s*:\s*)+', '', subject, flags=re.IGNORECASE).strip()
 
         classification, is_hot = ReplyClassifier.classify(subject, body, clean_sender)
@@ -424,8 +489,19 @@ class IMAPReplyListener:
             else:
                 matching_qid = None
 
-            ai_reply = ReplyClassifier.draft_1click_response(clean_sender, comp, body) if is_hot else ""
-            snippet = (body or "").strip()[:280]
+            lead_niche = None
+            if matching_q:
+                try:
+                    lead_niche = matching_q["industry_niche"]
+                except Exception:
+                    try:
+                        lead_niche = matching_q["target_country"]
+                    except Exception:
+                        lead_niche = None
+
+            cleaned_body = ReplyClassifier.clean_incoming_inquiry_body(body)
+            ai_reply = ReplyClassifier.draft_1click_response(clean_sender, comp, body, niche=lead_niche) if is_hot else ""
+            snippet = (cleaned_body or body or "").strip()[:280]
 
             # Determine if this is a newly detected reply on a currently dispatched lead
             is_new_reply = False

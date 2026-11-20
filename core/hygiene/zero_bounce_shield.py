@@ -130,17 +130,18 @@ class ZeroBounceHygieneShield:
 
         # Check dummy/placeholder emails and domains unconditionally
         if (
-            clean in {"you@company.com", "user@example.com", "email@example.com", "test@example.com"}
+            clean in {"you@company.com", "user@example.com", "email@example.com", "test@example.com", "example@email.com"}
             or clean.startswith("you@")
             or clean.startswith("test@")
+            or clean.startswith("example@")
             or clean.startswith("noreply@")
             or clean.startswith("no-reply@")
-            or domain in {"example.com", "example.org", "example.net", "company.com", "domain.com", "test.com"}
+            or domain in {"example.com", "example.org", "example.net", "company.com", "domain.com", "test.com", "email.com", "sample.com"}
             or domain.endswith(".example.com")
             or domain.startswith("example.")
             or domain.startswith("example-")
             or domain.endswith(".example")
-            or prefix in {"you", "user", "yourname", "name", "email", "someone", "test", "demo", "sample", "placeholder"}
+            or prefix in {"you", "user", "yourname", "name", "email", "someone", "test", "demo", "sample", "placeholder", "example"}
             or prefix.startswith("test")
         ):
             return False, False, f"Rejected dummy/placeholder email: '{clean}'"

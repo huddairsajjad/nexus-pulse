@@ -306,6 +306,15 @@ function NexusPulseApp() {
   const [activeTab, setActiveTab] = useState("kanban");
   const [alertBanner, setAlertBanner] = useState(null);
 
+  // Auto-dismiss banners cleanly (8s for info/success, 12s for warnings/errors)
+  useEffect(() => {
+    if (!alertBanner) return;
+    const timer = setTimeout(() => {
+      setAlertBanner(null);
+    }, alertBanner.type === "danger" || alertBanner.type === "error" ? 12000 : 8000);
+    return () => clearTimeout(timer);
+  }, [alertBanner]);
+
   // Workflow state machine tracking for Replied -> Hot Lead advancement
   const [promotedToHotLeadIds, setPromotedToHotLeadIds] = useState(() => {
     try {
@@ -562,6 +571,8 @@ function NexusPulseApp() {
           setPulseState("HOT_ALERT");
         } else if (isDispatchingNow || (dispRes && dispRes.status === "DISPATCHING")) {
           setPulseState("DISPATCHING");
+        } else if (isHunting) {
+          setPulseState("HUNTING");
         } else if (dispRes && dispRes.status === "RUNNING") {
           setPulseState("RUNNING");
         } else if (approvalsRes && approvalsRes.length > 0) {
@@ -570,7 +581,7 @@ function NexusPulseApp() {
           setPulseState("RUNNING");
         }
       } else if (dispRes && dispRes.status) {
-        setPulseState(dispRes.status === "DISPATCHING" ? "DISPATCHING" : "RUNNING");
+        setPulseState(dispRes.status === "DISPATCHING" ? "DISPATCHING" : (isHunting ? "HUNTING" : "RUNNING"));
       }
       if (Array.isArray(mailboxesRes)) setMailboxes(mailboxesRes);
       if (tzRes) setTimezones(tzRes);
@@ -1196,7 +1207,7 @@ function doPost(e) {
     const jobId = activeScrapeJobId;
     setActiveScrapeJobId(null);
     setIsHunting(false);
-    setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
+    setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
     setIsHuntModalOpen(false);
 
     if (jobId) {
@@ -1209,6 +1220,7 @@ function doPost(e) {
         console.warn("Cancel job request error:", e);
       }
     }
+    fetchData();
     setAlertBanner({
       type: "info",
       message: "Lead hunt cancelled. Ongoing operations stopped cleanly."
@@ -1327,15 +1339,18 @@ function doPost(e) {
               scrapePollTimerRef.current = null;
               setActiveScrapeJobId(null);
               setIsHunting(false);
-              setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
+              setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
               setIsHuntModalOpen(false);
+              fetchData();
               setAlertBanner({ type: "info", message: "Crawl was cancelled." });
             } else if (statusData.status === "ERROR") {
               clearInterval(pollTimer);
               scrapePollTimerRef.current = null;
               setActiveScrapeJobId(null);
               setIsHunting(false);
-              setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
+              setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
+              setIsHuntModalOpen(false);
+              fetchData();
               setAlertBanner({ type: "danger", message: `Scrape error: ${statusData.error || "Unknown error"}` });
             } else {
               // IN_PROGRESS: update progress if available
@@ -1682,10 +1697,19 @@ function doPost(e) {
   // ---------------------------------------------------------------------------
   const handleOpenHotLeadModal = (lead) => {
     setSelectedHotLead(lead);
-    const inquiryText = lead.reply_snippet || lead.incoming_message || lead.last_reply_body || "";
+    // Strip quoted > thread lines, On ... wrote headers, and email continuation noise
+    const rawInquiry = lead.reply_snippet || lead.incoming_message || lead.last_reply_body || "";
+    const inquiryText = rawInquiry
+      .split("\n")
+      .filter(line => !line.trim().startsWith(">") && !/^on\s.+wrote:$/i.test(line.trim()))
+      .join("\n")
+      .trim();
     setIncomingInquiryText(inquiryText);
+    const resolvedComp = lead.company_name && !["gmail.com", "outlook.com", "yahoo.com", "hotmail.com", "icloud.com", "mail.com"].includes(lead.company_name.toLowerCase()) && lead.company_name !== lead.sender_email
+      ? lead.company_name
+      : (lead.sender_email ? lead.sender_email.split("@")[0].replace(/[._-]/g, " ").replace(/\b\w/g, c => c.toUpperCase()) : "your organization");
     const aiDraft = lead.ai_suggested_reply || (inquiryText
-      ? `Thank you for your inquiry regarding ${lead.company_name || "your project"}.\n\nWe'd be happy to arrange a call to discuss next steps. Please let us know your availability.\n\nBest regards`
+      ? `Thank you for your inquiry regarding ${resolvedComp}.\n\nWe would be glad to connect and discuss how we can assist with your requirements. Please let us know your availability for a brief conversation this week.\n\nBest regards`
       : "");
     setHotLeadReplyBody(aiDraft);
   };
@@ -3004,7 +3028,7 @@ function doPost(e) {
                   Pipeline Lifecycle: Autonomous Lead Engine
                 </h2>
                 <p className="text-xs text-theme-secondary mt-0.5">
-                  Tracking verified estimating targets through zero-bounce hygiene, human gate, and IMAP listeners.
+                  Multi-niche verified B2B contacts tracked through zero-bounce hygiene, human approval gate, and IMAP reply listeners.
                 </p>
               </div>
 
@@ -3195,7 +3219,7 @@ function doPost(e) {
                                 <div className="space-y-1.5 mt-1">
                                   {normalizeLeadStatus(lead.status) === "HOT_LEAD" && (
                                     <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-red-950 text-red-300 border border-red-800 flex items-center gap-1 font-semibold">
-                                      🔥 Hot Tender Inquiry
+                                      🔥 Hot Lead Inquiry
                                     </span>
                                   )}
                                   <div className="flex items-center gap-1">
@@ -3442,7 +3466,7 @@ function doPost(e) {
                 <span>🔥 Hot Lead Inquiries & Instant Response Stream</span>
               </h2>
               <p className="text-xs text-theme-secondary mt-0.5">
-                Incoming responses classified by LLM agent as high-intent estimating or tender opportunities.
+                Incoming replies classified by IMAP listener as high-intent commercial opportunities across all active niches.
               </p>
             </div>
 
@@ -3450,7 +3474,7 @@ function doPost(e) {
               <div className="np-card p-12 text-center">
                 <span className="text-3xl mb-2 block">📡</span>
                 <h3 className="font-semibold text-sm text-theme-primary">IMAP Reply Listener Active</h3>
-                <p className="text-xs text-theme-secondary mt-1">Listening on enrolled mailboxes for tender replies...</p>
+                <p className="text-xs text-theme-secondary mt-1">Listening on enrolled mailboxes for high-intent commercial replies across all active niches...</p>
               </div>
             ) : (
               <div className="space-y-3">
@@ -3459,7 +3483,13 @@ function doPost(e) {
                     <div className="flex items-start justify-between">
                       <div>
                         <div className="flex items-center gap-2">
-                          <h3 className="font-semibold text-sm text-theme-primary">{hl.company_name}</h3>
+                          <h3 className="font-semibold text-sm text-theme-primary">
+                            {hl.company_name && !["gmail.com", "outlook.com", "yahoo.com", "hotmail.com", "icloud.com", "mail.com"].includes(hl.company_name.toLowerCase()) && hl.company_name !== hl.sender_email
+                              ? hl.company_name
+                              : (hl.sender_email
+                                  ? hl.sender_email.split("@")[0].replace(/[._-]/g, " ").replace(/\b\w/g, c => c.toUpperCase())
+                                  : (hl.company_name || "Direct Inquirer"))}
+                          </h3>
                           <span className="badge badge-danger">HOT INQUIRY</span>
                         </div>
                         <p className="text-xs font-mono text-theme-accent mt-0.5">{hl.sender_email}</p>
@@ -5294,7 +5324,11 @@ function doPost(e) {
             <div className="np-modal-header">
               <div>
                 <h3 className="font-bold text-sm text-theme-danger">
-                  1-Click AI Response: {selectedHotLead.company_name}
+                  1-Click AI Response: {selectedHotLead.company_name && !["gmail.com", "outlook.com", "yahoo.com", "hotmail.com", "icloud.com", "mail.com"].includes(selectedHotLead.company_name.toLowerCase()) && selectedHotLead.company_name !== selectedHotLead.sender_email
+                    ? selectedHotLead.company_name
+                    : (selectedHotLead.sender_email
+                        ? selectedHotLead.sender_email.split("@")[0].replace(/[._-]/g, " ").replace(/\b\w/g, c => c.toUpperCase())
+                        : (selectedHotLead.company_name || "Direct Inquirer"))}
                 </h3>
                 <p className="text-xs text-theme-secondary mt-0.5">
                   High-intent response detected by IMAP listener.

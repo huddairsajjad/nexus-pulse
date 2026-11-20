@@ -148,6 +148,90 @@ LOCALIZATION_MATRIX: Dict[str, Dict[str, Any]] = {
             "RFP Submissions"
         ],
         "contact_anchors": ["Contact Us", "Locations", "Leadership", "Estimating"]
+    },
+    "united arab emirates": {
+        "lang_code": "en",
+        "tld": ".ae",
+        "niche_translations": {
+            "commercial construction": "Commercial Building Construction",
+            "general contractors": "General Contracting Companies",
+            "luxury real estate": "Luxury Real Estate Properties Agencies",
+            "architecture": "Architectural Consulting Engineering",
+            "mep engineering": "MEP Contracting Services"
+        },
+        "intent_triggers": [
+            "Commercial Department",
+            "Procurement",
+            "Business Inquiries",
+            "Tenders",
+            "Client Relations"
+        ],
+        "contact_anchors": ["Contact Us", "Head Office", "About Us", "Inquiries"]
+    },
+    "saudi arabia": {
+        "lang_code": "ar",
+        "tld": ".sa",
+        "niche_translations": {
+            "commercial construction": "شركات المقاولات والإنشاءات",
+            "general contractors": "المقاولون العموميون",
+            "luxury real estate": "العقارات الفاخرة والاستثمار العقاري"
+        },
+        "intent_triggers": [
+            "إدارة المشتريات",
+            "المناقصات والعقود",
+            "التواصل التجاري"
+        ],
+        "contact_anchors": ["اتصل بنا", "تواصل معنا", "من نحن", "المكتب الرئيسي"]
+    },
+    "canada": {
+        "lang_code": "en",
+        "tld": ".ca",
+        "niche_translations": {
+            "commercial construction": "Commercial General Contractors",
+            "general contractors": "General Contracting Construction"
+        },
+        "intent_triggers": ["Estimating", "Tenders", "Procurement", "Inquiries"],
+        "contact_anchors": ["Contact Us", "Head Office", "About Us"]
+    },
+    "australia": {
+        "lang_code": "en",
+        "tld": ".com.au",
+        "niche_translations": {
+            "commercial construction": "Commercial Building Contractors",
+            "general contractors": "Commercial Head Contractors"
+        },
+        "intent_triggers": ["Tenders", "Estimating", "Commercial Enquiries"],
+        "contact_anchors": ["Contact Us", "Head Office", "About Us"]
+    },
+    "netherlands": {
+        "lang_code": "nl",
+        "tld": ".nl",
+        "niche_translations": {
+            "commercial construction": "Commerciële Utiliteitsbouw Bouwbedrijf",
+            "general contractors": "Hoofdaannemer Bouw"
+        },
+        "intent_triggers": ["Aanbestedingen", "Calculatie", "Inkoop"],
+        "contact_anchors": ["Contact", "Over ons", "Vestiging"]
+    },
+    "switzerland": {
+        "lang_code": "de",
+        "tld": ".ch",
+        "niche_translations": {
+            "commercial construction": "Gewerbebau Generalunternehmung",
+            "general contractors": "Generalunternehmer Bau"
+        },
+        "intent_triggers": ["Ausschreibungen", "Kalkulation", "Bauofferten"],
+        "contact_anchors": ["Kontakt", "Impressum", "Standort"]
+    },
+    "austria": {
+        "lang_code": "de",
+        "tld": ".at",
+        "niche_translations": {
+            "commercial construction": "Gewerblicher Hochbau Bauunternehmen",
+            "general contractors": "Generalunternehmer Hochbau"
+        },
+        "intent_triggers": ["Ausschreibungen", "Kalkulation", "Angebote"],
+        "contact_anchors": ["Kontakt", "Impressum", "Standort"]
     }
 }
 
@@ -213,45 +297,93 @@ class LocalizationEngine:
         intents = locale["intent_triggers"]
         anchors = locale["contact_anchors"]
 
+        # Check whether this is a construction/contractor-focused niche
+        construction_keywords = (
+            "construction", "contractor", "hochbau", "tiefbau", "bâtiment",
+            "building", "roofing", "mep", "tga", "civil", "infrastructure",
+            "architecture", "architect", "engineering", "plumbing", "electrical",
+            "bauunternehmen", "travaux", "edificación"
+        )
+        is_construction = any(ck in clean_niche for ck in construction_keywords)
+
         queries: List[Dict[str, str]] = []
 
-        # Query 1: High-precision intent (Estimating / Tenders / Bids in native language)
-        q1 = f'"{localized_niche}" "{clean_city}" ("{intents[0]}" OR "{intents[1]}") site:{tld}'
-        queries.append({
-            "type": "HIGH_INTENT_ESTIMATING",
-            "query": q1,
-            "language": lang_code,
-            "description": f"Targeting estimating & bidding departments in {city}"
-        })
+        if is_construction:
+            # Construction-specific bidding/tender/estimating operators
+            q1 = f'"{localized_niche}" "{clean_city}" ("{intents[0]}" OR "{intents[1]}") site:{tld}'
+            queries.append({
+                "type": "HIGH_INTENT_ESTIMATING",
+                "query": q1,
+                "language": lang_code,
+                "description": f"Targeting estimating & bidding departments in {city}"
+            })
 
-        # Query 2: Direct contact & imprint discovery
-        q2 = f'"{localized_niche}" "{clean_city}" "{anchors[0]}" "{anchors[1]}" email'
-        queries.append({
-            "type": "DIRECT_CONTACT_DISCOVERY",
-            "query": q2,
-            "language": lang_code,
-            "description": f"Targeting corporate contact & directory pages in {city}"
-        })
+            q2 = f'"{localized_niche}" "{clean_city}" "{anchors[0]}" "{anchors[1]}" email'
+            queries.append({
+                "type": "DIRECT_CONTACT_DISCOVERY",
+                "query": q2,
+                "language": lang_code,
+                "description": f"Targeting corporate contact & directory pages in {city}"
+            })
 
-        # Query 3: Subcontractor & Procurement portal
-        trigger_3 = intents[2] if len(intents) > 2 else intents[0]
-        q3 = f'"{localized_niche}" "{clean_city}" "{trigger_3}" ("@")'
-        queries.append({
-            "type": "PROCUREMENT_PORTAL",
-            "query": q3,
-            "language": lang_code,
-            "description": f"Targeting procurement and tender submissions in {city}"
-        })
+            trigger_3 = intents[2] if len(intents) > 2 else intents[0]
+            q3 = f'"{localized_niche}" "{clean_city}" "{trigger_3}" ("@")'
+            queries.append({
+                "type": "PROCUREMENT_PORTAL",
+                "query": q3,
+                "language": lang_code,
+                "description": f"Targeting procurement and tender submissions in {city}"
+            })
 
-        # Query 4: Executive leadership and commercial directory
-        anchor_lead = anchors[2] if len(anchors) > 2 else anchors[0]
-        q4 = f'"{localized_niche}" "{clean_city}" "{anchor_lead}" ("mailto:")'
-        queries.append({
-            "type": "LEADERSHIP_MAILTO",
-            "query": q4,
-            "language": lang_code,
-            "description": f"Targeting mailto links on {city} contractor sites"
-        })
+            anchor_lead = anchors[2] if len(anchors) > 2 else anchors[0]
+            q4 = f'"{localized_niche}" "{clean_city}" "{anchor_lead}" ("mailto:")'
+            queries.append({
+                "type": "LEADERSHIP_MAILTO",
+                "query": q4,
+                "language": lang_code,
+                "description": f"Targeting mailto links on {city} contractor sites"
+            })
+        else:
+            # Universal Multi-Niche Commercial queries (Luxury Real Estate, SaaS, Fitness, etc.)
+            q1 = f'"{localized_niche}" "{clean_city}" contact email site:{tld}'
+            queries.append({
+                "type": "NICHE_LOCAL_CONTACT",
+                "query": q1,
+                "language": lang_code,
+                "description": f"Targeting verified {niche} contact pages in {city}"
+            })
+
+            q2 = f'"{localized_niche}" ("agency" OR "company" OR "firm" OR "brokerage" OR "office") "{clean_city}" email'
+            queries.append({
+                "type": "NICHE_COMMERCIAL_FIRM",
+                "query": q2,
+                "language": lang_code,
+                "description": f"Targeting corporate {niche} companies in {city}"
+            })
+
+            q3 = f'"{localized_niche}" "{clean_city}" ("contact us" OR "inquiries" OR "office") email'
+            queries.append({
+                "type": "NICHE_INQUIRIES",
+                "query": q3,
+                "language": lang_code,
+                "description": f"Targeting commercial inquiries for {niche} in {city}"
+            })
+
+            q4 = f'"{localized_niche}" "{clean_city}" "{country}" "info@" OR "contact@"'
+            queries.append({
+                "type": "NICHE_DIRECT_MAIL",
+                "query": q4,
+                "language": lang_code,
+                "description": f"Targeting direct mail contacts for {niche} in {city}"
+            })
+
+            q5 = f'"{localized_niche}" in "{clean_city}" official website contact'
+            queries.append({
+                "type": "NICHE_OFFICIAL_WEBSITE",
+                "query": q5,
+                "language": lang_code,
+                "description": f"Targeting official websites for {niche} in {city}"
+            })
 
         return queries[:max_queries]
 
