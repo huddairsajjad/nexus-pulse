@@ -128,6 +128,10 @@ class ZeroBounceHygieneShield:
             if prefix == p or prefix.startswith(p):
                 return False, False, f"Automated dead-end or invalid system prefix detected: {prefix}@"
 
+        # Check disposable / temporary mail providers first
+        if domain in DISPOSABLE_DOMAINS or any(domain == d or domain.endswith("." + d) for d in ("wixpress.com", "sentry.io", "sentry-next.wixpress.com")):
+            return True, True, f"Disposable or junk tracker domain detected: {domain}"
+
         # Check dummy/placeholder emails and domains unconditionally
         if (
             clean in {"you@company.com", "user@example.com", "email@example.com", "test@example.com", "example@email.com"}
@@ -145,9 +149,6 @@ class ZeroBounceHygieneShield:
             or prefix.startswith("test")
         ):
             return False, False, f"Rejected dummy/placeholder email: '{clean}'"
-
-        if domain in DISPOSABLE_DOMAINS or any(domain == d or domain.endswith("." + d) for d in ("wixpress.com", "sentry.io", "sentry-next.wixpress.com")):
-            return True, True, f"Disposable or junk tracker domain detected: {domain}"
 
         # Ensure TLD is at least 2 chars and not purely digits
         tld = domain.split(".")[-1]

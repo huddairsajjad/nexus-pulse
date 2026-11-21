@@ -567,11 +567,11 @@ class LeadValidationFilter:
                     matched_indicators.append(f"meta:'{sec}'")
                     break
 
-        # 4. Content Body keyword density check (up to 40 points)
+        # 4. Content Body keyword density check (up to 55 points)
         content_primary_hits = sum(1 for p in profile["primary"] if p in content_lower)
         content_sec_hits = sum(1 for s in profile["secondary"] if re.search(rf'\b{re.escape(s)}\b', content_lower))
 
-        content_points = min(40, (content_primary_hits * 15) + (content_sec_hits * 5))
+        content_points = min(55, (content_primary_hits * 20) + (content_sec_hits * 8))
         if content_points > 0:
             score += content_points
             matched_indicators.append(f"content_hits:p{content_primary_hits}_s{content_sec_hits}")

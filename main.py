@@ -29,7 +29,17 @@ if not getattr(socket, "_nexus_ipv4_enforced", False):
 
 import os
 import sys
+import logging
 from pathlib import Path
+
+# Configure root logging to stdout BEFORE anything else loads
+# This ensures all logger.info()/logger.error() calls appear in Railway Deploy Logs
+logging.basicConfig(
+    level=logging.INFO,
+    stream=sys.stdout,
+    force=True,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+)
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent

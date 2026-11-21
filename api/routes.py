@@ -1868,6 +1868,11 @@ async def _run_scrape_job(
         f"[HUNT:{job_id}] Launching scrape pipeline: region='{region}', country='{country}', "
         f"city='{city_override}', niche='{niche}', limit={limit}, operator='{op_id}'"
     )
+    print(
+        f"[HUNT:{job_id}] ▶ START — region='{region}' country='{country}' city='{city_override}' "
+        f"niche='{niche}' limit={limit} operator='{op_id}'",
+        flush=True,
+    )
 
     # ── Pre-load known domains for zero-dup discovery exclusion ─────────────
     _existing_domains: set = set()
@@ -2008,6 +2013,7 @@ async def _run_scrape_job(
                     )
                     if q_res.get("queue_id"):
                         verified_leads.append(pres)
+                        print(f"[HUNT:{job_id}] ✓ VERIFIED #{len(verified_leads)}/{limit} — {lead.domain} <{lead.primary_email}>", flush=True)
                         try:
                             with db.get_connection() as _reg_conn:
                                 register_domain_seen(lead.domain, lead.primary_email, pres.get("lead_id"), _reg_conn)
@@ -2046,6 +2052,7 @@ async def _run_scrape_job(
                     batch_chunk.append(cand)
 
                 if batch_chunk:
+                    print(f"[HUNT:{job_id}] 🕷 SCRAPING batch of {len(batch_chunk)} | verified={len(verified_leads)}/{limit}", flush=True)
                     await asyncio.gather(*[_scrape_candidate(u) for u in batch_chunk])
 
                 # Log progress audit
@@ -2092,6 +2099,7 @@ async def _run_scrape_job(
                 queries_run += len(next_queries)
                 needed_discovery = max((limit - len(verified_leads)) * 3, 15)
                 logger.info(f"[HUNT:{job_id}] Discovering with queries: {next_queries[:2]} (target {needed_discovery} domains)")
+                print(f"[HUNT:{job_id}] 🔍 DISCOVERY queries_run={queries_run} target={needed_discovery} sample={str(next_queries[0])[:80]}", flush=True)
                 discovered = await discovery_agent.discover_candidate_urls(
                     queries=next_queries,
                     limit=needed_discovery,
@@ -2107,6 +2115,7 @@ async def _run_scrape_job(
                     candidate_domains_queue.append(u)
                 total_domains_found += len(new_candidates)
                 logger.info(f"[HUNT:{job_id}] Added {len(new_candidates)} fresh candidates (queue size: {len(candidate_domains_queue)})")
+                print(f"[HUNT:{job_id}] 📋 CANDIDATES +{len(new_candidates)} new | queue={len(candidate_domains_queue)} | total_found={total_domains_found} | verified={len(verified_leads)}/{limit}", flush=True)
 
                 # If discovery returned 0 candidates on this batch and queue empty, continue to next query
                 if not candidate_domains_queue and not query_batches and synonym_idx >= len(niche_synonyms) and adj_idx >= len(adjacent_cities):
@@ -2122,6 +2131,12 @@ async def _run_scrape_job(
             f"[HUNT:{job_id}] region='{region}', country='{country}', city='{city_override}', "
             f"niche='{niche}', queries_run={queries_run}, domains_found={total_domains_found}, "
             f"emails_extracted={total_emails_extracted}, verified_saved={len(verified_leads)}/{limit}"
+        )
+        print(
+            f"[HUNT:{job_id}] ✅ COMPLETE — queries_run={queries_run} domains_found={total_domains_found} "
+            f"emails_extracted={total_emails_extracted} verified={len(verified_leads)}/{limit} "
+            f"rejected={len(rejected_leads)} fallback={fallback_triggered}",
+            flush=True,
         )
 
         scraped_raw_count = total_domains_found or len(scraped_leads_summary)
@@ -2178,6 +2193,7 @@ async def _run_scrape_job(
 
     except Exception as exc:
         logger.error(f"[HUNT:{job_id}] Unhandled error: {exc}", exc_info=True)
+        print(f"[HUNT:{job_id}] ❌ EXCEPTION: {exc}", flush=True)
         _update_job(job_id, status="FAILED", completed_at=datetime.now(timezone.utc).isoformat(), error=str(exc))
 
 

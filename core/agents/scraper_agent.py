@@ -75,6 +75,7 @@ DISCARD_DOMAINS = {
     "yellowpages.", "houzz.", "checkatrade.", "bark.com",
     "clutch.co", "trustpilot.", "glassdoor.", "indeed.", "example.com",
     "aeroleads.", "hunter.io", "apollo.io", "openai.", "chatgpt.",
+    "slideshare.", "scribd.", "baidu.", "carigold.", "meta.com", "threads.net",
     "merriam-webster.", "dictionary.", "thefreedictionary.", "vocabulary.com",
     "cambridge.org", "collinsdictionary.", "oxfordlearnersdictionaries.", "britannica.",
 }
@@ -82,10 +83,12 @@ DISCARD_DOMAINS = {
 # Junk email domains / prefixes handled by LeadValidationFilter but also
 # enforced explicitly here as a fast path:
 JUNK_EMAIL_PREFIXES = (
-    "noreply", "no-reply", "support", "privacy", "webmaster",
-    "sentry", "mailer-daemon", "donotreply", "do-not-reply",
-    "bounce", "admin", "careers", "press", "example", "test",
-    "demo", "sample", "placeholder", "user", "you"
+    # True system/daemon/junk addresses only — do NOT block legitimate B2B contacts
+    # like privacy@, support@, admin@, press@, careers@ which are real business emails
+    "noreply", "no-reply", "webmaster", "sentry", "mailer-daemon",
+    "donotreply", "do-not-reply", "bounce", "example", "test",
+    "demo", "sample", "placeholder", "postmaster", "hostmaster", "abuse",
+    "unsubscribe", "optout", "opt-out", "notifications", "alerts",
 )
 JUNK_EMAIL_DOMAINS = {
     "example.com", "email.com", "sample.com", "domain.com", "test.com",
@@ -136,7 +139,8 @@ CONTACT_SUBPAGE_KEYWORDS = [
     "ansprechpartner", "team", "our-team", "leadership", "people", "staff", "mentions", "mentions-legales", "legal",
     "contacto", "contatti", "contacts", "direction", "firmensitz", "standort", "imprint",
     "qui-sommes-nous", "chi-siamo", "quienes-somos", "fale-conosco", "faleconosco", "over-ons",
-    "equipo", "management", "directors", "inquiries", "enquiries", "location", "sede"
+    "equipo", "management", "directors", "inquiries", "enquiries", "location", "sede",
+    "privacy", "privacy-policy", "terms", "terms-of-service", "datenschutz", "policy",
 ]
 COMMON_SUBPATHS = [
     "/contact", "/contact/", "/contact-us", "/contact-us/",
@@ -147,6 +151,12 @@ COMMON_SUBPATHS = [
     "/contactez-nous", "/contactez-nous/",
     "/imprint", "/imprint/", "/legal", "/legal/",
     "/contato", "/contato/", "/over-ons", "/over-ons/",
+    # Privacy & legal pages frequently contain real business email addresses
+    "/privacy-policy", "/privacy-policy/", "/privacy", "/privacy/",
+    "/terms", "/terms/", "/terms-of-service", "/terms-of-service/",
+    "/terms-of-use", "/terms-of-use/",
+    "/legal/privacy", "/legal/privacy/",
+    "/gdpr", "/gdpr/", "/data-protection", "/data-protection/",
 ]
 
 
@@ -353,11 +363,11 @@ class SearchDiscoveryAgent:
             return []
 
         urls: List[str] = []
-        for backend in ("html", "lite"):
+        for backend in ("api", "html", "lite"):
             try:
                 logger.info(f"[PROVIDER-1 DDGS] backend='{backend}' query='{query}'")
                 with _DDGS(timeout=int(self.timeout)) as ddgs_client:
-                    results = list(ddgs_client.text(query, max_results=max_results, backend=backend))
+                    results = list(ddgs_client.text(query, max_results=max_results, backend=backend, safesearch="on"))
                 logger.info(f"[PROVIDER-1 DDGS] backend='{backend}' returned {len(results)} raw results")
                 for r in results:
                     href = r.get("href") or r.get("link") or ""
@@ -387,7 +397,7 @@ class SearchDiscoveryAgent:
             try:
                 resp = await client.get(
                     "https://www.bing.com/search",
-                    params={"q": clean_q, "first": str(first_offset), "setlang": "en"},
+                    params={"q": clean_q, "first": str(first_offset), "setlang": "en", "adlt": "strict"},
                 )
                 if resp.status_code != 200:
                     break
@@ -396,8 +406,8 @@ class SearchDiscoveryAgent:
                 selectors = [
                     "li.b_algo h2 a",
                     "li.b_algo .b_title a",
-                    "h2 a[href^='http']",
-                    "li.b_algo p a",
+                    "li.b_algo .b_algoheader a",
+                    "li.b_algo h3 a",
                 ]
                 page_found = 0
                 for sel in selectors:
@@ -510,6 +520,10 @@ class SearchDiscoveryAgent:
         Generates diverse query variations designed to surface real B2B company
         contact pages rather than directories, blogs, or social networks.
         Dynamically adapts between construction-specific and universal multi-niche commercial queries.
+
+        CLOUD-DATACENTER STRATEGY: Broad, unquoted queries are listed FIRST because
+        heavily-quoted queries consistently fail on Railway/cloud IPs (Bing/DDGS filter them).
+        Quoted/precise variations are added afterward as supplementary depth queries.
         """
         n = niche.strip()
         c = city.strip()
@@ -524,40 +538,97 @@ class SearchDiscoveryAgent:
 
         if is_construction:
             return [
-                # Variation 1: direct intent with estimating/tenders signal
-                f'"{n}" "{c}" "estimating" OR "tenders" contact email',
-                # Variation 2: contractor + contact
-                f'"{n}" contractors "{c}" contact email',
-                # Variation 3: simple unquoted — broadest fallback
-                f'{n} general contractors {c} contact email',
-                # Variation 4: "contact us" page targeting
+                # Cloud-friendly broad queries FIRST (no heavy quoting)
+                f"{n} companies {c} contact email",
+                f"{n} contractors {c} email",
+                f"{n} {c} company website contact",
+                f"{n} general contractors {c} contact email",
                 f'{n} {c} "contact us" email',
-                # Variation 5: commercial company/firm inquiries
+                # Deeper quoted variations
+                f'"{n}" "{c}" "estimating" OR "tenders" contact email',
+                f'"{n}" contractors "{c}" contact email',
                 f'"{n}" firms "{c}" contact phone email',
-                # Variation 6: B2B services directory / company profile
                 f'{n} company "{c}" "{country}" contact',
-                # Variation 7: commercial solutions & suppliers
                 f'"{n}" suppliers "{c}" "{country}" email',
-                # Variation 8: quotation / RFP / proposals
-                f'"{n}" "{c}" "request a quote" OR "commercial proposal" email',
-                # Variation 9: specialized industry providers
-                f'"{n}" specialists in "{c}" official website contact',
             ]
         else:
             return [
-                # Universal multi-niche commercial query variations
+                # Cloud-friendly broad queries FIRST (no heavy quoting — works on cloud IPs)
+                f"{n} companies {c} contact email",
+                f"{n} {c} company email",
+                f"{n} {c} contact us",
+                f"{n} agency {c} email contact",
+                f"{n} software {c} company contact",
+                f"{n} {c} {country} company website",
+                f"{n} {c} business email info",
+                # Quoted variations for deeper recall
                 f'"{n}" "{c}" contact email',
                 f'"{n}" "{c}" "contact us" email',
                 f'"{n}" agency OR company OR firm "{c}" email',
                 f'"{n}" "{c}" inurl:contact',
                 f'"{n}" "{c}" ("inquiries" OR "office") email',
-                f'{n} {c} contact email',
-                f'{n} "{c}" "{country}" contact us',
                 f'"{n}" "{c}" official website contact',
                 f'"{n}" "{c}" "info@" OR "contact@"',
                 f'"{n}" specialists "{c}" contact phone',
-                f'"{n}" directory OR members "{c}" contact',
             ]
+
+    # ------------------------------------------------------------------
+    # GitHub Org Discovery — works from cloud datacenter IPs (60 req/hr)
+    # ------------------------------------------------------------------
+    async def _github_org_search(self, city: str, niche: str, max_results: int = 20) -> List[str]:
+        """
+        Queries the GitHub public search API for organisations located in the target city.
+        GitHub does NOT block cloud/datacenter IPs and requires no auth (60 req/hr limit).
+        Returns a list of company website URLs harvested from GitHub org profiles.
+        """
+        urls: List[str] = []
+        queries = [
+            f'location:"{city}" type:org {niche}',
+            f'location:"{city}" type:org',
+        ]
+        try:
+            async with httpx.AsyncClient(
+                headers={"User-Agent": "NexusPulse/2.0", "Accept": "application/vnd.github+json"},
+                timeout=10.0,
+                verify=False,
+                follow_redirects=True,
+            ) as gh_client:
+                for q in queries:
+                    if len(urls) >= max_results:
+                        break
+                    try:
+                        r = await gh_client.get(
+                            "https://api.github.com/search/users",
+                            params={"q": q, "per_page": min(max_results, 30), "type": "org"},
+                        )
+                        logger.info(f"[GITHUB-DISCOVERY] query='{q}' status={r.status_code}")
+                        if r.status_code != 200:
+                            continue
+                        items = r.json().get("items", [])
+                        for item in items:
+                            if len(urls) >= max_results:
+                                break
+                            login = item.get("login", "")
+                            if not login:
+                                continue
+                            try:
+                                r2 = await gh_client.get(f"https://api.github.com/users/{login}", timeout=5.0)
+                                if r2.status_code == 200:
+                                    profile = r2.json()
+                                    blog = (profile.get("blog") or "").strip()
+                                    if blog and not blog.startswith("http"):
+                                        blog = f"https://{blog}"
+                                    if blog and blog.startswith("http"):
+                                        urls.append(blog)
+                                        logger.info(f"[GITHUB-DISCOVERY] ✓ {login} → {blog}")
+                            except Exception as _gh_user_ex:
+                                logger.debug(f"[GITHUB-DISCOVERY] User fetch error for {login}: {_gh_user_ex}")
+                    except Exception as _gh_q_ex:
+                        logger.debug(f"[GITHUB-DISCOVERY] Query error '{q}': {_gh_q_ex}")
+        except Exception as _gh_ex:
+            logger.debug(f"[GITHUB-DISCOVERY] Session error: {_gh_ex}")
+        logger.info(f"[GITHUB-DISCOVERY] Harvested {len(urls)} org website URLs for city='{city}' niche='{niche}'")
+        return urls
 
     # ------------------------------------------------------------------
     # Main discovery entry point (Parallel Multi-Source)
@@ -638,6 +709,10 @@ class SearchDiscoveryAgent:
             verify=False,
         ) as client:
 
+            # Run GitHub org search concurrently with the first search query batch
+            # GitHub is unblocked on Railway cloud IPs and reliably returns real company websites
+            _github_task_done = False
+
             for query_str in all_queries:
                 if is_cancelled and is_cancelled():
                     logger.info("[DISCOVERY] Cancellation signal observed — stopping discovery.")
@@ -648,26 +723,40 @@ class SearchDiscoveryAgent:
                 logger.info(f"[DISCOVERY] ━━ Processing query: '{query_str[:80]}...' ━━")
 
                 # Launch search providers in parallel for maximum recall
-                tasks = [
-                    asyncio.get_event_loop().run_in_executor(
-                        None, self._ddgs_search, query_str, max(limit * 2, 20)
-                    ),
-                    self._bing_search(query_str, client, max_results=max(limit * 2, 25)),
-                    self._yahoo_search(query_str, client, max_results=max(limit, 15)),
-                    self._brave_search(query_str, client, max_results=max(limit, 15)),
-                ]
-
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                # On first query, also fire GitHub org search as a bonus provider
+                if not _github_task_done:
+                    _github_task_done = True
+                    tasks = [
+                        asyncio.get_event_loop().run_in_executor(
+                            None, self._ddgs_search, query_str, max(limit * 2, 20)
+                        ),
+                        self._bing_search(query_str, client, max_results=max(limit * 2, 25)),
+                        self._yahoo_search(query_str, client, max_results=max(limit, 15)),
+                        self._brave_search(query_str, client, max_results=max(limit, 15)),
+                        self._github_org_search(city, niche, max_results=min(limit, 25)),
+                    ]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    p_names = ["DDGS", "BING", "YAHOO", "BRAVE", "GITHUB"]
+                else:
+                    tasks = [
+                        asyncio.get_event_loop().run_in_executor(
+                            None, self._ddgs_search, query_str, max(limit * 2, 20)
+                        ),
+                        self._bing_search(query_str, client, max_results=max(limit * 2, 25)),
+                        self._yahoo_search(query_str, client, max_results=max(limit, 15)),
+                        self._brave_search(query_str, client, max_results=max(limit, 15)),
+                    ]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    p_names = ["DDGS", "BING", "YAHOO", "BRAVE"]
 
                 # Process results from all successful providers
-                p_names = ["DDGS", "BING", "YAHOO", "BRAVE"]
                 for i, res in enumerate(results):
                     if isinstance(res, list) and res:
                         _register_urls(res, p_names[i])
                         if len(discovered_urls) >= limit:
                             break
 
-                # If still under limit and all 4 yielded few, query DDG Lite
+                # If still under limit and all yielded few, query DDG Lite
                 if len(discovered_urls) < limit:
                     lite_res = await self._ddg_lite_post(query_str, client)
                     if lite_res:
@@ -705,11 +794,34 @@ class DeepScraperAgent:
     # Static email hygiene guard (fast path before LeadValidationFilter)
     # ------------------------------------------------------------------
     @staticmethod
-    def _is_junk_email(email: str) -> bool:
+    def _clean_extracted_email(raw_email: str) -> str:
+        """Strips leading/trailing HTML or unicode artifacts (e.g. u003e, \\u003e, &gt;, quotes) from email."""
+        if not raw_email or "@" not in raw_email:
+            return ""
+        clean = raw_email.strip().lower()
+        clean = re.sub(r'^(?:u003[ec]|\\u003[ec]|&[gl]t;|[<>"\'\s\\])+', '', clean)
+        clean = re.sub(r'(?:&[gl]t;|[<>"\'\s\\])+$', '', clean)
+        return clean.strip()
+
+    @classmethod
+    def _is_junk_email(cls, email: str) -> bool:
         """Returns True if the email is a known junk/role/system address."""
         if not email or "@" not in email:
             return True
-        local, domain = email.lower().split("@", 1)
+        clean_email = cls._clean_extracted_email(email)
+        if not clean_email or "@" not in clean_email:
+            return True
+        local, domain = clean_email.split("@", 1)
+        # Block unsubscribe / optout addresses and unicode remnants
+        if (
+            "unsubscribe" in local
+            or "optout" in local
+            or "opt-out" in local
+            or local.startswith("remove")
+            or local.startswith("u003")
+            or "%" in local
+        ):
+            return True
         # Strict dummy / placeholder / example checks
         if local in {"example", "test", "demo", "sample", "placeholder", "user", "you", "yourname", "name", "someone"}:
             return True
@@ -727,7 +839,7 @@ class DeepScraperAgent:
             if local == prefix or local.startswith(prefix + ".") or local.startswith(prefix + "-") or local.startswith(prefix + "_"):
                 return True
         # Asset false positives (.png, .jpg, etc.)
-        if any(email.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".css", ".js")):
+        if any(clean_email.endswith(ext) for ext in (".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif", ".css", ".js")):
             return True
         return False
 
@@ -747,7 +859,7 @@ class DeepScraperAgent:
         import json
 
         GENERIC_SEO_PATTERNS = [
-            r"^(?:home|welcome|contact|contact\s+us|about|about\s+us|services?|solutions|official\s+site)$",
+            r"^(?:home|welcome|contact|contact\s+us|about|about\s+us|services?|solutions|official\s+site|privacy|privacy\s+policy|terms|terms\s+of\s+(?:service|use)|legal|legal\s+notice|cookie\s+policy|datenschutz|impressum|imprint)$",
             r"\bbest\s+.*(?:in|near|across)\b",
             r"\btop\s+\d+\s+",
             r"\bfind\s+(?:local\s+)?(?:contractors?|builders?|companies)\b",
@@ -762,7 +874,13 @@ class DeepScraperAgent:
             r"\btrusted\s+(?:local|commercial)?\s*(?:contractors?|builders?)\b",
             r"\bcommercial\s+construction\s+services\b",
             r"\baffordable\s+(?:construction|roofing|cladding)\b",
-            r"\bfor\s+free\b"
+            r"\bfor\s+free\b",
+            r"\bprivacy\s+policy\b",
+            r"\bterms\s+of\s+(?:service|use)\b",
+            r"\bcookie\s+policy\b",
+            r"\blegal\s+notice\b",
+            r"\bdatenschutz\b",
+            r"\bimpressum\b",
         ]
 
         def is_generic_phrase(text: str) -> bool:
@@ -771,6 +889,14 @@ class DeepScraperAgent:
             if text.strip().upper() in {"AI", "IT", "HR", "PR", "HQ", "CO", "IO", "APP", "DEV", "TECH", "THE", "AND", "OR"}:
                 return True
             t_lower = text.strip().lower()
+            generic_exact = {
+                "privacy policy", "privacy", "terms of service", "terms of use", "terms", "terms and conditions",
+                "terms & conditions", "legal notice", "legal", "cookie policy", "datenschutz", "impressum", "imprint",
+                "contact us", "contact", "about us", "about", "home", "homepage", "welcome", "our services", "services",
+                "solutions", "overview", "site map", "sitemap", "disclaimer", "accessibility"
+            }
+            if t_lower in generic_exact or any(t_lower == g or t_lower.startswith(g + " -") or t_lower.startswith(g + " |") for g in generic_exact):
+                return True
             if any(re.search(pat, t_lower) for pat in GENERIC_SEO_PATTERNS):
                 return True
             words = text.strip().split()
@@ -907,7 +1033,15 @@ class DeepScraperAgent:
             lv_company_name = ""
 
         # Clean company name using our multi-priority extractor
-        company_name = self.extract_clean_company_name(soup, raw_title, domain) or lv_company_name
+        extracted_name = self.extract_clean_company_name(soup, raw_title, domain) or lv_company_name
+        fallback_brand = LeadValidationFilter.extract_brand_name_from_domain(domain)
+        if not extracted_name or extracted_name.lower().strip() in {
+            "privacy policy", "privacy", "terms of service", "terms of use", "terms",
+            "legal notice", "legal", "cookie policy", "datenschutz", "impressum", "imprint"
+        }:
+            company_name = fallback_brand
+        else:
+            company_name = extracted_name
 
         # ── Layer 4: Niche relevance scoring ───────────────────────────
         if inherited_niche_score is not None:
@@ -930,10 +1064,10 @@ class DeepScraperAgent:
             except Exception:
                 niche_score, score_summary = 0, "niche_score_error"
 
-        if niche_score < 70:
+        if niche_score < 40 and inherited_niche_score is None:
             logger.info(
                 f"[LAYER-4 FILTER] Rejecting {source_url}: "
-                f"Niche score {niche_score}/100 < 70 for '{niche}' ({score_summary})"
+                f"Niche score {niche_score}/100 < 40 for '{niche}' ({score_summary})"
             )
             return None
 
@@ -945,8 +1079,8 @@ class DeepScraperAgent:
         for a_tag in soup.find_all("a", href=True):
             href = a_tag["href"].strip()
             if href.lower().startswith("mailto:"):
-                raw_mail = href[7:].split("?")[0].strip()
-                if self._is_junk_email(raw_mail):
+                raw_mail = self._clean_extracted_email(href[7:].split("?")[0].strip())
+                if not raw_mail or self._is_junk_email(raw_mail):
                     logger.info(f"[EMAIL-FILTER] Rejected junk mailto: {raw_mail} on {source_url}")
                     continue
                 try:
@@ -969,7 +1103,8 @@ class DeepScraperAgent:
         for match in EMAIL_REGEX.findall(raw_text):
             # Normalise obfuscated [at]/(at)
             normalised = re.sub(r'\s*[\[\(]at[\]\)]\s*', '@', match, flags=re.IGNORECASE).replace(" ", "")
-            if self._is_junk_email(normalised):
+            normalised = self._clean_extracted_email(normalised)
+            if not normalised or self._is_junk_email(normalised):
                 logger.info(f"[EMAIL-FILTER] Rejected junk regex match: {normalised}")
                 continue
             try:
@@ -1147,6 +1282,9 @@ class DeepScraperAgent:
                 )
                 soup = BeautifulSoup(resp.text, "html.parser")
                 candidate_subpages: List[str] = []
+                primary_contacts: List[str] = []
+                legal_privacy: List[str] = []
+                other_subpages: List[str] = []
 
                 for a_tag in soup.find_all("a", href=True):
                     href = a_tag["href"].strip()
@@ -1155,21 +1293,43 @@ class DeepScraperAgent:
                     if any(kw in href_lower or kw in text for kw in CONTACT_SUBPAGE_KEYWORDS):
                         full_sub_url = urljoin(base_url, href)
                         sub_domain = urlparse(full_sub_url).netloc.replace("www.", "").lower()
-                        if (
-                            sub_domain == base_domain
-                            and full_sub_url not in candidate_subpages
-                            and full_sub_url != base_url
-                        ):
-                            candidate_subpages.append(full_sub_url)
+                        if sub_domain == base_domain and full_sub_url != base_url:
+                            if any(k in href_lower for k in ("privacy", "legal", "terms", "datenschutz", "impressum", "imprint")):
+                                if full_sub_url not in legal_privacy:
+                                    legal_privacy.append(full_sub_url)
+                            elif any(k in href_lower for k in ("contact", "kontakt", "about", "team", "ansprechpartner")):
+                                if full_sub_url not in primary_contacts:
+                                    primary_contacts.append(full_sub_url)
+                            else:
+                                if full_sub_url not in other_subpages:
+                                    other_subpages.append(full_sub_url)
 
-                # Always append common subpath guesses as extra fallback
+                # Prioritize: up to 3 contact/about + up to 2 privacy/legal + fallback
+                candidate_subpages = (primary_contacts[:3] + legal_privacy[:2] + other_subpages[:1])
+
+                # Ensure at least 1 privacy/legal and 1 contact URL are present
+                if not any("privacy" in u or "legal" in u for u in candidate_subpages):
+                    for sp in ("/privacy-policy", "/privacy", "/legal/privacy"):
+                        guess_url = urljoin(base_url, sp)
+                        if guess_url not in candidate_subpages:
+                            candidate_subpages.append(guess_url)
+                            break
+                if not any("contact" in u or "about" in u for u in candidate_subpages):
+                    for sp in ("/contact", "/contact-us", "/about"):
+                        guess_url = urljoin(base_url, sp)
+                        if guess_url not in candidate_subpages:
+                            candidate_subpages.append(guess_url)
+                            break
+
                 for sp in COMMON_SUBPATHS:
+                    if len(candidate_subpages) >= 6:
+                        break
                     guess_url = urljoin(base_url, sp)
                     if guess_url not in candidate_subpages and guess_url != base_url:
                         candidate_subpages.append(guess_url)
 
-                # Limit to 4 subpages to respect timeout budget
-                candidate_subpages = candidate_subpages[:4]
+                # Limit to 6 subpages (crawled in parallel, completes in ~3.5s)
+                candidate_subpages = candidate_subpages[:6]
                 logger.info(
                     f"[SCRAPER] {len(candidate_subpages)} contact subpage(s) queued for "
                     f"{base_domain}: {candidate_subpages}"
@@ -1185,7 +1345,7 @@ class DeepScraperAgent:
                         root_meta = desc_tag["content"].strip()
                     root_text = soup.get_text(separator=" ", strip=True)
                     sc, _ = LeadValidationFilter.calculate_niche_score(niche, root_title, root_text, root_meta, base_domain)
-                    if sc >= 70:
+                    if sc >= 25:
                         root_niche_score = sc
                 except Exception:
                     pass

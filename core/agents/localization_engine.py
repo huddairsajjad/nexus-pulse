@@ -540,7 +540,19 @@ class LocalizationEngine:
         queries: List[Dict[str, str]] = []
 
         if is_construction:
-            # Construction-specific bidding/tender/estimating operators
+            # Construction-specific bidding/tender/estimating operators (broad recall first)
+            queries.append({
+                "type": "COMMERCIAL_CONTRACTOR_DIRECTORY",
+                "query": f'{clean_niche} general contractors {clean_city} contact email',
+                "language": "en",
+                "description": f"General contractor directory search in {clean_city}"
+            })
+            queries.append({
+                "type": "SUB_TRADE_INQUIRIES",
+                "query": f'{clean_niche} contractors "{clean_city}" contact email',
+                "language": "en",
+                "description": f"Sub-trade commercial directory in {clean_city}"
+            })
             queries.append({
                 "type": "HIGH_INTENT_ESTIMATING",
                 "query": f'"{localized_niche}" "{clean_city}" ("{intents[0]}" OR "{intents[1] if len(intents)>1 else intents[0]}")',
@@ -568,19 +580,26 @@ class LocalizationEngine:
                 "description": f"Targeting mailto links on {clean_city} contractor sites"
             })
             queries.append({
-                "type": "COMMERCIAL_CONTRACTOR_DIRECTORY",
-                "query": f'"{clean_niche}" general contractors "{clean_city}" contact email',
-                "language": "en",
-                "description": f"General contractor directory search in {clean_city}"
-            })
-            queries.append({
-                "type": "SUB_TRADE_INQUIRIES",
+                "type": "COMMERCIAL_FIRM_FALLBACK",
                 "query": f'"{clean_niche}" firms "{clean_city}" "{clean_country}" contact phone email',
                 "language": "en",
                 "description": f"Sub-trade commercial directory in {clean_city}"
             })
         else:
             # Universal Multi-Niche Commercial queries (Luxury Real Estate, SaaS, Fitness, Medical, etc.)
+            # Cloud-friendly broad recall queries FIRST
+            queries.append({
+                "type": "NICHE_BROAD_UNQUOTED",
+                "query": f'{clean_niche} in "{clean_city}" "contact us"',
+                "language": "en",
+                "description": f"Broad contact recall for {clean_niche} in {clean_city}"
+            })
+            queries.append({
+                "type": "NICHE_COMPANIES_CONTACT",
+                "query": f'{clean_niche} {clean_city} contact email',
+                "language": "en",
+                "description": f"Broad email query for {clean_niche} in {clean_city}"
+            })
             queries.append({
                 "type": "NICHE_LOCAL_CONTACT",
                 "query": f'"{clean_niche}" "{clean_city}" contact email',
@@ -600,6 +619,12 @@ class LocalizationEngine:
                 "description": f"Targeting commercial inquiries for {clean_niche} in {clean_city}"
             })
             queries.append({
+                "type": "NICHE_REGIONAL_OFFICIAL",
+                "query": f'{clean_niche} {clean_city} {clean_country} official website',
+                "language": "en",
+                "description": f"Regional official websites for {clean_niche} in {clean_city}"
+            })
+            queries.append({
                 "type": "NICHE_DIRECT_MAIL",
                 "query": f'"{clean_niche}" "{clean_city}" "{clean_country}" "info@" OR "contact@"',
                 "language": lang_code,
@@ -610,18 +635,6 @@ class LocalizationEngine:
                 "query": f'"{clean_niche}" in "{clean_city}" official website contact',
                 "language": lang_code,
                 "description": f"Targeting official websites for {clean_niche} in {clean_city}"
-            })
-            queries.append({
-                "type": "NICHE_BROAD_UNQUOTED",
-                "query": f'{clean_niche} {clean_city} contact email',
-                "language": "en",
-                "description": f"Broad unquoted recall for {clean_niche} in {clean_city}"
-            })
-            queries.append({
-                "type": "NICHE_REGIONAL_OFFICIAL",
-                "query": f'{clean_niche} {clean_city} {clean_country} official website',
-                "language": "en",
-                "description": f"Regional official websites for {clean_niche} in {clean_city}"
             })
             queries.append({
                 "type": "NICHE_DIRECTORY_PARTNERS",

@@ -182,7 +182,7 @@ class TemplateManager:
         _app_base = os.getenv("APP_BASE_URL", os.getenv("RAILWAY_PUBLIC_DOMAIN", os.getenv("RAILWAY_STATIC_URL", "nexus-pulse-production.up.railway.app"))).strip()
         if _app_base and not _app_base.startswith("http"):
             _app_base = f"https://{_app_base}"
-        _recip_enc = urllib.parse.quote(recipient_email, safe="")
+        _recip_enc = urllib.parse.quote(recipient_email, safe="@")
         unsub_link = unsubscribe_url or f"{_app_base}/api/unsubscribe?email={_recip_enc}"
 
         with self.db.get_connection() as conn:
