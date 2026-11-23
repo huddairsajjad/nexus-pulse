@@ -2854,7 +2854,7 @@ function doPost(e) {
               </div>
 
               {authMode === "login" ? (
-                <div className="space-y-4">
+                <div key="showcase-login" className="space-y-4 np-auth-pane-enter">
                   <div>
                     <span className="badge badge-accent text-[9px] font-mono uppercase tracking-wider mb-2 inline-block px-2 py-0.5">
                       Security Matrix Active
@@ -2899,7 +2899,7 @@ function doPost(e) {
                   </div>
                 </div>
               ) : (
-                <div className="space-y-4">
+                <div key="showcase-register" className="space-y-4 np-auth-pane-enter">
                   <div>
                     <span className="badge badge-success text-[9px] font-mono uppercase tracking-wider mb-2 inline-block px-2 py-0.5">
                       Instant 2-Day Trial
@@ -2999,7 +2999,13 @@ function doPost(e) {
             {isScanning && <div className="biometric-scanner-line" />}
 
             {/* Video 1 Sliding Split Pill Toggle */}
-            <div className="flex p-1.5 bg-[rgba(0,0,0,0.5)] backdrop-blur-md rounded-xl border border-[rgba(255,255,255,0.08)] mb-5 shadow-inner">
+            <div className="np-auth-toggle-container mb-5">
+              <div
+                className="np-auth-toggle-slider"
+                style={{
+                  transform: authMode === "login" ? "translateX(0%)" : "translateX(100%)",
+                }}
+              />
               <button
                 type="button"
                 onClick={() => {
@@ -3008,10 +3014,10 @@ function doPost(e) {
                   setRegError("");
                   SoundEffects.authToggle();
                 }}
-                className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all ${
+                className={`np-auth-toggle-btn ${
                   authMode === "login"
-                    ? "bg-[var(--accent)] text-[var(--bg-base)] shadow font-bold"
-                    : "text-theme-secondary hover:text-theme-primary"
+                    ? "text-[var(--bg-base)] font-bold"
+                    : "text-theme-secondary hover:text-white"
                 }`}
               >
                 Sign In
@@ -3024,10 +3030,10 @@ function doPost(e) {
                   setRegError("");
                   SoundEffects.authToggle();
                 }}
-                className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all ${
+                className={`np-auth-toggle-btn ${
                   authMode === "register"
-                    ? "bg-[var(--accent)] text-[var(--bg-base)] shadow font-bold"
-                    : "text-theme-secondary hover:text-theme-primary"
+                    ? "text-[var(--bg-base)] font-bold"
+                    : "text-theme-secondary hover:text-white"
                 }`}
               >
                 Create Account (2-Day Trial)
@@ -3059,7 +3065,7 @@ function doPost(e) {
                 </div>
               </div>
             ) : authMode === "login" ? (
-              <form onSubmit={handleBiometricLogin} className="space-y-4">
+              <form key="login-form" onSubmit={handleBiometricLogin} className="space-y-4 np-auth-pane-enter">
                 <div>
                   <label className="np-label">Operator or Admin Username</label>
                   <div className="relative">
@@ -3141,7 +3147,7 @@ function doPost(e) {
                 </div>
               </form>
             ) : (
-              <form onSubmit={handleRegister} className="space-y-3">
+              <form key="register-form" onSubmit={handleRegister} className="space-y-3 np-auth-pane-enter">
                 <div>
                   <label className="np-label">Full Name</label>
                   <div className="relative">
@@ -4702,14 +4708,14 @@ function doPost(e) {
                 <table className="np-table">
                   <thead>
                     <tr>
-                      <th style={{ width: "20%" }}>Operator Identity</th>
-                      <th style={{ width: "8%" }}>Role</th>
-                      <th style={{ width: "10%" }}>Access Status</th>
-                      <th style={{ width: "14%" }}>Device Lock</th>
-                      <th style={{ width: "12%" }}>Daily Quotas</th>
-                      <th style={{ width: "10%" }}>Subscription Expiry</th>
-                      <th style={{ width: "10%" }}>Last Login</th>
-                      <th style={{ width: "16%" }} className="text-right">Actions</th>
+                      <th style={{ minWidth: "180px" }}>Operator Identity</th>
+                      <th style={{ minWidth: "80px" }}>Role</th>
+                      <th style={{ minWidth: "130px" }}>Access Status</th>
+                      <th style={{ minWidth: "160px" }}>Device Lock</th>
+                      <th style={{ minWidth: "130px" }}>Daily Quotas</th>
+                      <th style={{ minWidth: "160px" }}>Subscription Expiry</th>
+                      <th style={{ minWidth: "110px" }}>Last Login</th>
+                      <th style={{ minWidth: "200px" }} className="text-right">Actions</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -4763,7 +4769,7 @@ function doPost(e) {
                           </td>
 
                           <td className="np-table-actions">
-                            <div className="flex items-center justify-end gap-1.5 flex-wrap">
+                            <div className="flex items-center justify-end gap-2 shrink-0">
                               <button
                                 onClick={() => handleOpenResetPasswordModal(op)}
                                 className="btn btn-secondary btn-sm"

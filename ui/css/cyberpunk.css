@@ -103,28 +103,28 @@
   --text-primary:   #f8fafc;
   --text-secondary: #94a3b8;
   --text-muted:     #64748b;
-  --text-link:      #38bdf8;
-  --accent:         #38bdf8;
+  --text-link:      #60a5fa;
+  --accent:         #3b82f6;
   --accent-hover:   #60a5fa;
-  --accent-muted:   rgba(56, 189, 248, 0.12);
+  --accent-muted:   rgba(59, 130, 246, 0.14);
   --success:        #34d399;
   --success-muted:  rgba(52, 211, 153, 0.12);
   --warning:        #fbbf24;
   --warning-muted:  rgba(251, 191, 36, 0.12);
   --danger:         #f87171;
   --danger-muted:   rgba(248, 113, 113, 0.12);
-  --gold:           #38bdf8;
-  --gold-muted:     rgba(56, 189, 248, 0.12);
+  --gold:           #3b82f6;
+  --gold-muted:     rgba(59, 130, 246, 0.14);
   --purple:         #818cf8;
   --purple-muted:   rgba(129, 140, 248, 0.12);
-  --scan-color:     #38bdf8;
-  --pulse-color:    rgba(56, 189, 248, 0.45);
+  --scan-color:     #3b82f6;
+  --pulse-color:    rgba(59, 130, 246, 0.45);
   --scrollbar:      #1d2331;
   --sidebar-bg:     #0d1017;
-  --sidebar-border: rgba(56, 189, 248, 0.14);
+  --sidebar-border: rgba(59, 130, 246, 0.14);
   --glass-bg:       rgba(17, 20, 28, 0.72);
   --glass-card-bg:  rgba(17, 20, 28, 0.85);
-  --glass-border:   rgba(56, 189, 248, 0.20);
+  --glass-border:   rgba(59, 130, 246, 0.20);
   --shadow-sm:      0 1px 3px rgba(0, 0, 0, 0.4);
   --shadow-md:      0 4px 16px rgba(0, 0, 0, 0.55);
   --shadow-lg:      0 12px 36px rgba(0, 0, 0, 0.75);
@@ -758,7 +758,66 @@ html, body {
   transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.25s ease;
 }
 
+/* Video 1 Sliding Auth Mode Toggle */
+.np-auth-toggle-container {
+  position: relative;
+  display: flex;
+  padding: 4px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-radius: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 2px 4px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+  user-select: none;
+}
+
+.np-auth-toggle-slider {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  left: 4px;
+  width: calc(50% - 4px);
+  background: var(--accent);
+  border-radius: 9px;
+  box-shadow: 0 2px 10px var(--accent-muted), 0 0 16px var(--accent-muted);
+  transition: transform 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+  pointer-events: none;
+  z-index: 1;
+}
+
+.np-auth-toggle-btn {
+  position: relative;
+  z-index: 2;
+  flex: 1;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  border-radius: 8px;
+  transition: color 0.2s ease;
+  text-align: center;
+}
+
 /* Micro-animations and view transitions */
+.np-auth-pane-enter {
+  animation: npAuthSlideFade 0.26s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes npAuthSlideFade {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
 .np-tab-pane-enter {
   animation: npFadeInSlide 0.22s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
@@ -1005,22 +1064,31 @@ html, body {
 
 .btn-primary {
   background: var(--accent);
-  color: var(--bg-base);
+  color: #0b0d11;
+  font-weight: 700;
   border-color: var(--accent);
+  box-shadow: 0 4px 14px var(--accent-muted);
 }
 .btn-primary:hover:not(:disabled) {
   background: var(--accent-hover);
   border-color: var(--accent-hover);
+  box-shadow: 0 6px 20px var(--accent-muted);
+  transform: translateY(-1px);
 }
 
 .btn-secondary {
-  background: var(--bg-overlay);
+  background: rgba(255, 255, 255, 0.04);
   color: var(--text-primary);
-  border-color: var(--border);
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07);
 }
 .btn-secondary:hover:not(:disabled) {
-  background: var(--bg-hover);
-  border-color: var(--border);
+  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.18);
+  color: #ffffff;
+  transform: translateY(-1px);
 }
 
 .btn-danger {
@@ -1081,10 +1149,10 @@ html, body {
 
 .np-table {
   width: 100%;
-  min-width: 1020px;
+  min-width: 1120px;
   border-collapse: collapse;
   font-size: 12px;
-  table-layout: fixed;
+  table-layout: auto;
 }
 
 .np-table th {
@@ -1098,8 +1166,8 @@ html, body {
   text-align: left;
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  overflow: visible;
+  text-overflow: clip;
   vertical-align: middle;
 }
 
@@ -1134,7 +1202,7 @@ html, body {
 .np-table-actions {
   white-space: nowrap !important;
   text-align: right;
-  min-width: 180px;
+  min-width: 200px;
 }
 
 /* ----------------------------------------------------------------
