@@ -306,13 +306,25 @@ const INDUSTRY_PRESETS = [
 ];
 
 const THEMES = [
-  { id: "obsidian-glass", name: "Obsidian Glass", dotColor: "#38bdf8", desc: "Default dark obsidian glass & cold ice cyan" },
-  { id: "emerald-vault", name: "Emerald Vault", dotColor: "#10b981", desc: "Deep emerald glass & radiant mint" },
-  { id: "cobalt-telemetry", name: "Cobalt Telemetry", dotColor: "#38bdf8", desc: "Deep cobalt sapphire & electric cyan" },
-  { id: "amber-forge", name: "Amber Forge", dotColor: "#f59e0b", desc: "Dark charcoal bronze & glowing amber" },
-  { id: "crimson-ops", name: "Crimson Ops", dotColor: "#f43f5e", desc: "Midnight obsidian & ruby crimson" },
-  { id: "violet-prism", name: "Violet Prism", dotColor: "#a855f7", desc: "Deep violet night & electric neon purple" }
+  { id: "obsidian-glass", name: "Obsidian Glass", dotColor: "#38bdf8", desc: "Default dark obsidian slate & ice cyan" },
+  { id: "emerald-vault", name: "Emerald Vault", dotColor: "#10b981", desc: "Executive dark obsidian & refined emerald" },
+  { id: "cobalt-telemetry", name: "Cobalt Telemetry", dotColor: "#3b82f6", desc: "Executive dark obsidian & sapphire cobalt" },
+  { id: "amber-forge", name: "Amber Forge", dotColor: "#f59e0b", desc: "Executive dark obsidian & warm bronze amber" },
+  { id: "crimson-ops", name: "Crimson Ops", dotColor: "#f43f5e", desc: "Executive dark obsidian & deep ruby crimson" },
+  { id: "violet-prism", name: "Violet Prism", dotColor: "#8b5cf6", desc: "Executive dark obsidian & Linear royal iris" }
 ];
+
+const getSavedThemeForUser = (username) => {
+  try {
+    if (username) {
+      const userTheme = localStorage.getItem(`nexus_theme_${username.toLowerCase()}`);
+      if (userTheme && userTheme !== "github-dark") return userTheme;
+    }
+  } catch (e) {}
+  const saved = localStorage.getItem("nexus_theme");
+  if (!saved || saved === "github-dark") return "obsidian-glass";
+  return saved;
+};
 
 const KANBAN_STAGES = [
   { key: "SCRAPED", label: "Scraped", badgeClass: "badge-muted" },
@@ -342,22 +354,6 @@ const normalizeLeadStatus = (rawStatus) => {
 
 function NexusPulseApp() {
   // ---------------------------------------------------------------------------
-  // THEME ENGINE (Requirement 1)
-  // ---------------------------------------------------------------------------
-  const [activeTheme, setActiveTheme] = useState(() => {
-    const saved = localStorage.getItem("nexus_theme");
-    if (!saved || saved === "github-dark") return "obsidian-glass";
-    return saved;
-  });
-  const [isThemeMenuOpen, setIsThemeMenuOpen] = useState(false);
-
-  useEffect(() => {
-    document.documentElement.setAttribute("data-theme", activeTheme);
-    document.body.setAttribute("data-theme", activeTheme);
-    localStorage.setItem("nexus_theme", activeTheme);
-  }, [activeTheme]);
-
-  // ---------------------------------------------------------------------------
   // AUTH & AUDIO STATE
   // ---------------------------------------------------------------------------
   const [user, setUser] = useState(() => {
@@ -365,6 +361,39 @@ function NexusPulseApp() {
     return saved ? JSON.parse(saved) : null;
   });
   const [token, setToken] = useState(() => localStorage.getItem("nexus_token") || "");
+
+  // ---------------------------------------------------------------------------
+  // THEME ENGINE (Per-Operator Theme Persistence)
+  // ---------------------------------------------------------------------------
+  const [activeTheme, setActiveTheme] = useState(() => {
+    let uName = null;
+    try {
+      const savedUser = localStorage.getItem("nexus_user");
+      if (savedUser) {
+        uName = JSON.parse(savedUser)?.username;
+      }
+    } catch (e) {}
+    return getSavedThemeForUser(uName);
+  });
+  const [isThemeMenuOpen, setIsThemeMenuOpen] = useState(false);
+
+  // When operator identity loads or switches, restore their specific saved theme
+  useEffect(() => {
+    if (user?.username) {
+      const preferred = getSavedThemeForUser(user.username);
+      setActiveTheme(preferred);
+    }
+  }, [user?.username]);
+
+  // Apply theme tokens to DOM and persist per-operator
+  useEffect(() => {
+    document.documentElement.setAttribute("data-theme", activeTheme);
+    document.body.setAttribute("data-theme", activeTheme);
+    localStorage.setItem("nexus_theme", activeTheme);
+    if (user?.username) {
+      localStorage.setItem(`nexus_theme_${user.username.toLowerCase()}`, activeTheme);
+    }
+  }, [activeTheme, user?.username]);
 
   // UI Click Sound Effects Engine State
   const [soundEnabled, setSoundEnabled] = useState(() => localStorage.getItem("nexus_sound_enabled") !== "false");
@@ -970,12 +999,17 @@ function NexusPulseApp() {
   };
 
   const handleLogout = () => {
+    try {
+      SoundEffects.lowTone();
+    } catch (e) {}
     localStorage.removeItem("nexus_token");
     localStorage.removeItem("nexus_user");
     setUser(null);
     setToken("");
     adminProfileLoadedRef.current = false;
     adminFormDirtyRef.current = false;
+    const defaultTheme = localStorage.getItem("nexus_theme") || "obsidian-glass";
+    setActiveTheme(defaultTheme);
   };
 
   // ---------------------------------------------------------------------------
@@ -2518,8 +2552,8 @@ function doPost(e) {
         <div className="min-h-screen flex items-center justify-center p-4 bg-base relative overflow-hidden">
           {/* Video 1 Geometric Obsidian Backdrop */}
           <div className="np-geometric-bg" />
-          <div className="absolute w-[500px] h-[500px] rounded-full bg-[var(--accent)] opacity-10 blur-[120px] pointer-events-none -top-40 -left-40 animate-pulse" />
-          <div className="absolute w-[500px] h-[500px] rounded-full bg-[var(--purple)] opacity-10 blur-[120px] pointer-events-none -bottom-40 -right-40 animate-pulse" />
+          <div className="absolute w-[500px] h-[500px] rounded-full bg-[var(--accent)] opacity-[0.06] blur-[140px] pointer-events-none -top-40 -left-40" />
+          <div className="absolute w-[500px] h-[500px] rounded-full bg-[var(--accent)] opacity-[0.04] blur-[140px] pointer-events-none -bottom-40 -right-40" />
 
           {/* Top Bar Quick Controls */}
           <div className="absolute top-4 right-4 flex items-center gap-2 z-20">
@@ -2768,8 +2802,8 @@ function doPost(e) {
       <div className="min-h-screen flex items-center justify-center p-4 bg-base relative overflow-hidden">
         {/* Video 1 Geometric Obsidian Backdrop */}
         <div className="np-geometric-bg" />
-        <div className="absolute w-[500px] h-[500px] rounded-full bg-[var(--accent)] opacity-10 blur-[120px] pointer-events-none -top-40 -left-40 animate-pulse" />
-        <div className="absolute w-[500px] h-[500px] rounded-full bg-[var(--purple)] opacity-10 blur-[120px] pointer-events-none -bottom-40 -right-40 animate-pulse" />
+        <div className="absolute w-[500px] h-[500px] rounded-full bg-[var(--accent)] opacity-[0.06] blur-[140px] pointer-events-none -top-40 -left-40" />
+        <div className="absolute w-[500px] h-[500px] rounded-full bg-[var(--accent)] opacity-[0.04] blur-[140px] pointer-events-none -bottom-40 -right-40" />
 
         {/* Top Right Quick Controls: Theme Presets & SFX Audio */}
         <div className="absolute top-4 right-4 flex items-center gap-2 z-20">
@@ -3504,30 +3538,32 @@ function doPost(e) {
               <span className="w-2 h-2 rounded-full bg-[var(--success)] animate-pulse" />
               <span>{systemHealth?.machine_id || "NEXUS-E727"}</span>
             </span>
-            <span className="badge badge-accent text-[9px] px-1 py-0">SECURE</span>
+            <span className="badge badge-accent text-[9px] px-1.5 py-0.5">SECURE</span>
           </div>
 
-          {/* Theme & SFX & Logout Controls Bar */}
-          <div className="flex items-center justify-between pt-1 border-t border-[var(--border-subtle)]">
+          {/* Theme & SFX Controls Bar */}
+          <div className="flex items-center justify-between pt-1.5 border-t border-[var(--border-subtle)] gap-2">
             {/* Theme Picker Dropdown */}
-            <div className="relative">
+            <div className="relative flex-1">
               <button
                 type="button"
                 onClick={() => setIsThemeMenuOpen(!isThemeMenuOpen)}
-                className="btn btn-secondary btn-sm flex items-center gap-1.5 py-1 px-2"
+                className="btn btn-secondary btn-sm w-full flex items-center justify-between gap-1.5 py-1 px-2"
                 title="Appearance Theme"
               >
-                <span
-                  className="theme-dot"
-                  style={{ backgroundColor: THEMES.find(t => t.id === activeTheme)?.dotColor || "#38bdf8" }}
-                />
-                <span className="text-[11px] font-mono">Theme</span>
-                <span className="text-[9px]">▾</span>
+                <div className="flex items-center gap-1.5 truncate">
+                  <span
+                    className="theme-dot shrink-0"
+                    style={{ backgroundColor: THEMES.find(t => t.id === activeTheme)?.dotColor || "#38bdf8" }}
+                  />
+                  <span className="text-[11px] font-mono truncate">{THEMES.find(t => t.id === activeTheme)?.name || "Theme"}</span>
+                </div>
+                <span className="text-[9px] opacity-60">▾</span>
               </button>
 
               {isThemeMenuOpen && (
                 <div
-                  className="absolute bottom-full left-0 mb-1.5 w-56 np-card p-1 z-50 shadow-2xl border-theme"
+                  className="absolute bottom-full left-0 mb-1.5 w-60 np-card p-1.5 z-50 shadow-2xl border-theme"
                   onMouseLeave={() => setIsThemeMenuOpen(false)}
                 >
                   <div className="px-2.5 py-1.5 text-[10px] font-semibold text-theme-secondary uppercase tracking-wider border-b-theme">
@@ -3567,21 +3603,25 @@ function doPost(e) {
                 setSoundEnabled(next);
                 if (next) setTimeout(() => playUiSound("glass_chime"), 50);
               }}
-              className={`btn btn-sm py-1 px-2 ${soundEnabled ? "btn-secondary text-theme-accent" : "btn-ghost text-theme-muted"}`}
+              className={`btn btn-sm py-1 px-2.5 shrink-0 ${soundEnabled ? "btn-secondary text-theme-accent" : "btn-ghost text-theme-muted"}`}
               title={soundEnabled ? "UI Audio SFX Active (Click to Mute)" : "UI Audio SFX Muted (Click to Enable)"}
             >
-              <span>{soundEnabled ? "🔊" : "🔇"}</span>
-            </button>
-
-            {/* Logout */}
-            <button
-              onClick={handleLogout}
-              className="btn btn-ghost btn-sm py-1 px-2 text-theme-muted hover:text-theme-danger"
-              title="Sign Out"
-            >
-              <span>⏻</span>
+              <span className="text-xs">{soundEnabled ? "🔊" : "🔇"}</span>
             </button>
           </div>
+
+          {/* Explicit, Unmistakable Sign Out Button */}
+          <button
+            type="button"
+            onClick={handleLogout}
+            className="np-btn-signout mt-1"
+            title="Sign out of current operator session"
+          >
+            <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
+            </svg>
+            <span>Sign Out</span>
+          </button>
         </div>
       </aside>
 
@@ -3981,7 +4021,7 @@ function doPost(e) {
               <div>
                 <h2 className="font-semibold text-base text-theme-primary flex items-center gap-2">
                   <span>🛡️ Human Authorization Hold Gate</span>
-                  <span className="badge badge-warning">MANDATORY GATE</span>
+                  <span className="badge badge-accent">MANDATORY GATE</span>
                 </h2>
                 <p className="text-xs text-theme-secondary mt-0.5">
                   No outreach messages are ever dispatched without explicit authorization from the Master Administrator.
@@ -4671,7 +4711,7 @@ function doPost(e) {
               <div>
                 <h2 className="font-semibold text-base text-theme-primary flex items-center gap-2">
                   <span>👥 Role-Based Operator Management</span>
-                  <span className="badge badge-purple">ADMIN PORTAL</span>
+                  <span className="badge badge-accent">ADMIN PORTAL</span>
                 </h2>
                 <p className="text-xs text-theme-secondary mt-0.5">
                   Issue operator licenses, configure hardware machine-locking, toggle active status, and modify daily quotas inline.
@@ -5003,7 +5043,7 @@ function doPost(e) {
               <div>
                 <h2 className="font-semibold text-base text-theme-primary flex items-center gap-2">
                   <span>💳 Manual Billing & Subscription Lifecycle</span>
-                  <span className="badge badge-purple">SUPER ADMIN</span>
+                  <span className="badge badge-accent">SUPER ADMIN</span>
                 </h2>
                 <p className="text-xs text-theme-secondary mt-0.5">
                   Direct operator license extensions, custom base pricing, and automated 10% discount on 90-day plans.
@@ -5300,7 +5340,7 @@ function doPost(e) {
               <div>
                 <h2 className="font-semibold text-base text-theme-primary flex items-center gap-2">
                   <span>🚫 Global Domain Blacklist & Suppression Rules</span>
-                  <span className="badge badge-purple">SUPER ADMIN</span>
+                  <span className="badge badge-accent">SUPER ADMIN</span>
                 </h2>
                 <p className="text-xs text-theme-secondary mt-0.5">
                   Enforce wildcard exclusion patterns (e.g., *.gov, competitor domains) across all scrapers, hygiene pipelines, and outbound queues.

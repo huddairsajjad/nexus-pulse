@@ -105,10 +105,23 @@
   </script>
 
   <script>
-    // Apply saved theme before first paint to prevent Flash of Unstyled Content (FOUC)
+    // Apply saved theme per-operator before first paint to prevent Flash of Unstyled Content (FOUC)
     (function() {
-      var saved = localStorage.getItem('nexus_theme') || 'obsidian-glass';
-      if (saved === 'github-dark') saved = 'obsidian-glass';
+      var saved = 'obsidian-glass';
+      try {
+        var userRaw = localStorage.getItem('nexus_user');
+        if (userRaw) {
+          var u = JSON.parse(userRaw);
+          if (u && u.username) {
+            var userTheme = localStorage.getItem('nexus_theme_' + u.username.toLowerCase());
+            if (userTheme && userTheme !== 'github-dark') saved = userTheme;
+          }
+        }
+      } catch (e) {}
+      if (saved === 'obsidian-glass') {
+        var globalTheme = localStorage.getItem('nexus_theme');
+        if (globalTheme && globalTheme !== 'github-dark') saved = globalTheme;
+      }
       document.documentElement.setAttribute('data-theme', saved);
     })();
 
