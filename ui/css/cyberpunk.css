@@ -642,17 +642,20 @@ html, body {
 /* True Video 1 Split-Card Glassmorphism Auth Container */
 .np-split-auth-card {
   width: 100%;
-  max-width: 960px;
-  min-height: 560px;
+  max-width: 980px;
+  min-height: 580px;
   display: grid;
   grid-template-columns: 1fr;
-  border-radius: 18px;
+  border-radius: 20px;
   overflow: hidden;
-  background: var(--glass-card-bg, rgba(17, 20, 28, 0.88));
-  backdrop-filter: blur(28px);
-  -webkit-backdrop-filter: blur(28px);
-  border: 1px solid var(--glass-border, rgba(255, 255, 255, 0.1));
-  box-shadow: 0 28px 64px -12px rgba(0, 0, 0, 0.85), inset 0 1px 0 rgba(255, 255, 255, 0.09);
+  background: rgba(13, 16, 23, 0.76);
+  backdrop-filter: blur(36px) saturate(190%);
+  -webkit-backdrop-filter: blur(36px) saturate(190%);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 
+    0 32px 80px -16px rgba(0, 0, 0, 0.92),
+    0 0 0 1px rgba(255, 255, 255, 0.05),
+    inset 0 1px 1px rgba(255, 255, 255, 0.16);
   position: relative;
   z-index: 10;
   box-sizing: border-box;
@@ -660,33 +663,56 @@ html, body {
 
 @media (min-width: 860px) {
   .np-split-auth-card {
-    grid-template-columns: 4.2fr 5.8fr;
+    grid-template-columns: 4.3fr 5.7fr;
   }
 }
 
 .np-auth-showcase-panel {
-  padding: 36px 32px;
-  background: linear-gradient(160deg, rgba(20, 24, 34, 0.95), rgba(11, 14, 20, 0.92));
-  border-bottom: 1px solid var(--border-subtle);
+  padding: 38px 34px;
+  background: linear-gradient(165deg, rgba(22, 27, 38, 0.86) 0%, rgba(13, 16, 23, 0.94) 100%);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
   display: flex;
   flex-direction: column;
   justify-content: space-between;
   gap: 24px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  position: relative;
 }
 
 @media (min-width: 860px) {
   .np-auth-showcase-panel {
     border-bottom: none;
-    border-right: 1px solid var(--border-subtle);
+    border-right: 1px solid rgba(255, 255, 255, 0.09);
+    box-shadow: 
+      inset -1px 0 0 rgba(0, 0, 0, 0.45),
+      inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  }
+  
+  /* Refined vertical specular highlight between panels */
+  .np-auth-showcase-panel::after {
+    content: '';
+    position: absolute;
+    top: 10%;
+    bottom: 10%;
+    right: -1px;
+    width: 1px;
+    background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.18), transparent);
+    pointer-events: none;
   }
 }
 
 .np-auth-form-panel {
-  padding: 36px 36px;
-  background: rgba(14, 17, 25, 0.72);
+  padding: 38px 38px;
+  background: linear-gradient(165deg, rgba(16, 20, 29, 0.74) 0%, rgba(10, 13, 19, 0.82) 100%);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
   display: flex;
   flex-direction: column;
   justify-content: center;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  position: relative;
 }
 
 @media (max-width: 640px) {
@@ -700,22 +726,23 @@ html, body {
 
 .np-glass-input {
   width: 100%;
-  padding: 9px 13px;
-  background: rgba(0, 0, 0, 0.45) !important;
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border: 1px solid var(--border) !important;
-  border-radius: 8px;
+  padding: 10px 14px;
+  background: rgba(0, 0, 0, 0.52) !important;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid rgba(255, 255, 255, 0.1) !important;
+  border-radius: 10px;
   color: var(--text-primary) !important;
   font-size: 13px;
   outline: none;
-  transition: all 0.2s ease;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.45), 0 1px 0 rgba(255, 255, 255, 0.03);
   box-sizing: border-box;
 }
 .np-glass-input:focus {
   border-color: var(--accent) !important;
-  box-shadow: 0 0 0 3px var(--accent-muted), 0 0 15px var(--accent-muted) !important;
-  background: rgba(0, 0, 0, 0.6) !important;
+  box-shadow: 0 0 0 3px var(--accent-muted), 0 0 18px var(--accent-muted), inset 0 1px 2px rgba(0, 0, 0, 0.3) !important;
+  background: rgba(0, 0, 0, 0.65) !important;
 }
 .np-glass-input::placeholder {
   color: var(--text-muted);
@@ -839,33 +866,88 @@ html, body {
 }
 
 /* ----------------------------------------------------------------
-   CARD CONTAINERS
+   CARD CONTAINERS & FROSTED SURFACES
    ---------------------------------------------------------------- */
 .np-card,
 .cyber-card {
-  background: var(--glass-card-bg, var(--bg-surface));
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: var(--shadow-sm);
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  background: var(--glass-card-bg, rgba(17, 20, 28, 0.85)) !important;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--border) !important;
+  border-radius: 14px;
+  box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.08) !important;
+  transition: border-color 0.2s cubic-bezier(0.16, 1, 0.3, 1), 
+              box-shadow 0.2s cubic-bezier(0.16, 1, 0.3, 1),
+              transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   box-sizing: border-box;
 }
 .np-card:hover,
 .cyber-card:hover {
-  border-color: var(--border);
-  box-shadow: var(--shadow-md);
+  border-color: rgba(255, 255, 255, 0.16) !important;
+  box-shadow: 0 14px 36px -6px rgba(0, 0, 0, 0.65), inset 0 1px 0 rgba(255, 255, 255, 0.12) !important;
 }
 
 .np-card-elevated {
   background: var(--bg-elevated);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
   border: 1px solid var(--border);
-  border-radius: 8px;
-  box-shadow: var(--shadow-md);
+  border-radius: 14px;
+  box-shadow: 0 12px 36px -6px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.09);
   box-sizing: border-box;
+}
+
+/* First-Class Frosted Glass Empty State Panel */
+.np-empty-state {
+  background: var(--glass-card-bg, rgba(17, 20, 28, 0.82));
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px dashed var(--border);
+  border-radius: 16px;
+  padding: 44px 24px;
+  text-align: center;
+  box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.np-empty-state:hover {
+  border-color: rgba(255, 255, 255, 0.18);
+  box-shadow: 0 16px 44px -6px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+/* Frosted Glass Variable Legend Bar */
+.np-variable-legend-bar {
+  background: var(--glass-card-bg, rgba(17, 20, 28, 0.85));
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 16px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.07);
+}
+
+/* Frosted Glass Dynamic Variable Chips */
+.np-variable-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 500;
+  padding: 4px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
+  color: var(--accent);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  user-select: all;
+  cursor: pointer;
+}
+.np-variable-chip:hover {
+  background: var(--accent-muted);
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  box-shadow: 0 3px 10px var(--accent-muted), inset 0 1px 0 rgba(255, 255, 255, 0.1);
 }
 
 /* ----------------------------------------------------------------
@@ -1158,23 +1240,31 @@ html, body {
 }
 
 .kanban-card {
-  background: var(--bg-elevated);
-  border: 1px solid var(--border-muted);
-  border-radius: 6px;
-  padding: 10px 12px;
+  background: var(--glass-card-bg, rgba(22, 26, 37, 0.85));
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
   cursor: default;
-  transition: border-color 0.12s, box-shadow 0.12s;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   box-sizing: border-box;
 }
 .kanban-card:hover {
-  border-color: var(--border);
-  box-shadow: var(--shadow-sm);
+  border-color: rgba(255, 255, 255, 0.18);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  transform: translateY(-1.5px);
 }
 .kanban-card.hot {
   border-color: var(--danger);
-  background: color-mix(in srgb, var(--danger-muted) 35%, var(--bg-elevated));
+  background: color-mix(in srgb, var(--danger-muted) 35%, var(--glass-card-bg, rgba(22, 26, 37, 0.85)));
+  box-shadow: 0 4px 14px rgba(248, 113, 113, 0.15), inset 0 1px 0 rgba(248, 113, 113, 0.2);
 }
-.kanban-card.hot:hover { box-shadow: 0 0 12px var(--danger-muted); }
+.kanban-card.hot:hover { 
+  box-shadow: 0 8px 26px rgba(248, 113, 113, 0.25), inset 0 1px 0 rgba(248, 113, 113, 0.3);
+  transform: translateY(-1.5px);
+}
 
 /* ----------------------------------------------------------------
    MODAL WINDOW SYSTEM

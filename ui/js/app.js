@@ -2615,29 +2615,29 @@ function doPost(e) {
                   </p>
                 </div>
 
-                <div className="space-y-3 pt-2">
-                  <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                <div className="space-y-2.5 pt-2">
+                  <div className="flex items-start gap-2.5 text-xs text-theme-secondary p-2.5 rounded-xl bg-[rgba(255,255,255,0.025)] border border-[rgba(255,255,255,0.06)] shadow-sm backdrop-blur-sm">
                     <span className="w-6 h-6 rounded-lg bg-[rgba(245,158,11,0.1)] border border-[rgba(245,158,11,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-warning">👑</span>
                     <div>
                       <strong className="text-white block font-medium">Master Root Authority</strong>
                       <span className="text-[11px] text-theme-muted">Full administrative control & multi-tenant management</span>
                     </div>
                   </div>
-                  <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                  <div className="flex items-start gap-2.5 text-xs text-theme-secondary p-2.5 rounded-xl bg-[rgba(255,255,255,0.025)] border border-[rgba(255,255,255,0.06)] shadow-sm backdrop-blur-sm">
                     <span className="w-6 h-6 rounded-lg bg-[rgba(168,85,247,0.1)] border border-[rgba(168,85,247,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-purple">🔒</span>
                     <div>
                       <strong className="text-white block font-medium">Hardware Cryptographic Lock</strong>
                       <span className="text-[11px] text-theme-muted">MachineGuid & Bcrypt 12-round key derivation</span>
                     </div>
                   </div>
-                  <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                  <div className="flex items-start gap-2.5 text-xs text-theme-secondary p-2.5 rounded-xl bg-[rgba(255,255,255,0.025)] border border-[rgba(255,255,255,0.06)] shadow-sm backdrop-blur-sm">
                     <span className="w-6 h-6 rounded-lg bg-[rgba(56,189,248,0.1)] border border-[rgba(56,189,248,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-accent">📦</span>
                     <div>
                       <strong className="text-white block font-medium">Vault Database Partitioning</strong>
                       <span className="text-[11px] text-theme-muted">Zero-leak SQLite ACID schema with auto-migration</span>
                     </div>
                   </div>
-                  <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                  <div className="flex items-start gap-2.5 text-xs text-theme-secondary p-2.5 rounded-xl bg-[rgba(255,255,255,0.025)] border border-[rgba(255,255,255,0.06)] shadow-sm backdrop-blur-sm">
                     <span className="w-6 h-6 rounded-lg bg-[rgba(16,185,129,0.1)] border border-[rgba(16,185,129,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-success">⚡</span>
                     <div>
                       <strong className="text-white block font-medium">Enterprise Pipeline Ready</strong>
@@ -2867,29 +2867,29 @@ function doPost(e) {
                     </p>
                   </div>
 
-                  <div className="space-y-3 pt-2">
-                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                  <div className="space-y-2.5 pt-2">
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary p-2.5 rounded-xl bg-[rgba(255,255,255,0.025)] border border-[rgba(255,255,255,0.06)] shadow-sm backdrop-blur-sm">
                       <span className="w-6 h-6 rounded-lg bg-[rgba(56,189,248,0.1)] border border-[rgba(56,189,248,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-accent">⚡</span>
                       <div>
                         <strong className="text-white block font-medium">3-Tier Geo Lead Engine</strong>
                         <span className="text-[11px] text-theme-muted">Cascading Region › Country › City discovery</span>
                       </div>
                     </div>
-                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary p-2.5 rounded-xl bg-[rgba(255,255,255,0.025)] border border-[rgba(255,255,255,0.06)] shadow-sm backdrop-blur-sm">
                       <span className="w-6 h-6 rounded-lg bg-[rgba(16,185,129,0.1)] border border-[rgba(16,185,129,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-success">🛡️</span>
                       <div>
                         <strong className="text-white block font-medium">Zero-Bounce Hygiene</strong>
                         <span className="text-[11px] text-theme-muted">Syntax, MX DNS & disposable email rejection</span>
                       </div>
                     </div>
-                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary p-2.5 rounded-xl bg-[rgba(255,255,255,0.025)] border border-[rgba(255,255,255,0.06)] shadow-sm backdrop-blur-sm">
                       <span className="w-6 h-6 rounded-lg bg-[rgba(245,158,11,0.1)] border border-[rgba(245,158,11,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-warning">🔄</span>
                       <div>
                         <strong className="text-white block font-medium">Adaptive Inbox Rotator</strong>
                         <span className="text-[11px] text-theme-muted">SMTP deliverability with dynamic send-cap monitors</span>
                       </div>
                     </div>
-                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary p-2.5 rounded-xl bg-[rgba(255,255,255,0.025)] border border-[rgba(255,255,255,0.06)] shadow-sm backdrop-blur-sm">
                       <span className="w-6 h-6 rounded-lg bg-[rgba(168,85,247,0.1)] border border-[rgba(168,85,247,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-purple">🔒</span>
                       <div>
                         <strong className="text-white block font-medium">Machine Lock Protection</strong>
@@ -2912,29 +2912,29 @@ function doPost(e) {
                     </p>
                   </div>
 
-                  <div className="space-y-3 pt-2">
-                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                  <div className="space-y-2.5 pt-2">
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary p-2.5 rounded-xl bg-[rgba(255,255,255,0.025)] border border-[rgba(255,255,255,0.06)] shadow-sm backdrop-blur-sm">
                       <span className="w-6 h-6 rounded-lg bg-[rgba(16,185,129,0.1)] border border-[rgba(16,185,129,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-success">✓</span>
                       <div>
                         <strong className="text-white block font-medium">100 Real Verified Leads</strong>
                         <span className="text-[11px] text-theme-muted">Live discovery with zero mock / zero dummy data</span>
                       </div>
                     </div>
-                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary p-2.5 rounded-xl bg-[rgba(255,255,255,0.025)] border border-[rgba(255,255,255,0.06)] shadow-sm backdrop-blur-sm">
                       <span className="w-6 h-6 rounded-lg bg-[rgba(56,189,248,0.1)] border border-[rgba(56,189,248,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-accent">✓</span>
                       <div>
                         <strong className="text-white block font-medium">48-Hour Full Access</strong>
                         <span className="text-[11px] text-theme-muted">Complete operator workspace & pipeline automation</span>
                       </div>
                     </div>
-                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary p-2.5 rounded-xl bg-[rgba(255,255,255,0.025)] border border-[rgba(255,255,255,0.06)] shadow-sm backdrop-blur-sm">
                       <span className="w-6 h-6 rounded-lg bg-[rgba(245,158,11,0.1)] border border-[rgba(245,158,11,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-warning">✓</span>
                       <div>
                         <strong className="text-white block font-medium">Zero Credit Card Upfront</strong>
                         <span className="text-[11px] text-theme-muted">Instant self-serve activation via email or Google</span>
                       </div>
                     </div>
-                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary p-2.5 rounded-xl bg-[rgba(255,255,255,0.025)] border border-[rgba(255,255,255,0.06)] shadow-sm backdrop-blur-sm">
                       <span className="w-6 h-6 rounded-lg bg-[rgba(168,85,247,0.1)] border border-[rgba(168,85,247,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-purple">✓</span>
                       <div>
                         <strong className="text-white block font-medium">Hardware-Bound Sandbox</strong>
@@ -2999,7 +2999,7 @@ function doPost(e) {
             {isScanning && <div className="biometric-scanner-line" />}
 
             {/* Video 1 Sliding Split Pill Toggle */}
-            <div className="flex p-1 bg-[rgba(0,0,0,0.35)] rounded-lg border border-[var(--border-subtle)] mb-5">
+            <div className="flex p-1.5 bg-[rgba(0,0,0,0.5)] backdrop-blur-md rounded-xl border border-[rgba(255,255,255,0.08)] mb-5 shadow-inner">
               <button
                 type="button"
                 onClick={() => {
@@ -3008,7 +3008,7 @@ function doPost(e) {
                   setRegError("");
                   SoundEffects.authToggle();
                 }}
-                className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all ${
                   authMode === "login"
                     ? "bg-[var(--accent)] text-[var(--bg-base)] shadow font-bold"
                     : "text-theme-secondary hover:text-theme-primary"
@@ -3024,7 +3024,7 @@ function doPost(e) {
                   setRegError("");
                   SoundEffects.authToggle();
                 }}
-                className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                className={`flex-1 py-2 text-xs font-semibold rounded-lg transition-all ${
                   authMode === "register"
                     ? "bg-[var(--accent)] text-[var(--bg-base)] shadow font-bold"
                     : "text-theme-secondary hover:text-theme-primary"
@@ -4023,10 +4023,14 @@ function doPost(e) {
             </div>
 
             {pendingApprovals.length === 0 ? (
-              <div className="np-card p-12 text-center">
-                <span className="text-3xl mb-2 block">✓</span>
+              <div className="np-empty-state">
+                <div className="w-12 h-12 mx-auto mb-3 rounded-2xl bg-[rgba(16,185,129,0.12)] border border-[rgba(16,185,129,0.25)] flex items-center justify-center text-xl text-theme-success shadow-inner">
+                  ✓
+                </div>
                 <h3 className="font-semibold text-sm text-theme-primary">Gate Clear: No Pending Outreach</h3>
-                <p className="text-xs text-theme-secondary mt-1">All leads reviewed or dispatched according to dynamic 9:00 AM - 5:00 PM local business window.</p>
+                <p className="text-xs text-theme-secondary mt-1.5 max-w-md mx-auto leading-relaxed">
+                  All leads reviewed or dispatched according to dynamic 9:00 AM - 5:00 PM local business window.
+                </p>
               </div>
             ) : (
               <div className="space-y-3">
@@ -4117,10 +4121,14 @@ function doPost(e) {
             </div>
 
             {uniqueHotLeads.length === 0 ? (
-              <div className="np-card p-12 text-center">
-                <span className="text-3xl mb-2 block">📡</span>
+              <div className="np-empty-state">
+                <div className="w-12 h-12 mx-auto mb-3 rounded-2xl bg-[rgba(56,189,248,0.12)] border border-[rgba(56,189,248,0.25)] flex items-center justify-center text-xl text-theme-accent shadow-inner">
+                  📡
+                </div>
                 <h3 className="font-semibold text-sm text-theme-primary">IMAP Reply Listener Active</h3>
-                <p className="text-xs text-theme-secondary mt-1">Listening on enrolled mailboxes for high-intent commercial replies across all active niches...</p>
+                <p className="text-xs text-theme-secondary mt-1.5 max-w-md mx-auto leading-relaxed">
+                  Listening on enrolled mailboxes for high-intent commercial replies across all active niches...
+                </p>
               </div>
             ) : (
               <div className="space-y-3">
@@ -4192,15 +4200,19 @@ function doPost(e) {
             </div>
 
             {mailboxes.length === 0 ? (
-              <div className="np-card p-12 text-center">
-                <span className="text-3xl mb-2 block">📬</span>
+              <div className="np-empty-state">
+                <div className="w-12 h-12 mx-auto mb-3 rounded-2xl bg-[rgba(56,189,248,0.12)] border border-[rgba(56,189,248,0.25)] flex items-center justify-center text-xl text-theme-accent shadow-inner">
+                  📬
+                </div>
                 <h3 className="font-semibold text-sm text-theme-primary">No Data Available: Zero Mailboxes Enrolled</h3>
-                <p className="text-xs text-theme-secondary mt-1">Enroll an active SMTP inbox into the rotation pool to enable automated outreach.</p>
+                <p className="text-xs text-theme-secondary mt-1.5 max-w-md mx-auto leading-relaxed">
+                  Enroll an active SMTP inbox into the rotation pool to enable automated outreach and deliverability monitoring.
+                </p>
                 <button
                   onClick={() => setIsAddMailboxOpen(true)}
-                  className="btn btn-primary btn-sm mt-4"
+                  className="btn btn-primary btn-sm mt-4 shadow-md"
                 >
-                  + Enroll Mailbox
+                  + Enroll First Mailbox
                 </button>
               </div>
             ) : (
@@ -4301,7 +4313,7 @@ function doPost(e) {
             </div>
 
             {/* Variable Interpolation Legend */}
-            <div className="p-3 bg-elevated rounded-md border-theme flex flex-wrap items-center gap-2 text-xs">
+            <div className="np-variable-legend-bar flex flex-wrap items-center gap-2.5 text-xs">
               <span className="text-theme-secondary font-medium">Available Dynamic Variables:</span>
               {[
                 "{{company_name}}",
@@ -4311,22 +4323,24 @@ function doPost(e) {
                 "{{tech_stack}}",
                 "{{unsubscribe_link}}"
               ].map(tag => (
-                <span key={tag} className="font-mono text-[11px] px-2 py-0.5 rounded bg-overlay text-theme-accent border-theme">
+                <span key={tag} className="np-variable-chip" title="Dynamic template variable">
                   {tag}
                 </span>
               ))}
             </div>
 
             {templatesList.length === 0 ? (
-              <div className="np-card p-12 text-center">
-                <span className="text-3xl mb-2 block">📝</span>
+              <div className="np-empty-state">
+                <div className="w-12 h-12 mx-auto mb-3 rounded-2xl bg-[rgba(168,85,247,0.12)] border border-[rgba(168,85,247,0.25)] flex items-center justify-center text-xl text-theme-purple shadow-inner">
+                  📝
+                </div>
                 <h3 className="font-semibold text-sm text-theme-primary">No Data Available: Zero Proposal Templates</h3>
-                <p className="text-xs text-theme-secondary mt-1">
+                <p className="text-xs text-theme-secondary mt-1.5 max-w-md mx-auto leading-relaxed">
                   The system starts 100% clean with zero seed templates. Create custom service templates to match target industries.
                 </p>
                 <button
                   onClick={() => handleOpenTemplateModal(null)}
-                  className="btn btn-primary btn-sm mt-4"
+                  className="btn btn-primary btn-sm mt-4 shadow-md"
                 >
                   + Create First Proposal Template
                 </button>
@@ -4667,13 +4681,17 @@ function doPost(e) {
             </div>
 
             {operatorsList.length === 0 ? (
-              <div className="np-card p-12 text-center">
-                <span className="text-3xl mb-2 block">👥</span>
+              <div className="np-empty-state">
+                <div className="w-12 h-12 mx-auto mb-3 rounded-2xl bg-[rgba(168,85,247,0.12)] border border-[rgba(168,85,247,0.25)] flex items-center justify-center text-xl text-theme-purple shadow-inner">
+                  👥
+                </div>
                 <h3 className="font-semibold text-sm text-theme-primary">No Data Available: Zero Operators Registered</h3>
-                <p className="text-xs text-theme-secondary mt-1">Issue hardware-locked credentials and license tokens to onboard your team.</p>
+                <p className="text-xs text-theme-secondary mt-1.5 max-w-md mx-auto leading-relaxed">
+                  Issue hardware-locked credentials and license tokens to onboard your team.
+                </p>
                 <button
                   onClick={() => setIsCreateOperatorOpen(true)}
-                  className="btn btn-primary btn-sm mt-4"
+                  className="btn btn-primary btn-sm mt-4 shadow-md"
                 >
                   + Create Operator Account
                 </button>
@@ -5218,10 +5236,12 @@ function doPost(e) {
               </div>
 
               {billingHistory.length === 0 ? (
-                <div className="p-8 text-center">
-                  <span className="text-2xl mb-1 block">💳</span>
+                <div className="np-empty-state py-8">
+                  <div className="w-10 h-10 mx-auto mb-2 rounded-xl bg-[rgba(245,158,11,0.12)] border border-[rgba(245,158,11,0.25)] flex items-center justify-center text-lg text-theme-warning shadow-inner">
+                    💳
+                  </div>
                   <h4 className="font-semibold text-xs text-theme-primary">No Data Available: Zero Billing Records</h4>
-                  <p className="text-[11px] text-theme-secondary mt-0.5">Manual subscription adjustments will be logged here.</p>
+                  <p className="text-[11px] text-theme-secondary mt-1">Manual subscription adjustments will be logged here.</p>
                 </div>
               ) : (
                 <div className="np-table-wrapper">
@@ -5325,10 +5345,12 @@ function doPost(e) {
               </div>
 
               {blacklistRules.length === 0 ? (
-                <div className="p-8 text-center">
-                  <span className="text-2xl mb-1 block">🛡️</span>
+                <div className="np-empty-state py-8">
+                  <div className="w-10 h-10 mx-auto mb-2 rounded-xl bg-[rgba(248,113,113,0.12)] border border-[rgba(248,113,113,0.25)] flex items-center justify-center text-lg text-theme-danger shadow-inner">
+                    🛡️
+                  </div>
                   <h4 className="font-semibold text-xs text-theme-primary">No Data Available: Zero Blacklist Rules</h4>
-                  <p className="text-[11px] text-theme-secondary mt-0.5">Add domain patterns above to automatically reject unwanted targets.</p>
+                  <p className="text-[11px] text-theme-secondary mt-1">Add domain patterns above to automatically reject unwanted targets.</p>
                 </div>
               ) : (
                 <div className="np-table-wrapper">
@@ -6592,7 +6614,7 @@ function doPost(e) {
                         key={tag}
                         type="button"
                         onClick={() => handleInsertTag(tag)}
-                        className="text-[11px] font-mono px-2 py-0.5 rounded bg-overlay hover:bg-hover text-theme-accent border-theme transition-colors"
+                        className="np-variable-chip"
                         title={`Insert ${tag}`}
                       >
                         + {tag}
