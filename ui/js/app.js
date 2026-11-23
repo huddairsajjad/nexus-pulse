@@ -3511,7 +3511,7 @@ function doPost(e) {
           )}
 
           {/* Quick Primary Actions */}
-          <div className="pt-2 border-t border-[var(--border-subtle)] space-y-2">
+          <div className="pt-2 border-t border-[var(--border-subtle)] space-y-1.5">
             <button
               onClick={() => { setIsHuntModalOpen(true); setHuntProgress(null); }}
               className="btn btn-primary btn-sm w-full justify-center shadow-sm"
@@ -3614,13 +3614,29 @@ function doPost(e) {
           <button
             type="button"
             onClick={handleLogout}
-            className="np-btn-signout mt-1"
+            className="np-btn-signout"
             title="Sign out of current operator session"
           >
-            <svg className="w-3.5 h-3.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+            <svg
+              className="np-btn-signout-icon w-3.5 h-3.5 shrink-0"
+              width="14"
+              height="14"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              style={{
+                width: "14px",
+                height: "14px",
+                minWidth: "14px",
+                maxWidth: "14px",
+                minHeight: "14px",
+                maxHeight: "14px",
+                flexShrink: 0
+              }}
+            >
               <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" />
             </svg>
-            <span>Sign Out</span>
+            <span style={{ whiteSpace: "nowrap" }}>Sign Out</span>
           </button>
         </div>
       </aside>
