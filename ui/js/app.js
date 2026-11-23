@@ -61,21 +61,52 @@ function playUiSound(tone = "switch_click") {
     if (!ctx) return;
     const t = ctx.currentTime;
 
-    if (tone === "water_drop" || tone === "tab") {
-      // 1. Water Drop: Crisp descending resonance (Nav/Sidebar switches)
+    if (tone === "welcome_chime" || tone === "login_success") {
+      // 1. Welcome Chime: Warm harmonic arpeggio chord (C5 -> E5 -> G5)
+      const notes = [523.25, 659.25, 783.99];
+      notes.forEach((freq, idx) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        const noteTime = t + (idx * 0.045);
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(freq, noteTime);
+        gain.gain.setValueAtTime(0.04, noteTime);
+        gain.gain.exponentialRampToValueAtTime(0.0001, noteTime + 0.26);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(noteTime);
+        osc.stop(noteTime + 0.26);
+      });
+    } else if (tone === "theme_shimmer") {
+      // 2. Theme Shimmer: Delicate resonant bell shimmer (1320Hz + 1980Hz + 2640Hz)
+      const freqs = [1320, 1980, 2640];
+      freqs.forEach((freq, idx) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(freq, t);
+        gain.gain.setValueAtTime(0.025 / (idx + 1), t);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+        osc.connect(gain);
+        gain.connect(ctx.destination);
+        osc.start(t);
+        osc.stop(t + 0.18);
+      });
+    } else if (tone === "water_drop" || tone === "tab") {
+      // 3. Water Drop: Airy descending resonance (Nav / Sidebar tab switches)
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = "sine";
-      osc.frequency.setValueAtTime(1400, t);
-      osc.frequency.exponentialRampToValueAtTime(520, t + 0.05);
-      gain.gain.setValueAtTime(0.055, t);
-      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.05);
+      osc.frequency.setValueAtTime(1350, t);
+      osc.frequency.exponentialRampToValueAtTime(480, t + 0.045);
+      gain.gain.setValueAtTime(0.05, t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.045);
       osc.connect(gain);
       gain.connect(ctx.destination);
       osc.start(t);
-      osc.stop(t + 0.05);
+      osc.stop(t + 0.045);
     } else if (tone === "bubble_pop") {
-      // 2. Bubble Pop: Upward chirping bubble (Filter / Toggle / Pill clicks)
+      // 4. Bubble Pop: Upward chirping bubble (Filter / Toggle / Pill clicks)
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = "sine";
@@ -87,21 +118,22 @@ function playUiSound(tone = "switch_click") {
       gain.connect(ctx.destination);
       osc.start(t);
       osc.stop(t + 0.038);
-    } else if (tone === "glass_chime" || tone === "action" || tone === "submit") {
-      // 3. Glass Chime: Elegant dual-harmonic crystal ping (Primary actions, theme changes, approves)
+    } else if (tone === "glass_chime" || tone === "action" || tone === "action_pulse" || tone === "submit") {
+      // 5. Action Pulse / Glass Chime: Clean upward dual-harmonic confirmation pulse
       const osc1 = ctx.createOscillator();
       const gain1 = ctx.createGain();
       const osc2 = ctx.createOscillator();
       const gain2 = ctx.createGain();
 
       osc1.type = "sine";
-      osc1.frequency.setValueAtTime(1760, t); // A6
+      osc1.frequency.setValueAtTime(880, t);
+      osc1.frequency.exponentialRampToValueAtTime(1760, t + 0.08);
       gain1.gain.setValueAtTime(0.045, t);
-      gain1.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+      gain1.gain.exponentialRampToValueAtTime(0.0001, t + 0.15);
 
       osc2.type = "sine";
-      osc2.frequency.setValueAtTime(2640, t); // E7
-      gain2.gain.setValueAtTime(0.025, t);
+      osc2.frequency.setValueAtTime(2640, t);
+      gain2.gain.setValueAtTime(0.02, t);
       gain2.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
 
       osc1.connect(gain1);
@@ -110,23 +142,36 @@ function playUiSound(tone = "switch_click") {
       gain2.connect(ctx.destination);
       osc1.start(t);
       osc2.start(t);
-      osc1.stop(t + 0.14);
+      osc1.stop(t + 0.15);
       osc2.stop(t + 0.12);
     } else if (tone === "low_tone" || tone === "destructive" || tone === "warning") {
-      // 4. Soft Low Tone: Warm warning / cancellation / destructive note
+      // 6. Soft Low Tone: Warm warning / cancellation / destructive note
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = "triangle";
-      osc.frequency.setValueAtTime(220, t);
-      osc.frequency.exponentialRampToValueAtTime(110, t + 0.09);
-      gain.gain.setValueAtTime(0.05, t);
+      osc.frequency.setValueAtTime(180, t);
+      osc.frequency.exponentialRampToValueAtTime(90, t + 0.09);
+      gain.gain.setValueAtTime(0.045, t);
       gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
       osc.connect(gain);
       gain.connect(ctx.destination);
       osc.start(t);
       osc.stop(t + 0.09);
+    } else if (tone === "auth_toggle") {
+      // 7. Auth Toggle: Crisp soft glass pop (Sign In <-> Create Account switch)
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(1400, t);
+      osc.frequency.exponentialRampToValueAtTime(240, t + 0.025);
+      gain.gain.setValueAtTime(0.045, t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.025);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.025);
     } else {
-      // 5. Subtle Switch Click (default): Crisp microsecond tactile click
+      // 8. Subtle Switch Click (default): Crisp microsecond tactile click
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = "sine";
@@ -145,11 +190,15 @@ function playUiSound(tone = "switch_click") {
 }
 
 const SoundEffects = {
+  authToggle: () => playUiSound("auth_toggle"),
+  welcomeChime: () => playUiSound("welcome_chime"),
   waterDrop: () => playUiSound("water_drop"),
-  bubblePop: () => playUiSound("bubble_pop"),
+  actionPulse: () => playUiSound("action_pulse"),
   glassChime: () => playUiSound("glass_chime"),
+  lowTone: () => playUiSound("low_tone"),
+  themeShimmer: () => playUiSound("theme_shimmer"),
   switchClick: () => playUiSound("switch_click"),
-  lowTone: () => playUiSound("low_tone")
+  bubblePop: () => playUiSound("bubble_pop")
 };
 window.SoundEffects = SoundEffects;
 window.playUiSound = playUiSound;
@@ -181,8 +230,10 @@ if (typeof document !== "undefined") {
 
         if (isDanger) {
           playUiSound("low_tone");
-        } else if (isTheme || isAction) {
-          playUiSound("glass_chime");
+        } else if (isTheme) {
+          playUiSound("theme_shimmer");
+        } else if (isAction) {
+          playUiSound("action_pulse");
         } else if (isTab) {
           playUiSound("water_drop");
         } else {
@@ -815,7 +866,7 @@ function NexusPulseApp() {
       const data = await resp.json();
 
       if (resp.ok && data.token) {
-        playUiSound("action");
+        SoundEffects.welcomeChime();
         setToken(data.token);
         setUser(data.user);
         localStorage.setItem("nexus_token", data.token);
@@ -853,6 +904,7 @@ function NexusPulseApp() {
         const data = await resp.json();
 
         if (resp.ok && data.token) {
+          SoundEffects.welcomeChime();
           setScanStep("Access Granted! Loading H.Huddair Nexus-Pulse Core...");
           setTimeout(() => {
             setToken(data.token);
@@ -894,6 +946,7 @@ function NexusPulseApp() {
       });
       const data = await resp.json();
       if (resp.ok && data.token) {
+        SoundEffects.welcomeChime();
         setScanStep("Google Identity Verified! 2-Day Free Trial provisioned...");
         setTimeout(() => {
           setToken(data.token);
@@ -984,6 +1037,7 @@ function NexusPulseApp() {
       });
       const data = await resp.json();
       if (resp.ok && (data.token || data.access_token)) {
+        SoundEffects.welcomeChime();
         const userToken = data.token || data.access_token;
         const userData = data.user || {
           id: data.user_id,
@@ -2495,6 +2549,7 @@ function doPost(e) {
                       onClick={() => {
                         setActiveTheme(t.id);
                         setIsThemeMenuOpen(false);
+                        SoundEffects.themeShimmer();
                       }}
                       className={`w-full text-left px-2.5 py-1.5 rounded text-xs flex items-center justify-between hover:bg-hover transition-colors ${
                         activeTheme === t.id ? "text-theme-accent font-semibold bg-[var(--accent-muted)]" : "text-theme-primary"
@@ -2530,20 +2585,85 @@ function doPost(e) {
             </button>
           </div>
 
-          <div className="np-glass-card w-full max-w-lg p-8 relative overflow-hidden shadow-2xl z-10">
-            <div className="text-center mb-6">
-              <div className="w-12 h-12 mx-auto mb-3 rounded-xl border border-[var(--border)] bg-elevated flex items-center justify-center font-bold text-base text-theme-accent font-mono shadow-inner">
-                NP
+        <div className="np-split-auth-card">
+          {/* LEFT SHOWCASE PANEL: FIRST RUN ADMIN SETUP */}
+          <div className="np-auth-showcase-panel">
+            <div>
+              <div className="flex items-center gap-2.5 mb-5">
+                <div className="w-10 h-10 rounded-xl border border-[var(--border)] bg-elevated flex items-center justify-center font-bold text-sm text-theme-accent font-mono shadow-inner">
+                  NP
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-bold text-sm tracking-tight text-white">Nexus-Pulse</span>
+                    <span className="badge badge-accent text-[9px] px-1.5 py-0 font-mono">LEVEL 2</span>
+                  </div>
+                  <div className="text-[10px] text-theme-muted font-mono">Autonomous B2B Pipeline Gateway</div>
+                </div>
               </div>
-              <h1 className="text-xl font-bold tracking-tight text-theme-primary">
-                Nexus-Pulse Level 2 Enterprise
-              </h1>
-              <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 mt-2 rounded-full text-[11px] font-mono bg-[var(--accent-muted)] text-[var(--accent)] border border-[var(--accent)]">
-                <span>★</span> Fresh Production State — First-Run Admin Setup
+
+              <div className="space-y-4">
+                <div>
+                  <span className="badge badge-warning text-[9px] font-mono uppercase tracking-wider mb-2 inline-block px-2 py-0.5">
+                    ★ First-Run Production Setup
+                  </span>
+                  <h2 className="text-2xl lg:text-3xl font-black tracking-tight text-white leading-tight">
+                    INITIALIZE MASTER ADMIN
+                  </h2>
+                  <p className="text-xs text-theme-secondary mt-1.5 leading-relaxed">
+                    Fresh installation detected. Configure your Master Administrator profile and bind your host hardware key.
+                  </p>
+                </div>
+
+                <div className="space-y-3 pt-2">
+                  <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                    <span className="w-6 h-6 rounded-lg bg-[rgba(245,158,11,0.1)] border border-[rgba(245,158,11,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-warning">👑</span>
+                    <div>
+                      <strong className="text-white block font-medium">Master Root Authority</strong>
+                      <span className="text-[11px] text-theme-muted">Full administrative control & multi-tenant management</span>
+                    </div>
+                  </div>
+                  <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                    <span className="w-6 h-6 rounded-lg bg-[rgba(168,85,247,0.1)] border border-[rgba(168,85,247,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-purple">🔒</span>
+                    <div>
+                      <strong className="text-white block font-medium">Hardware Cryptographic Lock</strong>
+                      <span className="text-[11px] text-theme-muted">MachineGuid & Bcrypt 12-round key derivation</span>
+                    </div>
+                  </div>
+                  <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                    <span className="w-6 h-6 rounded-lg bg-[rgba(56,189,248,0.1)] border border-[rgba(56,189,248,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-accent">📦</span>
+                    <div>
+                      <strong className="text-white block font-medium">Vault Database Partitioning</strong>
+                      <span className="text-[11px] text-theme-muted">Zero-leak SQLite ACID schema with auto-migration</span>
+                    </div>
+                  </div>
+                  <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                    <span className="w-6 h-6 rounded-lg bg-[rgba(16,185,129,0.1)] border border-[rgba(16,185,129,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-success">⚡</span>
+                    <div>
+                      <strong className="text-white block font-medium">Enterprise Pipeline Ready</strong>
+                      <span className="text-[11px] text-theme-muted">3-tier geo lead search, zero-bounce hygiene & SMTP</span>
+                    </div>
+                  </div>
+                </div>
               </div>
-              <p className="text-xs text-theme-secondary mt-2">
-                Clean installation detected. Initialize your Master Administrator profile and bind your host hardware key.
-              </p>
+            </div>
+
+            <div className="space-y-3 pt-4 border-t border-[var(--border-subtle)]">
+              <div className="flex items-center justify-between text-[10px] font-mono text-theme-muted">
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-[var(--warning)] animate-pulse" />
+                  <span>STATUS: FRESH INSTALL</span>
+                </span>
+                <span>ROOT PROVISIONING</span>
+              </div>
+            </div>
+          </div>
+
+          {/* RIGHT FORM PANEL: FIRST RUN ADMIN SETUP */}
+          <div className="np-auth-form-panel">
+            <div className="mb-5">
+              <h3 className="text-lg font-bold text-theme-primary">Create Master Admin</h3>
+              <p className="text-xs text-theme-secondary mt-0.5">Define your executive administrative credentials.</p>
             </div>
 
             {initError && (
@@ -2552,65 +2672,80 @@ function doPost(e) {
               </div>
             )}
 
-            <form onSubmit={handleInitializeAdmin} className="space-y-4">
+            <form onSubmit={handleInitializeAdmin} className="space-y-3.5">
               <div>
                 <label className="np-label">Master Administrator Username *</label>
-                <input
-                  type="text"
-                  value={initUsername}
-                  onChange={(e) => setInitUsername(e.target.value)}
-                  className="np-glass-input font-mono"
-                  placeholder="e.g. admin or h.huddair"
-                  required
-                />
+                <div className="relative">
+                  <span className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted text-xs">👤</span>
+                  <input
+                    type="text"
+                    value={initUsername}
+                    onChange={(e) => setInitUsername(e.target.value)}
+                    className="np-glass-input font-mono pl-9"
+                    placeholder="e.g. admin or h.huddair"
+                    required
+                  />
+                </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="np-label">Executive Full Name *</label>
-                  <input
-                    type="text"
-                    value={initFullName}
-                    onChange={(e) => setInitFullName(e.target.value)}
-                    className="np-glass-input"
-                    placeholder="e.g. H.Huddair (Master Admin)"
-                    required
-                  />
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted text-xs">👔</span>
+                    <input
+                      type="text"
+                      value={initFullName}
+                      onChange={(e) => setInitFullName(e.target.value)}
+                      className="np-glass-input pl-9"
+                      placeholder="e.g. H.Huddair"
+                      required
+                    />
+                  </div>
                 </div>
                 <div>
                   <label className="np-label">Corporate Email</label>
-                  <input
-                    type="email"
-                    value={initEmail}
-                    onChange={(e) => setInitEmail(e.target.value)}
-                    className="np-glass-input font-mono"
-                    placeholder="admin@nexus-pulse.io"
-                  />
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted text-xs">✉️</span>
+                    <input
+                      type="email"
+                      value={initEmail}
+                      onChange={(e) => setInitEmail(e.target.value)}
+                      className="np-glass-input font-mono pl-9"
+                      placeholder="admin@nexus-pulse.io"
+                    />
+                  </div>
                 </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div>
                   <label className="np-label">Master Passphrase (Bcrypt) *</label>
-                  <input
-                    type="password"
-                    value={initPassword}
-                    onChange={(e) => setInitPassword(e.target.value)}
-                    className="np-glass-input font-mono"
-                    placeholder="Min 6 characters"
-                    required
-                  />
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted text-xs">🔒</span>
+                    <input
+                      type="password"
+                      value={initPassword}
+                      onChange={(e) => setInitPassword(e.target.value)}
+                      className="np-glass-input font-mono pl-9"
+                      placeholder="Min 6 characters"
+                      required
+                    />
+                  </div>
                 </div>
                 <div>
                   <label className="np-label">Confirm Passphrase *</label>
-                  <input
-                    type="password"
-                    value={initConfirmPassword}
-                    onChange={(e) => setInitConfirmPassword(e.target.value)}
-                    className="np-glass-input font-mono"
-                    placeholder="••••••••••••"
-                    required
-                  />
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted text-xs">🔒</span>
+                    <input
+                      type="password"
+                      value={initConfirmPassword}
+                      onChange={(e) => setInitConfirmPassword(e.target.value)}
+                      className="np-glass-input font-mono pl-9"
+                      placeholder="••••••••••••"
+                      required
+                    />
+                  </div>
                 </div>
               </div>
 
@@ -2624,6 +2759,7 @@ function doPost(e) {
               </button>
             </form>
           </div>
+        </div>
         </div>
       );
     }
@@ -2663,6 +2799,7 @@ function doPost(e) {
                     onClick={() => {
                       setActiveTheme(t.id);
                       setIsThemeMenuOpen(false);
+                      SoundEffects.themeShimmer();
                     }}
                     className={`w-full text-left px-2.5 py-1.5 rounded text-xs flex items-center justify-between hover:bg-hover transition-colors ${
                       activeTheme === t.id ? "text-theme-accent font-semibold bg-[var(--accent-muted)]" : "text-theme-primary"
@@ -2698,253 +2835,413 @@ function doPost(e) {
           </button>
         </div>
 
-        {/* Video 1 Frosted Glass Card Container */}
-        <div className="np-glass-card w-full max-w-md p-8 relative overflow-hidden shadow-2xl z-10">
-          {isScanning && <div className="biometric-scanner-line" />}
-
-          {/* Brand Header */}
-          <div className="text-center mb-6">
-            <div className="w-12 h-12 mx-auto mb-3 rounded-xl border border-[var(--border)] bg-elevated flex items-center justify-center font-bold text-base text-theme-accent font-mono shadow-inner">
-              NP
-            </div>
-            <h1 className="text-xl font-bold tracking-tight text-theme-primary">
-              Nexus-Pulse Level 2 Enterprise
-            </h1>
-            <p className="text-xs text-theme-secondary mt-1">
-              Autonomous B2B Lead Engine & Multi-Tenant Gateway
-            </p>
-          </div>
-
-          {/* Video 1 Sliding Split Pill Toggle */}
-          <div className="flex p-1 bg-[rgba(0,0,0,0.35)] rounded-lg border border-[var(--border-subtle)] mb-5">
-            <button
-              type="button"
-              onClick={() => {
-                setAuthMode("login");
-                setLoginError("");
-                setRegError("");
-                SoundEffects.switchClick();
-              }}
-              className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${
-                authMode === "login"
-                  ? "bg-[var(--accent)] text-[var(--bg-base)] shadow font-bold"
-                  : "text-theme-secondary hover:text-theme-primary"
-              }`}
-            >
-              Sign In
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setAuthMode("register");
-                setLoginError("");
-                setRegError("");
-                SoundEffects.switchClick();
-              }}
-              className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${
-                authMode === "register"
-                  ? "bg-[var(--accent)] text-[var(--bg-base)] shadow font-bold"
-                  : "text-theme-secondary hover:text-theme-primary"
-              }`}
-            >
-              Create Account (2-Day Trial)
-            </button>
-          </div>
-
-          {authMode === "login" && loginError && (
-            <div className="mb-5 np-alert np-alert-error">
-              <span>{loginError}</span>
-            </div>
-          )}
-
-          {authMode === "register" && regError && (
-            <div className="mb-5 np-alert np-alert-error">
-              <span>{regError}</span>
-            </div>
-          )}
-
-          {isScanning ? (
-            <div className="text-center py-8 space-y-4">
-              <div className="w-14 h-14 mx-auto rounded-full border-2 border-dashed border-[var(--accent)] animate-spin flex items-center justify-center">
-                <span className="text-[10px] font-mono font-bold text-theme-accent">AUTH</span>
-              </div>
-              <p className="text-xs font-mono text-theme-secondary">
-                {scanStep}
-              </p>
-              <div className="w-48 h-1 bg-overlay rounded-full mx-auto overflow-hidden">
-                <div className="h-full bg-[var(--accent)] animate-pulse" style={{ width: "80%" }} />
-              </div>
-            </div>
-          ) : authMode === "login" ? (
-            <form onSubmit={handleBiometricLogin} className="space-y-4">
-              <div>
-                <label className="np-label">Operator or Admin Username</label>
-                <input
-                  type="text"
-                  value={loginUsername}
-                  onChange={(e) => setLoginUsername(e.target.value)}
-                  className="np-glass-input font-mono"
-                  placeholder="e.g. h.huddair or operator"
-                  required
-                />
+        {/* Video 1 True Split-Card Glassmorphism Auth Container */}
+        <div className="np-split-auth-card">
+          {/* LEFT SHOWCASE & VALUE PROPOSITION PANEL */}
+          <div className="np-auth-showcase-panel">
+            <div>
+              <div className="flex items-center gap-2.5 mb-5">
+                <div className="w-10 h-10 rounded-xl border border-[var(--border)] bg-elevated flex items-center justify-center font-bold text-sm text-theme-accent font-mono shadow-inner">
+                  NP
+                </div>
+                <div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-bold text-sm tracking-tight text-white">Nexus-Pulse</span>
+                    <span className="badge badge-accent text-[9px] px-1.5 py-0 font-mono">LEVEL 2</span>
+                  </div>
+                  <div className="text-[10px] text-theme-muted font-mono">Autonomous B2B Pipeline Gateway</div>
+                </div>
               </div>
 
-              <div>
-                <label className="np-label">Cryptographic Passphrase (Bcrypt)</label>
-                <div className="relative">
-                  <input
-                    type={showLoginPassword ? "text" : "password"}
-                    value={loginPassword}
-                    onChange={(e) => setLoginPassword(e.target.value)}
-                    className="np-glass-input font-mono pr-9"
-                    placeholder="••••••••••••"
-                    required
-                  />
+              {authMode === "login" ? (
+                <div className="space-y-4">
+                  <div>
+                    <span className="badge badge-accent text-[9px] font-mono uppercase tracking-wider mb-2 inline-block px-2 py-0.5">
+                      Security Matrix Active
+                    </span>
+                    <h2 className="text-2xl lg:text-3xl font-black tracking-tight text-white leading-tight">
+                      WELCOME BACK!
+                    </h2>
+                    <p className="text-xs text-theme-secondary mt-1.5 leading-relaxed">
+                      Please sign in with your cryptographic credentials to unlock your autonomous commercial pipeline.
+                    </p>
+                  </div>
+
+                  <div className="space-y-3 pt-2">
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                      <span className="w-6 h-6 rounded-lg bg-[rgba(56,189,248,0.1)] border border-[rgba(56,189,248,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-accent">⚡</span>
+                      <div>
+                        <strong className="text-white block font-medium">3-Tier Geo Lead Engine</strong>
+                        <span className="text-[11px] text-theme-muted">Cascading Region › Country › City discovery</span>
+                      </div>
+                    </div>
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                      <span className="w-6 h-6 rounded-lg bg-[rgba(16,185,129,0.1)] border border-[rgba(16,185,129,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-success">🛡️</span>
+                      <div>
+                        <strong className="text-white block font-medium">Zero-Bounce Hygiene</strong>
+                        <span className="text-[11px] text-theme-muted">Syntax, MX DNS & disposable email rejection</span>
+                      </div>
+                    </div>
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                      <span className="w-6 h-6 rounded-lg bg-[rgba(245,158,11,0.1)] border border-[rgba(245,158,11,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-warning">🔄</span>
+                      <div>
+                        <strong className="text-white block font-medium">Adaptive Inbox Rotator</strong>
+                        <span className="text-[11px] text-theme-muted">SMTP deliverability with dynamic send-cap monitors</span>
+                      </div>
+                    </div>
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                      <span className="w-6 h-6 rounded-lg bg-[rgba(168,85,247,0.1)] border border-[rgba(168,85,247,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-purple">🔒</span>
+                      <div>
+                        <strong className="text-white block font-medium">Machine Lock Protection</strong>
+                        <span className="text-[11px] text-theme-muted">Hardware-bound Bcrypt 12-round identity</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-4">
+                  <div>
+                    <span className="badge badge-success text-[9px] font-mono uppercase tracking-wider mb-2 inline-block px-2 py-0.5">
+                      Instant 2-Day Trial
+                    </span>
+                    <h2 className="text-2xl lg:text-3xl font-black tracking-tight text-white leading-tight">
+                      HELLO, PARTNER!
+                    </h2>
+                    <p className="text-xs text-theme-secondary mt-1.5 leading-relaxed">
+                      Enter your operator details and start your journey with autonomous commercial client acquisition.
+                    </p>
+                  </div>
+
+                  <div className="space-y-3 pt-2">
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                      <span className="w-6 h-6 rounded-lg bg-[rgba(16,185,129,0.1)] border border-[rgba(16,185,129,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-success">✓</span>
+                      <div>
+                        <strong className="text-white block font-medium">100 Real Verified Leads</strong>
+                        <span className="text-[11px] text-theme-muted">Live discovery with zero mock / zero dummy data</span>
+                      </div>
+                    </div>
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                      <span className="w-6 h-6 rounded-lg bg-[rgba(56,189,248,0.1)] border border-[rgba(56,189,248,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-accent">✓</span>
+                      <div>
+                        <strong className="text-white block font-medium">48-Hour Full Access</strong>
+                        <span className="text-[11px] text-theme-muted">Complete operator workspace & pipeline automation</span>
+                      </div>
+                    </div>
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                      <span className="w-6 h-6 rounded-lg bg-[rgba(245,158,11,0.1)] border border-[rgba(245,158,11,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-warning">✓</span>
+                      <div>
+                        <strong className="text-white block font-medium">Zero Credit Card Upfront</strong>
+                        <span className="text-[11px] text-theme-muted">Instant self-serve activation via email or Google</span>
+                      </div>
+                    </div>
+                    <div className="flex items-start gap-2.5 text-xs text-theme-secondary">
+                      <span className="w-6 h-6 rounded-lg bg-[rgba(168,85,247,0.1)] border border-[rgba(168,85,247,0.25)] flex items-center justify-center text-xs shrink-0 text-theme-purple">✓</span>
+                      <div>
+                        <strong className="text-white block font-medium">Hardware-Bound Sandbox</strong>
+                        <span className="text-[11px] text-theme-muted">Dedicated tenant workspace with strict role security</span>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Showcase Bottom Telemetry & CTA Switch */}
+            <div className="space-y-3 pt-4 border-t border-[var(--border-subtle)]">
+              <div className="flex items-center justify-between text-[10px] font-mono text-theme-muted">
+                <span className="flex items-center gap-1.5">
+                  <span className="w-2 h-2 rounded-full bg-[var(--success)] animate-pulse" />
+                  <span>STATUS: ONLINE [LEVEL 2]</span>
+                </span>
+                <span>AES-256 + BCRYPT</span>
+              </div>
+
+              {authMode === "login" ? (
+                <div>
+                  <div className="text-[11px] text-theme-muted mb-1.5">Don't have an enterprise account?</div>
                   <button
                     type="button"
-                    onClick={() => setShowLoginPassword(!showLoginPassword)}
-                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-theme-muted hover:text-theme-primary text-xs"
-                    title={showLoginPassword ? "Hide passphrase" : "Show passphrase"}
+                    onClick={() => {
+                      setAuthMode("register");
+                      setLoginError("");
+                      setRegError("");
+                      SoundEffects.authToggle();
+                    }}
+                    className="btn btn-secondary btn-sm w-full flex items-center justify-center gap-2 border border-[var(--border-subtle)] hover:border-[var(--accent)] font-mono text-xs"
                   >
-                    {showLoginPassword ? "👁️" : "👁️‍🗨️"}
+                    <span>Create Account (2-Day Trial)</span>
+                    <span>➔</span>
                   </button>
                 </div>
-              </div>
-
-              <div className="flex items-center justify-between text-[11px] font-mono text-theme-muted px-0.5">
-                <span className="flex items-center gap-1.5">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--success)] animate-pulse" />
-                  <span>Machine ID Protected</span>
-                </span>
-                <span className="text-[10px] text-theme-secondary">Bcrypt 12-Rounds</span>
-              </div>
-
-              <button type="submit" className="btn btn-primary w-full justify-center btn-lg mt-2 shadow-lg">
-                <span>Sign In & Verify Machine ID</span>
-                <span>➔</span>
-              </button>
-
-              <div className="relative my-4">
-                <div className="absolute inset-0 flex items-center">
-                  <div className="w-full border-t border-[var(--border-subtle)]" />
+              ) : (
+                <div>
+                  <div className="text-[11px] text-theme-muted mb-1.5">Already have an account?</div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthMode("login");
+                      setLoginError("");
+                      setRegError("");
+                      SoundEffects.authToggle();
+                    }}
+                    className="btn btn-secondary btn-sm w-full flex items-center justify-center gap-2 border border-[var(--border-subtle)] hover:border-[var(--accent)] font-mono text-xs"
+                  >
+                    <span>Sign In to Workspace</span>
+                    <span>➔</span>
+                  </button>
                 </div>
-                <div className="relative flex justify-center text-[10px] uppercase font-mono">
-                  <span className="bg-[var(--glass-card-bg)] px-2 text-theme-muted">Or Instant Self-Serve</span>
-                </div>
-              </div>
+              )}
+            </div>
+          </div>
 
+          {/* RIGHT AUTH INTERACTIVE FORM PANEL */}
+          <div className="np-auth-form-panel relative">
+            {isScanning && <div className="biometric-scanner-line" />}
+
+            {/* Video 1 Sliding Split Pill Toggle */}
+            <div className="flex p-1 bg-[rgba(0,0,0,0.35)] rounded-lg border border-[var(--border-subtle)] mb-5">
               <button
                 type="button"
-                onClick={handleGoogleSignIn}
-                className="btn btn-secondary w-full justify-center btn-lg flex items-center gap-2 border border-[var(--border)] hover:border-[var(--accent)] shadow-sm bg-[rgba(255,255,255,0.03)]"
+                onClick={() => {
+                  setAuthMode("login");
+                  setLoginError("");
+                  setRegError("");
+                  SoundEffects.authToggle();
+                }}
+                className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                  authMode === "login"
+                    ? "bg-[var(--accent)] text-[var(--bg-base)] shadow font-bold"
+                    : "text-theme-secondary hover:text-theme-primary"
+                }`}
               >
-                <span className="font-bold text-xs text-theme-accent">G</span>
-                <span className="font-semibold text-xs text-theme-primary">Sign in with Google</span>
-                <span className="badge badge-accent text-[9px] px-1.5 py-0 ml-1">2-Day Free Trial</span>
+                Sign In
               </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthMode("register");
+                  setLoginError("");
+                  setRegError("");
+                  SoundEffects.authToggle();
+                }}
+                className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${
+                  authMode === "register"
+                    ? "bg-[var(--accent)] text-[var(--bg-base)] shadow font-bold"
+                    : "text-theme-secondary hover:text-theme-primary"
+                }`}
+              >
+                Create Account (2-Day Trial)
+              </button>
+            </div>
 
-              <div className="text-center pt-2">
-                <button
-                  type="button"
-                  onClick={() => { setAuthMode("register"); setLoginError(""); SoundEffects.switchClick(); }}
-                  className="text-xs text-theme-accent hover:underline font-mono"
-                >
-                  Need an account? Register with 2-Day Free Trial ➔
-                </button>
+            {authMode === "login" && loginError && (
+              <div className="mb-5 np-alert np-alert-error">
+                <span>{loginError}</span>
               </div>
-            </form>
-          ) : (
-            <form onSubmit={handleRegister} className="space-y-3">
-              <div>
-                <label className="np-label">Full Name</label>
-                <input
-                  type="text"
-                  value={regFullName}
-                  onChange={(e) => setRegFullName(e.target.value)}
-                  className="np-glass-input"
-                  placeholder="e.g. Alexander Stone"
-                  required
-                />
-              </div>
+            )}
 
-              <div>
-                <label className="np-label">Work Email</label>
-                <input
-                  type="email"
-                  value={regEmail}
-                  onChange={(e) => setRegEmail(e.target.value)}
-                  className="np-glass-input font-mono"
-                  placeholder="stone@contractors.de"
-                  required
-                />
+            {authMode === "register" && regError && (
+              <div className="mb-5 np-alert np-alert-error">
+                <span>{regError}</span>
               </div>
+            )}
 
-              <div>
-                <label className="np-label">Desired Username</label>
-                <input
-                  type="text"
-                  value={regUsername}
-                  onChange={(e) => setRegUsername(e.target.value)}
-                  className="np-glass-input font-mono"
-                  placeholder="astone"
-                  required
-                />
+            {isScanning ? (
+              <div className="text-center py-8 space-y-4">
+                <div className="w-14 h-14 mx-auto rounded-full border-2 border-dashed border-[var(--accent)] animate-spin flex items-center justify-center">
+                  <span className="text-[10px] font-mono font-bold text-theme-accent">AUTH</span>
+                </div>
+                <p className="text-xs font-mono text-theme-secondary">
+                  {scanStep}
+                </p>
+                <div className="w-48 h-1 bg-overlay rounded-full mx-auto overflow-hidden">
+                  <div className="h-full bg-[var(--accent)] animate-pulse" style={{ width: "80%" }} />
+                </div>
               </div>
-
-              <div className="grid grid-cols-2 gap-2">
+            ) : authMode === "login" ? (
+              <form onSubmit={handleBiometricLogin} className="space-y-4">
                 <div>
-                  <label className="np-label">Passphrase</label>
+                  <label className="np-label">Operator or Admin Username</label>
                   <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted text-xs">👤</span>
                     <input
-                      type={showRegPassword ? "text" : "password"}
-                      value={regPassword}
-                      onChange={(e) => setRegPassword(e.target.value)}
-                      className="np-glass-input font-mono pr-7"
-                      placeholder="••••••••"
+                      type="text"
+                      value={loginUsername}
+                      onChange={(e) => setLoginUsername(e.target.value)}
+                      className="np-glass-input font-mono pl-9"
+                      placeholder="e.g. h.huddair or operator"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="np-label">Cryptographic Passphrase (Bcrypt)</label>
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted text-xs">🔒</span>
+                    <input
+                      type={showLoginPassword ? "text" : "password"}
+                      value={loginPassword}
+                      onChange={(e) => setLoginPassword(e.target.value)}
+                      className="np-glass-input font-mono pl-9 pr-9"
+                      placeholder="••••••••••••"
                       required
                     />
                     <button
                       type="button"
-                      onClick={() => setShowRegPassword(!showRegPassword)}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 text-theme-muted hover:text-theme-primary text-xs"
+                      onClick={() => setShowLoginPassword(!showLoginPassword)}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-theme-muted hover:text-theme-primary text-xs"
+                      title={showLoginPassword ? "Hide passphrase" : "Show passphrase"}
                     >
-                      {showRegPassword ? "👁️" : "👁️‍🗨️"}
+                      {showLoginPassword ? "👁️" : "👁️‍🗨️"}
                     </button>
                   </div>
                 </div>
-                <div>
-                  <label className="np-label">Confirm</label>
-                  <input
-                    type="password"
-                    value={regConfirmPassword}
-                    onChange={(e) => setRegConfirmPassword(e.target.value)}
-                    className="np-glass-input font-mono"
-                    placeholder="••••••••"
-                    required
-                  />
+
+                <div className="flex items-center justify-between text-[11px] font-mono text-theme-muted px-0.5">
+                  <span className="flex items-center gap-1.5">
+                    <span className="w-1.5 h-1.5 rounded-full bg-[var(--success)] animate-pulse" />
+                    <span>Machine ID Protected</span>
+                  </span>
+                  <span className="text-[10px] text-theme-secondary">Bcrypt 12-Rounds</span>
                 </div>
-              </div>
 
-              <button
-                type="submit"
-                disabled={isRegistering}
-                className="btn btn-primary w-full justify-center btn-lg mt-3 shadow-lg"
-              >
-                <span>{isRegistering ? "Creating Account..." : "Create Account & Start 2-Day Trial"}</span>
-                <span>➔</span>
-              </button>
+                <button type="submit" className="btn btn-primary w-full justify-center btn-lg mt-2 shadow-lg">
+                  <span>Sign In & Verify Machine ID</span>
+                  <span>➔</span>
+                </button>
 
-              <div className="text-center pt-2">
+                <div className="relative my-4">
+                  <div className="absolute inset-0 flex items-center">
+                    <div className="w-full border-t border-[var(--border-subtle)]" />
+                  </div>
+                  <div className="relative flex justify-center text-[10px] uppercase font-mono">
+                    <span className="bg-[var(--glass-card-bg)] px-2 text-theme-muted">Or Instant Self-Serve</span>
+                  </div>
+                </div>
+
                 <button
                   type="button"
-                  onClick={() => { setAuthMode("login"); setRegError(""); SoundEffects.switchClick(); }}
-                  className="text-xs text-theme-accent hover:underline font-mono"
+                  onClick={handleGoogleSignIn}
+                  className="btn btn-secondary w-full justify-center btn-lg flex items-center gap-2 border border-[var(--border)] hover:border-[var(--accent)] shadow-sm bg-[rgba(255,255,255,0.03)]"
                 >
-                  Already have an account? Sign In ➔
+                  <span className="font-bold text-xs text-theme-accent">G</span>
+                  <span className="font-semibold text-xs text-theme-primary">Sign in with Google</span>
+                  <span className="badge badge-accent text-[9px] px-1.5 py-0 ml-1">2-Day Free Trial</span>
                 </button>
-              </div>
-            </form>
-          )}
+
+                <div className="text-center pt-2">
+                  <button
+                    type="button"
+                    onClick={() => { setAuthMode("register"); setLoginError(""); SoundEffects.authToggle(); }}
+                    className="text-xs text-theme-accent hover:underline font-mono"
+                  >
+                    Need an account? Register with 2-Day Free Trial ➔
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <form onSubmit={handleRegister} className="space-y-3">
+                <div>
+                  <label className="np-label">Full Name</label>
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted text-xs">👤</span>
+                    <input
+                      type="text"
+                      value={regFullName}
+                      onChange={(e) => setRegFullName(e.target.value)}
+                      className="np-glass-input pl-9"
+                      placeholder="e.g. Alexander Stone"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="np-label">Work Email</label>
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted text-xs">✉️</span>
+                    <input
+                      type="email"
+                      value={regEmail}
+                      onChange={(e) => setRegEmail(e.target.value)}
+                      className="np-glass-input font-mono pl-9"
+                      placeholder="stone@contractors.de"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="np-label">Desired Username</label>
+                  <div className="relative">
+                    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-theme-muted text-xs">🆔</span>
+                    <input
+                      type="text"
+                      value={regUsername}
+                      onChange={(e) => setRegUsername(e.target.value)}
+                      className="np-glass-input font-mono pl-9"
+                      placeholder="astone"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="np-label">Passphrase</label>
+                    <div className="relative">
+                      <input
+                        type={showRegPassword ? "text" : "password"}
+                        value={regPassword}
+                        onChange={(e) => setRegPassword(e.target.value)}
+                        className="np-glass-input font-mono pr-7"
+                        placeholder="••••••••"
+                        required
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowRegPassword(!showRegPassword)}
+                        className="absolute right-2 top-1/2 -translate-y-1/2 text-theme-muted hover:text-theme-primary text-xs"
+                      >
+                        {showRegPassword ? "👁️" : "👁️‍🗨️"}
+                      </button>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="np-label">Confirm</label>
+                    <input
+                      type="password"
+                      value={regConfirmPassword}
+                      onChange={(e) => setRegConfirmPassword(e.target.value)}
+                      className="np-glass-input font-mono"
+                      placeholder="••••••••"
+                      required
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isRegistering}
+                  className="btn btn-primary w-full justify-center btn-lg mt-3 shadow-lg"
+                >
+                  <span>{isRegistering ? "Creating Account..." : "Create Account & Start 2-Day Trial"}</span>
+                  <span>➔</span>
+                </button>
+
+                <div className="text-center pt-2">
+                  <button
+                    type="button"
+                    onClick={() => { setAuthMode("login"); setRegError(""); SoundEffects.authToggle(); }}
+                    className="text-xs text-theme-accent hover:underline font-mono"
+                  >
+                    Already have an account? Sign In ➔
+                  </button>
+                </div>
+              </form>
+            )}
+          </div>
         </div>
       </div>
     );
@@ -3236,7 +3533,7 @@ function doPost(e) {
                       onClick={() => {
                         setActiveTheme(t.id);
                         setIsThemeMenuOpen(false);
-                        SoundEffects.glassChime();
+                        SoundEffects.themeShimmer();
                       }}
                       className={`w-full text-left px-2.5 py-1.5 rounded text-xs flex items-center justify-between hover:bg-hover transition-colors ${
                         activeTheme === t.id ? "text-theme-accent font-semibold bg-[var(--accent-muted)]" : "text-theme-primary"
@@ -3367,7 +3664,8 @@ function doPost(e) {
 
         {/* MAIN CONTENT WORKSPACE */}
         <main className="np-main-content">
-        {/* TAB 1: KANBAN LEAD PIPELINE */}
+          <div key={activeTab} className="np-tab-pane-enter w-full">
+            {/* TAB 1: KANBAN LEAD PIPELINE */}
         {activeTab === "kanban" && (
           <div className="w-full space-y-4">
             <div className="flex items-center justify-between">
@@ -5217,6 +5515,7 @@ function doPost(e) {
             </div>
           </div>
         )}
+          </div>
       </main>
     </div>
 
