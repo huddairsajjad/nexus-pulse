@@ -1,47 +1,256 @@
 /* =============================================================
    H.Huddair's Nexus-Pulse Level 2 Enterprise
-   GitHub / Linear / Vercel Modern Minimalist Theme System
-   4 Themes: github-dark | vercel-midnight | github-light | linear-dark
+   Unified 6-Theme Design Token System & Glassmorphism Engine
+   6 Presets: Obsidian Glass (Default) | Emerald Vault | Cobalt Telemetry | Amber Forge | Crimson Ops | Violet Prism
    ============================================================= */
 
 /* ----------------------------------------------------------------
    THEME DESIGN TOKENS
    ---------------------------------------------------------------- */
+
+/* 1. OBSIDIAN GLASS (Default Master Theme) */
 :root,
+[data-theme="obsidian-glass"],
 [data-theme="github-dark"] {
-  --bg-base:        #0d1117;
-  --bg-surface:     #161b22;
-  --bg-elevated:    #1c2128;
-  --bg-overlay:     #21262d;
-  --bg-hover:       #262c36;
-  --border:         #30363d;
-  --border-muted:   #21262d;
-  --border-subtle:  #2a3040;
-  --text-primary:   #e6edf3;
-  --text-secondary: #8b949e;
-  --text-muted:     #6e7681;
-  --text-link:      #58a6ff;
-  --accent:         #58a6ff;
-  --accent-hover:   #79b8ff;
-  --accent-muted:   rgba(88, 166, 255, 0.12);
-  --success:        #3fb950;
-  --success-muted:  rgba(63, 185, 80, 0.12);
-  --warning:        #d29922;
-  --warning-muted:  rgba(210, 153, 34, 0.12);
-  --danger:         #f85149;
-  --danger-muted:   rgba(248, 81, 73, 0.14);
-  --gold:           #e3b341;
-  --gold-muted:     rgba(227, 179, 65, 0.12);
-  --purple:         #bc8cff;
-  --purple-muted:   rgba(188, 140, 255, 0.12);
-  --scan-color:     #58a6ff;
-  --pulse-color:    rgba(88, 166, 255, 0.5);
-  --scrollbar:      #30363d;
-  --shadow-sm:      0 1px 3px rgba(0, 0, 0, 0.35);
-  --shadow-md:      0 4px 14px rgba(0, 0, 0, 0.45);
-  --shadow-lg:      0 8px 30px rgba(0, 0, 0, 0.55);
+  --bg-base:        #0b0d11;
+  --bg-surface:     #121620;
+  --bg-elevated:    #18202d;
+  --bg-overlay:     #202a3c;
+  --bg-hover:       #28354c;
+  --border:         rgba(255, 255, 255, 0.09);
+  --border-muted:   rgba(255, 255, 255, 0.05);
+  --border-subtle:  rgba(255, 255, 255, 0.07);
+  --text-primary:   #f8fafc;
+  --text-secondary: #94a3b8;
+  --text-muted:     #64748b;
+  --text-link:      #38bdf8;
+  --accent:         #38bdf8;
+  --accent-hover:   #7dd3fc;
+  --accent-muted:   rgba(56, 189, 248, 0.14);
+  --success:        #34d399;
+  --success-muted:  rgba(52, 211, 153, 0.14);
+  --warning:        #fbbf24;
+  --warning-muted:  rgba(251, 191, 36, 0.14);
+  --danger:         #f87171;
+  --danger-muted:   rgba(248, 113, 113, 0.14);
+  --gold:           #fbbf24;
+  --gold-muted:     rgba(251, 191, 36, 0.14);
+  --purple:         #a78bfa;
+  --purple-muted:   rgba(167, 139, 250, 0.14);
+  --scan-color:     #38bdf8;
+  --pulse-color:    rgba(56, 189, 248, 0.5);
+  --scrollbar:      #202a3c;
+  --sidebar-bg:     #0d1117;
+  --sidebar-border: rgba(255, 255, 255, 0.08);
+  --glass-bg:       rgba(18, 22, 32, 0.72);
+  --glass-card-bg:  rgba(18, 22, 32, 0.82);
+  --glass-border:   rgba(255, 255, 255, 0.12);
+  --shadow-sm:      0 1px 3px rgba(0, 0, 0, 0.4);
+  --shadow-md:      0 4px 16px rgba(0, 0, 0, 0.55);
+  --shadow-lg:      0 12px 36px rgba(0, 0, 0, 0.75);
 }
 
+/* 2. EMERALD VAULT */
+[data-theme="emerald-vault"] {
+  --bg-base:        #06120c;
+  --bg-surface:     #0b1d14;
+  --bg-elevated:    #11281d;
+  --bg-overlay:     #183627;
+  --bg-hover:       #204533;
+  --border:         rgba(16, 185, 129, 0.20);
+  --border-muted:   rgba(16, 185, 129, 0.10);
+  --border-subtle:  rgba(16, 185, 129, 0.15);
+  --text-primary:   #f0fdf4;
+  --text-secondary: #a7f3d0;
+  --text-muted:     #6ee7b7;
+  --text-link:      #10b981;
+  --accent:         #10b981;
+  --accent-hover:   #34d399;
+  --accent-muted:   rgba(16, 185, 129, 0.16);
+  --success:        #10b981;
+  --success-muted:  rgba(16, 185, 129, 0.16);
+  --warning:        #f59e0b;
+  --warning-muted:  rgba(245, 158, 11, 0.15);
+  --danger:         #ef4444;
+  --danger-muted:   rgba(239, 68, 68, 0.15);
+  --gold:           #f59e0b;
+  --gold-muted:     rgba(245, 158, 11, 0.15);
+  --purple:         #a78bfa;
+  --purple-muted:   rgba(167, 139, 250, 0.14);
+  --scan-color:     #10b981;
+  --pulse-color:    rgba(16, 185, 129, 0.5);
+  --scrollbar:      #183627;
+  --sidebar-bg:     #07150e;
+  --sidebar-border: rgba(16, 185, 129, 0.16);
+  --glass-bg:       rgba(11, 29, 20, 0.72);
+  --glass-card-bg:  rgba(11, 29, 20, 0.82);
+  --glass-border:   rgba(16, 185, 129, 0.22);
+  --shadow-sm:      0 1px 3px rgba(0, 0, 0, 0.45);
+  --shadow-md:      0 4px 16px rgba(0, 0, 0, 0.6);
+  --shadow-lg:      0 12px 36px rgba(0, 0, 0, 0.8);
+}
+
+/* 3. COBALT TELEMETRY */
+[data-theme="cobalt-telemetry"] {
+  --bg-base:        #060d19;
+  --bg-surface:     #0c172a;
+  --bg-elevated:    #12213b;
+  --bg-overlay:     #1a2d50;
+  --bg-hover:       #233a66;
+  --border:         rgba(56, 189, 248, 0.20);
+  --border-muted:   rgba(56, 189, 248, 0.10);
+  --border-subtle:  rgba(56, 189, 248, 0.15);
+  --text-primary:   #f0f9ff;
+  --text-secondary: #93c5fd;
+  --text-muted:     #60a5fa;
+  --text-link:      #38bdf8;
+  --accent:         #38bdf8;
+  --accent-hover:   #7dd3fc;
+  --accent-muted:   rgba(56, 189, 248, 0.16);
+  --success:        #34d399;
+  --success-muted:  rgba(52, 211, 153, 0.14);
+  --warning:        #fbbf24;
+  --warning-muted:  rgba(251, 191, 36, 0.14);
+  --danger:         #f87171;
+  --danger-muted:   rgba(248, 113, 113, 0.14);
+  --gold:           #38bdf8;
+  --gold-muted:     rgba(56, 189, 248, 0.14);
+  --purple:         #818cf8;
+  --purple-muted:   rgba(129, 140, 248, 0.14);
+  --scan-color:     #38bdf8;
+  --pulse-color:    rgba(56, 189, 248, 0.5);
+  --scrollbar:      #1a2d50;
+  --sidebar-bg:     #081020;
+  --sidebar-border: rgba(56, 189, 248, 0.16);
+  --glass-bg:       rgba(12, 23, 42, 0.72);
+  --glass-card-bg:  rgba(12, 23, 42, 0.82);
+  --glass-border:   rgba(56, 189, 248, 0.22);
+  --shadow-sm:      0 1px 3px rgba(0, 0, 0, 0.45);
+  --shadow-md:      0 4px 16px rgba(0, 0, 0, 0.6);
+  --shadow-lg:      0 12px 36px rgba(0, 0, 0, 0.8);
+}
+
+/* 4. AMBER FORGE */
+[data-theme="amber-forge"] {
+  --bg-base:        #120c04;
+  --bg-surface:     #1c1308;
+  --bg-elevated:    #271b0d;
+  --bg-overlay:     #352513;
+  --bg-hover:       #453119;
+  --border:         rgba(245, 158, 11, 0.22);
+  --border-muted:   rgba(245, 158, 11, 0.10);
+  --border-subtle:  rgba(245, 158, 11, 0.15);
+  --text-primary:   #fffbeb;
+  --text-secondary: #fde68a;
+  --text-muted:     #d97706;
+  --text-link:      #f59e0b;
+  --accent:         #f59e0b;
+  --accent-hover:   #fbbf24;
+  --accent-muted:   rgba(245, 158, 11, 0.16);
+  --success:        #10b981;
+  --success-muted:  rgba(16, 185, 129, 0.14);
+  --warning:        #f59e0b;
+  --warning-muted:  rgba(245, 158, 11, 0.16);
+  --danger:         #ef4444;
+  --danger-muted:   rgba(239, 68, 68, 0.14);
+  --gold:           #f59e0b;
+  --gold-muted:     rgba(245, 158, 11, 0.16);
+  --purple:         #c084fc;
+  --purple-muted:   rgba(192, 132, 252, 0.14);
+  --scan-color:     #f59e0b;
+  --pulse-color:    rgba(245, 158, 11, 0.5);
+  --scrollbar:      #352513;
+  --sidebar-bg:     #150e05;
+  --sidebar-border: rgba(245, 158, 11, 0.18);
+  --glass-bg:       rgba(28, 19, 8, 0.72);
+  --glass-card-bg:  rgba(28, 19, 8, 0.82);
+  --glass-border:   rgba(245, 158, 11, 0.24);
+  --shadow-sm:      0 1px 3px rgba(0, 0, 0, 0.45);
+  --shadow-md:      0 4px 16px rgba(0, 0, 0, 0.6);
+  --shadow-lg:      0 12px 36px rgba(0, 0, 0, 0.8);
+}
+
+/* 5. CRIMSON OPS */
+[data-theme="crimson-ops"] {
+  --bg-base:        #120508;
+  --bg-surface:     #1d090e;
+  --bg-elevated:    #290d15;
+  --bg-overlay:     #38131e;
+  --bg-hover:       #491927;
+  --border:         rgba(244, 63, 94, 0.22);
+  --border-muted:   rgba(244, 63, 94, 0.10);
+  --border-subtle:  rgba(244, 63, 94, 0.15);
+  --text-primary:   #fff1f2;
+  --text-secondary: #fecdd3;
+  --text-muted:     #fda4af;
+  --text-link:      #f43f5e;
+  --accent:         #f43f5e;
+  --accent-hover:   #fb7185;
+  --accent-muted:   rgba(244, 63, 94, 0.16);
+  --success:        #10b981;
+  --success-muted:  rgba(16, 185, 129, 0.14);
+  --warning:        #fbbf24;
+  --warning-muted:  rgba(251, 191, 36, 0.14);
+  --danger:         #f43f5e;
+  --danger-muted:   rgba(244, 63, 94, 0.16);
+  --gold:           #fbbf24;
+  --gold-muted:     rgba(251, 191, 36, 0.14);
+  --purple:         #e879f9;
+  --purple-muted:   rgba(232, 121, 249, 0.14);
+  --scan-color:     #f43f5e;
+  --pulse-color:    rgba(244, 63, 94, 0.5);
+  --scrollbar:      #38131e;
+  --sidebar-bg:     #16070a;
+  --sidebar-border: rgba(244, 63, 94, 0.18);
+  --glass-bg:       rgba(29, 9, 14, 0.72);
+  --glass-card-bg:  rgba(29, 9, 14, 0.82);
+  --glass-border:   rgba(244, 63, 94, 0.24);
+  --shadow-sm:      0 1px 3px rgba(0, 0, 0, 0.45);
+  --shadow-md:      0 4px 16px rgba(0, 0, 0, 0.6);
+  --shadow-lg:      0 12px 36px rgba(0, 0, 0, 0.8);
+}
+
+/* 6. VIOLET PRISM */
+[data-theme="violet-prism"] {
+  --bg-base:        #0d0818;
+  --bg-surface:     #150d26;
+  --bg-elevated:    #1f1337;
+  --bg-overlay:     #2b1a4c;
+  --bg-hover:       #382263;
+  --border:         rgba(168, 85, 247, 0.22);
+  --border-muted:   rgba(168, 85, 247, 0.10);
+  --border-subtle:  rgba(168, 85, 247, 0.15);
+  --text-primary:   #faf5ff;
+  --text-secondary: #e9d5ff;
+  --text-muted:     #d8b4fe;
+  --text-link:      #a855f7;
+  --accent:         #a855f7;
+  --accent-hover:   #c084fc;
+  --accent-muted:   rgba(168, 85, 247, 0.16);
+  --success:        #34d399;
+  --success-muted:  rgba(52, 211, 153, 0.14);
+  --warning:        #fbbf24;
+  --warning-muted:  rgba(251, 191, 36, 0.14);
+  --danger:         #f87171;
+  --danger-muted:   rgba(248, 113, 113, 0.14);
+  --gold:           #f59e0b;
+  --gold-muted:     rgba(245, 158, 11, 0.14);
+  --purple:         #a855f7;
+  --purple-muted:   rgba(168, 85, 247, 0.16);
+  --scan-color:     #a855f7;
+  --pulse-color:    rgba(168, 85, 247, 0.5);
+  --scrollbar:      #2b1a4c;
+  --sidebar-bg:     #100a1e;
+  --sidebar-border: rgba(168, 85, 247, 0.18);
+  --glass-bg:       rgba(21, 13, 38, 0.72);
+  --glass-card-bg:  rgba(21, 13, 38, 0.82);
+  --glass-border:   rgba(168, 85, 247, 0.24);
+  --shadow-sm:      0 1px 3px rgba(0, 0, 0, 0.45);
+  --shadow-md:      0 4px 16px rgba(0, 0, 0, 0.6);
+  --shadow-lg:      0 12px 36px rgba(0, 0, 0, 0.8);
+}
+
+/* BACKWARD COMPATIBILITY ALIASES */
 [data-theme="vercel-midnight"] {
   --bg-base:        #000000;
   --bg-surface:     #0a0a0a;
@@ -71,6 +280,11 @@
   --scan-color:     #ffffff;
   --pulse-color:    rgba(255, 255, 255, 0.4);
   --scrollbar:      #2a2a2a;
+  --sidebar-bg:     #050505;
+  --sidebar-border: #1a1a1a;
+  --glass-bg:       rgba(10, 10, 10, 0.72);
+  --glass-card-bg:  rgba(10, 10, 10, 0.82);
+  --glass-border:   rgba(255, 255, 255, 0.15);
   --shadow-sm:      0 1px 3px rgba(0, 0, 0, 0.7);
   --shadow-md:      0 4px 18px rgba(0, 0, 0, 0.85);
   --shadow-lg:      0 10px 40px rgba(0, 0, 0, 0.95);
@@ -105,6 +319,11 @@
   --scan-color:     #0969da;
   --pulse-color:    rgba(9, 105, 218, 0.4);
   --scrollbar:      #d0d7de;
+  --sidebar-bg:     #f0f2f5;
+  --sidebar-border: #d0d7de;
+  --glass-bg:       rgba(255, 255, 255, 0.85);
+  --glass-card-bg:  rgba(255, 255, 255, 0.92);
+  --glass-border:   rgba(208, 215, 222, 0.8);
   --shadow-sm:      0 1px 3px rgba(0, 0, 0, 0.08);
   --shadow-md:      0 4px 12px rgba(0, 0, 0, 0.12);
   --shadow-lg:      0 8px 24px rgba(0, 0, 0, 0.15);
@@ -139,6 +358,11 @@
   --scan-color:     #818cf8;
   --pulse-color:    rgba(129, 140, 248, 0.5);
   --scrollbar:      #2e303b;
+  --sidebar-bg:     #121317;
+  --sidebar-border: #23242c;
+  --glass-bg:       rgba(21, 22, 26, 0.72);
+  --glass-card-bg:  rgba(21, 22, 26, 0.82);
+  --glass-border:   rgba(129, 140, 248, 0.18);
   --shadow-sm:      0 1px 3px rgba(0, 0, 0, 0.5);
   --shadow-md:      0 4px 16px rgba(0, 0, 0, 0.6);
   --shadow-lg:      0 10px 32px rgba(0, 0, 0, 0.7);
@@ -208,8 +432,236 @@ html, body {
 ::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
 
 /* ----------------------------------------------------------------
-   APP CONTAINER & LAYOUT WRAPPERS
+   APP CONTAINER & LAYOUT WRAPPERS (VIDEO 2 DASHBOARD V21)
    ---------------------------------------------------------------- */
+.np-app-layout {
+  display: flex;
+  width: 100%;
+  min-height: 100vh;
+  background-color: var(--bg-base);
+  color: var(--text-primary);
+  position: relative;
+}
+
+/* Independent Sidebar Navigation Panel (Video 2) */
+.np-sidebar {
+  width: 270px;
+  min-width: 270px;
+  max-width: 270px;
+  height: 100vh;
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--sidebar-bg);
+  border-right: 1px solid var(--sidebar-border);
+  z-index: 50;
+  box-sizing: border-box;
+  user-select: none;
+  transition: transform 0.25s ease, width 0.25s ease;
+}
+
+.np-sidebar-header {
+  padding: 16px 18px 14px 18px;
+  border-bottom: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  background: var(--bg-surface);
+}
+
+.np-sidebar-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.np-sidebar-scroll::-webkit-scrollbar { width: 4px; }
+.np-sidebar-scroll::-webkit-scrollbar-thumb { background: var(--border-muted); border-radius: 4px; }
+
+.np-sidebar-user-card {
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.np-sidebar-nav-group {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.np-sidebar-group-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-muted);
+  padding: 6px 12px 4px 12px;
+}
+
+.np-sidebar-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-secondary);
+  cursor: pointer;
+  background: transparent;
+  border: 1px solid transparent;
+  border-left: 3px solid transparent;
+  transition: all 0.15s ease;
+  text-align: left;
+  width: 100%;
+}
+.np-sidebar-item:hover {
+  color: var(--text-primary);
+  background: var(--bg-hover);
+  border-color: var(--border-muted);
+}
+.np-sidebar-item.active {
+  color: var(--text-primary);
+  background: var(--accent-muted);
+  border-color: var(--border);
+  border-left-color: var(--accent);
+  font-weight: 600;
+  box-shadow: 0 0 12px var(--accent-muted);
+}
+
+.np-sidebar-footer {
+  padding: 12px 14px;
+  border-top: 1px solid var(--border-subtle);
+  background: var(--bg-surface);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Main Area Container (Video 2) */
+.np-main-wrapper {
+  flex: 1;
+  min-width: 0;
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-base);
+}
+
+.np-context-header {
+  height: 56px;
+  min-height: 56px;
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  padding: 0 20px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  box-sizing: border-box;
+}
+
+/* Mobile Sidebar Backdrop & Drawer */
+.np-sidebar-backdrop {
+  display: none;
+}
+
+@media (max-width: 1024px) {
+  .np-sidebar {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    transform: translateX(-100%);
+    box-shadow: 0 0 30px rgba(0, 0, 0, 0.8);
+  }
+  .np-sidebar.mobile-open {
+    transform: translateX(0);
+  }
+  .np-sidebar-backdrop.mobile-open {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(4px);
+    z-index: 48;
+  }
+}
+
+/* ----------------------------------------------------------------
+   VIDEO 1 GEOMETRIC OBSIDIAN & GLASSMORPHISM LOGIN STYLES
+   ---------------------------------------------------------------- */
+.np-geometric-bg {
+  position: fixed;
+  inset: 0;
+  background-color: var(--bg-base);
+  background-image: 
+    radial-gradient(circle at 10% 20%, var(--accent-muted) 0%, transparent 45%),
+    radial-gradient(circle at 90% 80%, var(--accent-muted) 0%, transparent 45%),
+    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
+  background-size: 100% 100%, 100% 100%, 40px 40px, 40px 40px;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.np-glass-card {
+  background: var(--glass-card-bg, rgba(18, 22, 32, 0.82)) !important;
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--glass-border, var(--border)) !important;
+  box-shadow: var(--shadow-lg), inset 0 1px 0 rgba(255, 255, 255, 0.1) !important;
+  border-radius: 16px;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.np-glass-input {
+  width: 100%;
+  padding: 9px 13px;
+  background: rgba(0, 0, 0, 0.4) !important;
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border) !important;
+  border-radius: 8px;
+  color: var(--text-primary) !important;
+  font-size: 13px;
+  outline: none;
+  transition: all 0.2s ease;
+  box-sizing: border-box;
+}
+.np-glass-input:focus {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px var(--accent-muted), 0 0 15px var(--accent-muted) !important;
+  background: rgba(0, 0, 0, 0.55) !important;
+}
+.np-glass-input::placeholder {
+  color: var(--text-muted);
+}
+
+.np-sliding-auth-container {
+  position: relative;
+  overflow: hidden;
+  transition: height 0.3s ease;
+}
+
+.np-auth-slide-pane {
+  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.25s ease;
+}
+
+/* Legacy layout container support */
 .np-app-container {
   width: 100%;
   min-height: 100vh;
@@ -305,7 +757,9 @@ html, body {
    ---------------------------------------------------------------- */
 .np-card,
 .cyber-card {
-  background: var(--bg-surface);
+  background: var(--glass-card-bg, var(--bg-surface));
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: var(--shadow-sm);
@@ -320,6 +774,8 @@ html, body {
 
 .np-card-elevated {
   background: var(--bg-elevated);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
   border: 1px solid var(--border);
   border-radius: 8px;
   box-shadow: var(--shadow-md);
@@ -640,8 +1096,9 @@ html, body {
 .np-modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.7);
-  backdrop-filter: blur(4px);
+  background: rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -650,10 +1107,12 @@ html, body {
 }
 
 .np-modal {
-  background: var(--bg-surface);
+  background: var(--glass-card-bg, var(--bg-surface));
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  box-shadow: var(--shadow-lg);
+  border-radius: 12px;
+  box-shadow: var(--shadow-lg), inset 0 1px 0 rgba(255, 255, 255, 0.08);
   width: 100%;
   max-height: 90vh;
   overflow-y: auto;

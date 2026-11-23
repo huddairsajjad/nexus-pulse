@@ -19,8 +19,9 @@
  */
 
 // =============================================================================
-// SUBTLE UI CLICK SOUND SYNTHESIZER (Web Audio API)
-// High-tech, zero-latency, zero-dependency tactile audio feedback
+// SUBTLE MULTI-SOUND WEB AUDIO ENGINE (Zero external dependencies)
+// High-tech, zero-latency tactile audio synthesizer:
+// 1. Water Drop  2. Bubble Pop  3. Glass Chime  4. Subtle Switch Click  5. Soft Low Tone
 // =============================================================================
 let _uiAudioContext = null;
 let _soundMuted = false;
@@ -39,54 +40,119 @@ function getUiAudioContext() {
   return _uiAudioContext;
 }
 
-function playUiSound(tone = "click") {
+// User-gesture unlocking hook for Web Audio API policy compliance
+if (typeof window !== "undefined") {
+  const unlockAudio = () => {
+    try {
+      const ctx = getUiAudioContext();
+      if (ctx && ctx.state === "suspended") {
+        ctx.resume().catch(() => {});
+      }
+    } catch (e) {}
+  };
+  window.addEventListener("pointerdown", unlockAudio, { once: true, passive: true });
+  window.addEventListener("keydown", unlockAudio, { once: true, passive: true });
+}
+
+function playUiSound(tone = "switch_click") {
   if (_soundMuted) return;
   try {
     const ctx = getUiAudioContext();
     if (!ctx) return;
-
     const t = ctx.currentTime;
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
 
-    if (tone === "tab") {
-      // Crisp subtle tone for navigation tabs
+    if (tone === "water_drop" || tone === "tab") {
+      // 1. Water Drop: Crisp descending resonance (Nav/Sidebar switches)
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
       osc.type = "sine";
-      osc.frequency.setValueAtTime(880, t);
-      osc.frequency.exponentialRampToValueAtTime(320, t + 0.045);
-      gain.gain.setValueAtTime(0.045, t);
-      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.045);
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(t);
-      osc.stop(t + 0.045);
-    } else if (tone === "action" || tone === "submit") {
-      // Affirmative soft chime for primary buttons/submits
-      osc.type = "triangle";
-      osc.frequency.setValueAtTime(960, t);
-      osc.frequency.exponentialRampToValueAtTime(440, t + 0.05);
-      gain.gain.setValueAtTime(0.05, t);
+      osc.frequency.setValueAtTime(1400, t);
+      osc.frequency.exponentialRampToValueAtTime(520, t + 0.05);
+      gain.gain.setValueAtTime(0.055, t);
       gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.05);
       osc.connect(gain);
       gain.connect(ctx.destination);
       osc.start(t);
       osc.stop(t + 0.05);
-    } else {
-      // Default subtle mechanical click for buttons, cards, links, selects
+    } else if (tone === "bubble_pop") {
+      // 2. Bubble Pop: Upward chirping bubble (Filter / Toggle / Pill clicks)
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
       osc.type = "sine";
-      osc.frequency.setValueAtTime(1150, t);
-      osc.frequency.exponentialRampToValueAtTime(160, t + 0.035);
-      gain.gain.setValueAtTime(0.04, t);
-      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.035);
+      osc.frequency.setValueAtTime(420, t);
+      osc.frequency.exponentialRampToValueAtTime(880, t + 0.038);
+      gain.gain.setValueAtTime(0.05, t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.038);
       osc.connect(gain);
       gain.connect(ctx.destination);
       osc.start(t);
-      osc.stop(t + 0.035);
+      osc.stop(t + 0.038);
+    } else if (tone === "glass_chime" || tone === "action" || tone === "submit") {
+      // 3. Glass Chime: Elegant dual-harmonic crystal ping (Primary actions, theme changes, approves)
+      const osc1 = ctx.createOscillator();
+      const gain1 = ctx.createGain();
+      const osc2 = ctx.createOscillator();
+      const gain2 = ctx.createGain();
+
+      osc1.type = "sine";
+      osc1.frequency.setValueAtTime(1760, t); // A6
+      gain1.gain.setValueAtTime(0.045, t);
+      gain1.gain.exponentialRampToValueAtTime(0.0001, t + 0.14);
+
+      osc2.type = "sine";
+      osc2.frequency.setValueAtTime(2640, t); // E7
+      gain2.gain.setValueAtTime(0.025, t);
+      gain2.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+
+      osc1.connect(gain1);
+      osc2.connect(gain2);
+      gain1.connect(ctx.destination);
+      gain2.connect(ctx.destination);
+      osc1.start(t);
+      osc2.start(t);
+      osc1.stop(t + 0.14);
+      osc2.stop(t + 0.12);
+    } else if (tone === "low_tone" || tone === "destructive" || tone === "warning") {
+      // 4. Soft Low Tone: Warm warning / cancellation / destructive note
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(220, t);
+      osc.frequency.exponentialRampToValueAtTime(110, t + 0.09);
+      gain.gain.setValueAtTime(0.05, t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.09);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.09);
+    } else {
+      // 5. Subtle Switch Click (default): Crisp microsecond tactile click
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(1250, t);
+      osc.frequency.exponentialRampToValueAtTime(180, t + 0.028);
+      gain.gain.setValueAtTime(0.04, t);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.028);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(t);
+      osc.stop(t + 0.028);
     }
   } catch (err) {
     // Non-blocking: never interrupt UI interaction if audio fails
   }
 }
+
+const SoundEffects = {
+  waterDrop: () => playUiSound("water_drop"),
+  bubblePop: () => playUiSound("bubble_pop"),
+  glassChime: () => playUiSound("glass_chime"),
+  switchClick: () => playUiSound("switch_click"),
+  lowTone: () => playUiSound("low_tone")
+};
+window.SoundEffects = SoundEffects;
+window.playUiSound = playUiSound;
 
 // Global delegated click listener for all interactive components
 if (typeof document !== "undefined") {
@@ -96,27 +162,38 @@ if (typeof document !== "undefined") {
       if (!el) return;
 
       const interactive = el.closest(
-        'button, [role="button"], a, select, input[type="submit"], input[type="button"], input[type="checkbox"], input[type="radio"], [role="tab"], .np-nav-tab, .nav-tab, .tab-btn, .kanban-card, .np-card.cursor-pointer, .cursor-pointer, [data-clickable="true"]'
+        'button, [role="button"], a, select, input[type="submit"], input[type="button"], input[type="checkbox"], input[type="radio"], [role="tab"], .np-nav-tab, .nav-tab, .tab-btn, .np-sidebar-item, .kanban-card, .np-card.cursor-pointer, .cursor-pointer, [data-clickable="true"]'
       );
 
       if (interactive) {
+        const isDanger = interactive.classList.contains("btn-danger") ||
+                         interactive.classList.contains("text-theme-danger") ||
+                         interactive.getAttribute("data-action") === "delete";
         const isTab = interactive.getAttribute("role") === "tab" ||
                       interactive.classList.contains("np-nav-tab") ||
+                      interactive.classList.contains("np-sidebar-item") ||
                       interactive.classList.contains("nav-tab") ||
-                      interactive.classList.contains("tab-btn") ||
-                      (interactive.tagName === "BUTTON" && interactive.closest("nav"));
+                      interactive.classList.contains("tab-btn");
         const isAction = interactive.classList.contains("btn-primary") ||
                          interactive.type === "submit";
-        const tone = isTab ? "tab" : isAction ? "action" : "click";
-        playUiSound(tone);
+        const isTheme = interactive.classList.contains("theme-dot") ||
+                        interactive.closest(".theme-picker-item");
+
+        if (isDanger) {
+          playUiSound("low_tone");
+        } else if (isTheme || isAction) {
+          playUiSound("glass_chime");
+        } else if (isTab) {
+          playUiSound("water_drop");
+        } else {
+          playUiSound("switch_click");
+        }
       }
     } catch (e) {
       // Fail safely
     }
   }, { capture: true, passive: true });
 }
-
-window.playUiSound = playUiSound;
 
 const { useState, useEffect, useRef, useMemo } = React;
 const API_BASE = window.location.origin;
@@ -178,10 +255,12 @@ const INDUSTRY_PRESETS = [
 ];
 
 const THEMES = [
-  { id: "github-dark", name: "GitHub Dark", dotColor: "#58a6ff", desc: "Default slate-grey minimalist" },
-  { id: "vercel-midnight", name: "Vercel Midnight", dotColor: "#ffffff", desc: "Pure OLED obsidian & mono" },
-  { id: "github-light", name: "GitHub Light", dotColor: "#0969da", desc: "Clean corporate enterprise mode" },
-  { id: "linear-dark", name: "Linear Dark", dotColor: "#818cf8", desc: "Minimalist charcoal & muted accents" }
+  { id: "obsidian-glass", name: "Obsidian Glass", dotColor: "#38bdf8", desc: "Default dark obsidian glass & cold ice cyan" },
+  { id: "emerald-vault", name: "Emerald Vault", dotColor: "#10b981", desc: "Deep emerald glass & radiant mint" },
+  { id: "cobalt-telemetry", name: "Cobalt Telemetry", dotColor: "#38bdf8", desc: "Deep cobalt sapphire & electric cyan" },
+  { id: "amber-forge", name: "Amber Forge", dotColor: "#f59e0b", desc: "Dark charcoal bronze & glowing amber" },
+  { id: "crimson-ops", name: "Crimson Ops", dotColor: "#f43f5e", desc: "Midnight obsidian & ruby crimson" },
+  { id: "violet-prism", name: "Violet Prism", dotColor: "#a855f7", desc: "Deep violet night & electric neon purple" }
 ];
 
 const KANBAN_STAGES = [
@@ -215,7 +294,9 @@ function NexusPulseApp() {
   // THEME ENGINE (Requirement 1)
   // ---------------------------------------------------------------------------
   const [activeTheme, setActiveTheme] = useState(() => {
-    return localStorage.getItem("nexus_theme") || "github-dark";
+    const saved = localStorage.getItem("nexus_theme");
+    if (!saved || saved === "github-dark") return "obsidian-glass";
+    return saved;
   });
   const [isThemeMenuOpen, setIsThemeMenuOpen] = useState(false);
 
@@ -270,6 +351,9 @@ function NexusPulseApp() {
   const [regConfirmPassword, setRegConfirmPassword] = useState("");
   const [regError, setRegError] = useState("");
   const [isRegistering, setIsRegistering] = useState(false);
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
+  const [showRegPassword, setShowRegPassword] = useState(false);
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
 
   // Setup Guide & Webhook Modal State
   const [isSetupGuideOpen, setIsSetupGuideOpen] = useState(false);
@@ -2377,27 +2461,78 @@ function doPost(e) {
   if (!user || !token) {
     if (setupRequired) {
       return (
-        <div className="min-h-screen flex items-center justify-center p-4 bg-base relative">
-          {/* Audio SFX Toggle */}
-          <div className="absolute top-4 right-4">
+        <div className="min-h-screen flex items-center justify-center p-4 bg-base relative overflow-hidden">
+          {/* Video 1 Geometric Obsidian Backdrop */}
+          <div className="np-geometric-bg" />
+          <div className="absolute w-[500px] h-[500px] rounded-full bg-[var(--accent)] opacity-10 blur-[120px] pointer-events-none -top-40 -left-40 animate-pulse" />
+          <div className="absolute w-[500px] h-[500px] rounded-full bg-[var(--purple)] opacity-10 blur-[120px] pointer-events-none -bottom-40 -right-40 animate-pulse" />
+
+          {/* Top Bar Quick Controls */}
+          <div className="absolute top-4 right-4 flex items-center gap-2 z-20">
+            {/* Theme Switcher */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setIsThemeMenuOpen(!isThemeMenuOpen)}
+                className="btn btn-secondary btn-sm flex items-center gap-1.5 backdrop-blur-md"
+                title="Select Visual Theme"
+              >
+                <span className="theme-dot" style={{ backgroundColor: THEMES.find(t => t.id === activeTheme)?.dotColor || "#38bdf8" }} />
+                <span className="hidden sm:inline text-xs font-mono">Theme</span>
+                <span className="text-[10px]">▾</span>
+              </button>
+              {isThemeMenuOpen && (
+                <div
+                  className="absolute right-0 mt-1.5 w-56 np-glass-card p-1 z-50 shadow-2xl border-theme"
+                  onMouseLeave={() => setIsThemeMenuOpen(false)}
+                >
+                  <div className="px-2.5 py-1.5 text-[10px] font-semibold text-theme-secondary uppercase tracking-wider border-b-theme">
+                    Appearance Preset (6 Themes)
+                  </div>
+                  {THEMES.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => {
+                        setActiveTheme(t.id);
+                        setIsThemeMenuOpen(false);
+                      }}
+                      className={`w-full text-left px-2.5 py-1.5 rounded text-xs flex items-center justify-between hover:bg-hover transition-colors ${
+                        activeTheme === t.id ? "text-theme-accent font-semibold bg-[var(--accent-muted)]" : "text-theme-primary"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="theme-dot" style={{ backgroundColor: t.dotColor }} />
+                        <div>
+                          <div>{t.name}</div>
+                          <div className="text-[9px] text-theme-muted leading-tight">{t.desc}</div>
+                        </div>
+                      </div>
+                      {activeTheme === t.id && <span>✓</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Audio SFX Toggle */}
             <button
               type="button"
               onClick={() => {
                 const next = !soundEnabled;
                 setSoundEnabled(next);
-                if (next) setTimeout(() => playUiSound("action"), 50);
+                if (next) setTimeout(() => playUiSound("glass_chime"), 50);
               }}
-              className={`btn btn-sm ${soundEnabled ? "btn-secondary text-theme-accent" : "btn-ghost text-theme-muted"}`}
+              className={`btn btn-sm backdrop-blur-md ${soundEnabled ? "btn-secondary text-theme-accent" : "btn-ghost text-theme-muted"}`}
               title={soundEnabled ? "UI Audio SFX Active (Click to Mute)" : "UI Audio SFX Muted (Click to Enable)"}
             >
               <span>{soundEnabled ? "🔊" : "🔇"}</span>
-              <span className="text-[11px] font-mono">{soundEnabled ? "SFX: ON" : "SFX: OFF"}</span>
+              <span className="text-[11px] font-mono hidden sm:inline">{soundEnabled ? "SFX: ON" : "SFX: OFF"}</span>
             </button>
           </div>
 
-          <div className="np-card w-full max-w-lg p-8 relative overflow-hidden shadow-2xl border-theme">
+          <div className="np-glass-card w-full max-w-lg p-8 relative overflow-hidden shadow-2xl z-10">
             <div className="text-center mb-6">
-              <div className="w-12 h-12 mx-auto mb-3 rounded-lg border-theme bg-elevated flex items-center justify-center font-bold text-base text-theme-accent font-mono">
+              <div className="w-12 h-12 mx-auto mb-3 rounded-xl border border-[var(--border)] bg-elevated flex items-center justify-center font-bold text-base text-theme-accent font-mono shadow-inner">
                 NP
               </div>
               <h1 className="text-xl font-bold tracking-tight text-theme-primary">
@@ -2424,7 +2559,7 @@ function doPost(e) {
                   type="text"
                   value={initUsername}
                   onChange={(e) => setInitUsername(e.target.value)}
-                  className="np-input font-mono"
+                  className="np-glass-input font-mono"
                   placeholder="e.g. admin or h.huddair"
                   required
                 />
@@ -2437,7 +2572,7 @@ function doPost(e) {
                     type="text"
                     value={initFullName}
                     onChange={(e) => setInitFullName(e.target.value)}
-                    className="np-input"
+                    className="np-glass-input"
                     placeholder="e.g. H.Huddair (Master Admin)"
                     required
                   />
@@ -2448,7 +2583,7 @@ function doPost(e) {
                     type="email"
                     value={initEmail}
                     onChange={(e) => setInitEmail(e.target.value)}
-                    className="np-input font-mono"
+                    className="np-glass-input font-mono"
                     placeholder="admin@nexus-pulse.io"
                   />
                 </div>
@@ -2461,7 +2596,7 @@ function doPost(e) {
                     type="password"
                     value={initPassword}
                     onChange={(e) => setInitPassword(e.target.value)}
-                    className="np-input font-mono"
+                    className="np-glass-input font-mono"
                     placeholder="Min 6 characters"
                     required
                   />
@@ -2472,7 +2607,7 @@ function doPost(e) {
                     type="password"
                     value={initConfirmPassword}
                     onChange={(e) => setInitConfirmPassword(e.target.value)}
-                    className="np-input font-mono"
+                    className="np-glass-input font-mono"
                     placeholder="••••••••••••"
                     required
                   />
@@ -2482,7 +2617,7 @@ function doPost(e) {
               <button
                 type="submit"
                 disabled={isInitializingAdmin}
-                className="btn btn-primary w-full justify-center btn-lg mt-4"
+                className="btn btn-primary w-full justify-center btn-lg mt-4 shadow-lg"
               >
                 <span>{isInitializingAdmin ? "Binding Hardware & Generating Keys..." : "Initialize Master Admin & Enter Dashboard"}</span>
                 <span>➔</span>
@@ -2494,29 +2629,82 @@ function doPost(e) {
     }
 
     return (
-      <div className="min-h-screen flex items-center justify-center p-4 bg-base relative">
-        {/* Audio SFX Toggle */}
-        <div className="absolute top-4 right-4">
+      <div className="min-h-screen flex items-center justify-center p-4 bg-base relative overflow-hidden">
+        {/* Video 1 Geometric Obsidian Backdrop */}
+        <div className="np-geometric-bg" />
+        <div className="absolute w-[500px] h-[500px] rounded-full bg-[var(--accent)] opacity-10 blur-[120px] pointer-events-none -top-40 -left-40 animate-pulse" />
+        <div className="absolute w-[500px] h-[500px] rounded-full bg-[var(--purple)] opacity-10 blur-[120px] pointer-events-none -bottom-40 -right-40 animate-pulse" />
+
+        {/* Top Right Quick Controls: Theme Presets & SFX Audio */}
+        <div className="absolute top-4 right-4 flex items-center gap-2 z-20">
+          {/* Theme Switcher */}
+          <div className="relative">
+            <button
+              type="button"
+              onClick={() => setIsThemeMenuOpen(!isThemeMenuOpen)}
+              className="btn btn-secondary btn-sm flex items-center gap-1.5 backdrop-blur-md"
+              title="Select Visual Theme"
+            >
+              <span className="theme-dot" style={{ backgroundColor: THEMES.find(t => t.id === activeTheme)?.dotColor || "#38bdf8" }} />
+              <span className="hidden sm:inline text-xs font-mono">Theme</span>
+              <span className="text-[10px]">▾</span>
+            </button>
+            {isThemeMenuOpen && (
+              <div
+                className="absolute right-0 mt-1.5 w-56 np-glass-card p-1 z-50 shadow-2xl border-theme"
+                onMouseLeave={() => setIsThemeMenuOpen(false)}
+              >
+                <div className="px-2.5 py-1.5 text-[10px] font-semibold text-theme-secondary uppercase tracking-wider border-b-theme">
+                  Appearance Preset (6 Themes)
+                </div>
+                {THEMES.map((t) => (
+                  <button
+                    key={t.id}
+                    onClick={() => {
+                      setActiveTheme(t.id);
+                      setIsThemeMenuOpen(false);
+                    }}
+                    className={`w-full text-left px-2.5 py-1.5 rounded text-xs flex items-center justify-between hover:bg-hover transition-colors ${
+                      activeTheme === t.id ? "text-theme-accent font-semibold bg-[var(--accent-muted)]" : "text-theme-primary"
+                    }`}
+                  >
+                    <div className="flex items-center gap-2">
+                      <span className="theme-dot" style={{ backgroundColor: t.dotColor }} />
+                      <div>
+                        <div>{t.name}</div>
+                        <div className="text-[9px] text-theme-muted leading-tight">{t.desc}</div>
+                      </div>
+                    </div>
+                    {activeTheme === t.id && <span>✓</span>}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Audio SFX Toggle */}
           <button
             type="button"
             onClick={() => {
               const next = !soundEnabled;
               setSoundEnabled(next);
-              if (next) setTimeout(() => playUiSound("action"), 50);
+              if (next) setTimeout(() => playUiSound("glass_chime"), 50);
             }}
-            className={`btn btn-sm ${soundEnabled ? "btn-secondary text-theme-accent" : "btn-ghost text-theme-muted"}`}
+            className={`btn btn-sm backdrop-blur-md ${soundEnabled ? "btn-secondary text-theme-accent" : "btn-ghost text-theme-muted"}`}
             title={soundEnabled ? "UI Audio SFX Active (Click to Mute)" : "UI Audio SFX Muted (Click to Enable)"}
           >
             <span>{soundEnabled ? "🔊" : "🔇"}</span>
-            <span className="text-[11px] font-mono">{soundEnabled ? "SFX: ON" : "SFX: OFF"}</span>
+            <span className="text-[11px] font-mono hidden sm:inline">{soundEnabled ? "SFX: ON" : "SFX: OFF"}</span>
           </button>
         </div>
 
-        <div className="np-card w-full max-w-md p-8 relative overflow-hidden shadow-lg border-theme">
+        {/* Video 1 Frosted Glass Card Container */}
+        <div className="np-glass-card w-full max-w-md p-8 relative overflow-hidden shadow-2xl z-10">
           {isScanning && <div className="biometric-scanner-line" />}
 
+          {/* Brand Header */}
           <div className="text-center mb-6">
-            <div className="w-12 h-12 mx-auto mb-3 rounded-lg border-theme bg-elevated flex items-center justify-center font-bold text-base text-theme-accent font-mono">
+            <div className="w-12 h-12 mx-auto mb-3 rounded-xl border border-[var(--border)] bg-elevated flex items-center justify-center font-bold text-base text-theme-accent font-mono shadow-inner">
               NP
             </div>
             <h1 className="text-xl font-bold tracking-tight text-theme-primary">
@@ -2527,29 +2715,39 @@ function doPost(e) {
             </p>
           </div>
 
-          {/* Auth Mode Toggle Tabs */}
-          <div className="flex border-b border-[var(--border-subtle)] mb-5">
+          {/* Video 1 Sliding Split Pill Toggle */}
+          <div className="flex p-1 bg-[rgba(0,0,0,0.35)] rounded-lg border border-[var(--border-subtle)] mb-5">
             <button
               type="button"
-              onClick={() => { setAuthMode("login"); setLoginError(""); setRegError(""); }}
-              className={`flex-1 py-2 text-xs font-semibold text-center border-b-2 transition-colors ${
+              onClick={() => {
+                setAuthMode("login");
+                setLoginError("");
+                setRegError("");
+                SoundEffects.switchClick();
+              }}
+              className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${
                 authMode === "login"
-                  ? "border-[var(--accent)] text-theme-primary font-bold"
-                  : "border-transparent text-theme-secondary hover:text-theme-primary"
+                  ? "bg-[var(--accent)] text-[var(--bg-base)] shadow font-bold"
+                  : "text-theme-secondary hover:text-theme-primary"
               }`}
             >
               Sign In
             </button>
             <button
               type="button"
-              onClick={() => { setAuthMode("register"); setLoginError(""); setRegError(""); }}
-              className={`flex-1 py-2 text-xs font-semibold text-center border-b-2 transition-colors ${
+              onClick={() => {
+                setAuthMode("register");
+                setLoginError("");
+                setRegError("");
+                SoundEffects.switchClick();
+              }}
+              className={`flex-1 py-1.5 text-xs font-semibold rounded-md transition-all ${
                 authMode === "register"
-                  ? "border-[var(--accent)] text-theme-primary font-bold"
-                  : "border-transparent text-theme-secondary hover:text-theme-primary"
+                  ? "bg-[var(--accent)] text-[var(--bg-base)] shadow font-bold"
+                  : "text-theme-secondary hover:text-theme-primary"
               }`}
             >
-              Register (2-Day Trial)
+              Create Account (2-Day Trial)
             </button>
           </div>
 
@@ -2585,25 +2783,43 @@ function doPost(e) {
                   type="text"
                   value={loginUsername}
                   onChange={(e) => setLoginUsername(e.target.value)}
-                  className="np-input font-mono"
-                  placeholder="Enter username"
+                  className="np-glass-input font-mono"
+                  placeholder="e.g. h.huddair or operator"
                   required
                 />
               </div>
 
               <div>
                 <label className="np-label">Cryptographic Passphrase (Bcrypt)</label>
-                <input
-                  type="password"
-                  value={loginPassword}
-                  onChange={(e) => setLoginPassword(e.target.value)}
-                  className="np-input font-mono"
-                  placeholder="••••••••••••"
-                  required
-                />
+                <div className="relative">
+                  <input
+                    type={showLoginPassword ? "text" : "password"}
+                    value={loginPassword}
+                    onChange={(e) => setLoginPassword(e.target.value)}
+                    className="np-glass-input font-mono pr-9"
+                    placeholder="••••••••••••"
+                    required
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowLoginPassword(!showLoginPassword)}
+                    className="absolute right-2.5 top-1/2 -translate-y-1/2 text-theme-muted hover:text-theme-primary text-xs"
+                    title={showLoginPassword ? "Hide passphrase" : "Show passphrase"}
+                  >
+                    {showLoginPassword ? "👁️" : "👁️‍🗨️"}
+                  </button>
+                </div>
               </div>
 
-              <button type="submit" className="btn btn-primary w-full justify-center btn-lg mt-2">
+              <div className="flex items-center justify-between text-[11px] font-mono text-theme-muted px-0.5">
+                <span className="flex items-center gap-1.5">
+                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--success)] animate-pulse" />
+                  <span>Machine ID Protected</span>
+                </span>
+                <span className="text-[10px] text-theme-secondary">Bcrypt 12-Rounds</span>
+              </div>
+
+              <button type="submit" className="btn btn-primary w-full justify-center btn-lg mt-2 shadow-lg">
                 <span>Sign In & Verify Machine ID</span>
                 <span>➔</span>
               </button>
@@ -2613,14 +2829,14 @@ function doPost(e) {
                   <div className="w-full border-t border-[var(--border-subtle)]" />
                 </div>
                 <div className="relative flex justify-center text-[10px] uppercase font-mono">
-                  <span className="bg-surface px-2 text-theme-muted">Or Instant Self-Serve</span>
+                  <span className="bg-[var(--glass-card-bg)] px-2 text-theme-muted">Or Instant Self-Serve</span>
                 </div>
               </div>
 
               <button
                 type="button"
                 onClick={handleGoogleSignIn}
-                className="btn btn-secondary w-full justify-center btn-lg flex items-center gap-2 border border-[var(--border-subtle)] hover:border-[var(--accent)]"
+                className="btn btn-secondary w-full justify-center btn-lg flex items-center gap-2 border border-[var(--border)] hover:border-[var(--accent)] shadow-sm bg-[rgba(255,255,255,0.03)]"
               >
                 <span className="font-bold text-xs text-theme-accent">G</span>
                 <span className="font-semibold text-xs text-theme-primary">Sign in with Google</span>
@@ -2630,7 +2846,7 @@ function doPost(e) {
               <div className="text-center pt-2">
                 <button
                   type="button"
-                  onClick={() => { setAuthMode("register"); setLoginError(""); }}
+                  onClick={() => { setAuthMode("register"); setLoginError(""); SoundEffects.switchClick(); }}
                   className="text-xs text-theme-accent hover:underline font-mono"
                 >
                   Need an account? Register with 2-Day Free Trial ➔
@@ -2645,7 +2861,7 @@ function doPost(e) {
                   type="text"
                   value={regFullName}
                   onChange={(e) => setRegFullName(e.target.value)}
-                  className="np-input"
+                  className="np-glass-input"
                   placeholder="e.g. Alexander Stone"
                   required
                 />
@@ -2657,7 +2873,7 @@ function doPost(e) {
                   type="email"
                   value={regEmail}
                   onChange={(e) => setRegEmail(e.target.value)}
-                  className="np-input font-mono"
+                  className="np-glass-input font-mono"
                   placeholder="stone@contractors.de"
                   required
                 />
@@ -2669,7 +2885,7 @@ function doPost(e) {
                   type="text"
                   value={regUsername}
                   onChange={(e) => setRegUsername(e.target.value)}
-                  className="np-input font-mono"
+                  className="np-glass-input font-mono"
                   placeholder="astone"
                   required
                 />
@@ -2678,14 +2894,23 @@ function doPost(e) {
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="np-label">Passphrase</label>
-                  <input
-                    type="password"
-                    value={regPassword}
-                    onChange={(e) => setRegPassword(e.target.value)}
-                    className="np-input font-mono"
-                    placeholder="••••••••"
-                    required
-                  />
+                  <div className="relative">
+                    <input
+                      type={showRegPassword ? "text" : "password"}
+                      value={regPassword}
+                      onChange={(e) => setRegPassword(e.target.value)}
+                      className="np-glass-input font-mono pr-7"
+                      placeholder="••••••••"
+                      required
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowRegPassword(!showRegPassword)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-theme-muted hover:text-theme-primary text-xs"
+                    >
+                      {showRegPassword ? "👁️" : "👁️‍🗨️"}
+                    </button>
+                  </div>
                 </div>
                 <div>
                   <label className="np-label">Confirm</label>
@@ -2693,7 +2918,7 @@ function doPost(e) {
                     type="password"
                     value={regConfirmPassword}
                     onChange={(e) => setRegConfirmPassword(e.target.value)}
-                    className="np-input font-mono"
+                    className="np-glass-input font-mono"
                     placeholder="••••••••"
                     required
                   />
@@ -2703,7 +2928,7 @@ function doPost(e) {
               <button
                 type="submit"
                 disabled={isRegistering}
-                className="btn btn-primary w-full justify-center btn-lg mt-3"
+                className="btn btn-primary w-full justify-center btn-lg mt-3 shadow-lg"
               >
                 <span>{isRegistering ? "Creating Account..." : "Create Account & Start 2-Day Trial"}</span>
                 <span>➔</span>
@@ -2712,7 +2937,7 @@ function doPost(e) {
               <div className="text-center pt-2">
                 <button
                   type="button"
-                  onClick={() => { setAuthMode("login"); setRegError(""); }}
+                  onClick={() => { setAuthMode("login"); setRegError(""); SoundEffects.switchClick(); }}
                   className="text-xs text-theme-accent hover:underline font-mono"
                 >
                   Already have an account? Sign In ➔
@@ -2729,296 +2954,419 @@ function doPost(e) {
   // VIEW: MAIN ENTERPRISE DASHBOARD
   // ---------------------------------------------------------------------------
   return (
-    <div className="np-app-container">
-      {/* GLOBAL NOTIFICATION BANNER */}
-      {alertBanner && (
-        <div className={`px-4 py-2.5 text-xs font-medium border-b flex items-center justify-between ${
-          alertBanner.type === "success" ? "bg-[var(--success-muted)] text-[var(--success)] border-[var(--success)]" :
-          alertBanner.type === "error" ? "bg-[var(--danger-muted)] text-[var(--danger)] border-[var(--danger)]" :
-          "bg-[var(--accent-muted)] text-[var(--accent)] border-[var(--accent)]"
-        }`}>
-          <span>{alertBanner.message}</span>
-          <button onClick={() => setAlertBanner(null)} className="hover:opacity-75 font-bold ml-4 text-sm">✕</button>
-        </div>
-      )}
+    <div className="np-app-layout">
+      {/* Mobile Sidebar Backdrop Drawer */}
+      <div
+        className={`np-sidebar-backdrop ${isMobileSidebarOpen ? "mobile-open" : ""}`}
+        onClick={() => setIsMobileSidebarOpen(false)}
+      />
 
-      {/* TOP NAVIGATION HEADER */}
-      <header className="np-header">
-        {/* Brand & Telemetry */}
-        <div className="flex items-center gap-3 shrink-0">
-          <div
-            className={`np-pulse-icon ${
-              pulseState === "HOT_ALERT" ? "np-pulse-hot" :
-              pulseState === "DISPATCHING" ? "np-pulse-dispatching" :
-              pulseState === "HUNTING" ? "np-pulse-hunting" :
-              pulseState === "RUNNING" ? "np-pulse-running" : "np-pulse-idle"
-            }`}
-            title={`Agent Engine State: ${pulseState}`}
-          >
-            <span>NP</span>
-          </div>
-
-          <div>
-            <div className="flex items-center gap-2">
-              <span className="font-bold text-sm tracking-tight text-theme-primary">
-                Nexus-Pulse
-              </span>
-              <span className="badge badge-accent">
-                Level 2
-              </span>
-              {user && user.role === "operator" && user.trial_active === 1 && user.subscription_status !== "active" && (
-                <span className="badge badge-warning text-[10px] font-mono px-2 py-0.5 animate-pulse" title={`Trial expires: ${user.trial_expires_at}`}>
-                  ⏳ 2-Day Trial: {calculateTrialRemaining(user.trial_expires_at)}
-                </span>
-              )}
-              {user && user.role === "operator" && user.subscription_status === "active" && (
-                <span className="badge badge-success text-[10px] font-mono px-2 py-0.5">
-                  ✓ {user.subscription_plan || "Active Subscription"}
-                </span>
-              )}
-            </div>
-            <div className="flex items-center gap-2 text-[11px] text-theme-muted font-mono">
-              <span>Status: <strong className={
-                pulseState === 'HOT_ALERT' ? 'text-theme-danger animate-pulse' :
-                pulseState === 'DISPATCHING' ? 'text-theme-warning animate-pulse' :
-                pulseState === 'HUNTING' ? 'text-theme-success animate-pulse' :
-                'text-theme-accent'
-              }>{pulseState}</strong></span>
-              <span>•</span>
-              <span className="hidden sm:inline">ID: {systemHealth?.machine_id || "NEXUS-E727"}</span>
-            </div>
-          </div>
-        </div>
-
-        {/* Center: Live Office Hours Clocks */}
-        <div className="hidden lg:flex items-center gap-4 text-xs font-mono bg-elevated px-3 py-1.5 rounded-md border-theme shrink-0">
-          <div className="flex items-center gap-1.5">
-            <span className="w-2 h-2 rounded-full bg-[var(--success)] animate-pulse" />
-            <span className="text-theme-secondary">Berlin (CET):</span>
-            <span className="font-semibold text-theme-primary">
-              {timezones.germany?.current_local_time?.split(" ")[1] || "09:15:00"}
-            </span>
-            <span className="text-[10px] text-theme-success">
-              [{timezones.germany?.is_in_send_window ? "9 AM - 5 PM WINDOW" : "QUEUED"}]
-            </span>
-          </div>
-          <span className="text-theme-muted">|</span>
-          <div className="flex items-center gap-1.5">
-            <span className="text-theme-secondary">London (GMT):</span>
-            <span className="font-semibold text-theme-primary">
-              {timezones.united_kingdom?.current_local_time?.split(" ")[1] || "08:15:00"}
-            </span>
-            <span className="text-[10px] text-theme-success">
-              [{timezones.united_kingdom?.is_in_send_window ? "9 AM - 5 PM WINDOW" : "QUEUED"}]
-            </span>
-          </div>
-        </div>
-
-        {/* Action Controls & Theme Engine */}
-        <div className="flex items-center gap-2.5 shrink-0">
-          <button
-            onClick={() => { setIsHuntModalOpen(true); setHuntProgress(null); }}
-            className="btn btn-primary btn-sm"
-            title="Launch Targeted Lead Hunt"
-          >
-            <span>⚡ Hunt & Verify</span>
-          </button>
-
-          <button
-            onClick={() => setIsBackupModalOpen(true)}
-            className="btn btn-secondary btn-sm"
-            title="Export Multi-Format Database Backup"
-          >
-            <span>📦 Backup</span>
-          </button>
-
-          {/* Theme Switcher Dropdown */}
-          <div className="relative">
-            <button
-              onClick={() => setIsThemeMenuOpen(!isThemeMenuOpen)}
-              className="btn btn-secondary btn-sm flex items-center gap-1.5"
-              title="Select Visual Theme"
+      {/* INDEPENDENT LEFT SIDEBAR PANEL (VIDEO 2 DASHBOARD V21) */}
+      <aside className={`np-sidebar ${isMobileSidebarOpen ? "mobile-open" : ""}`}>
+        {/* Brand Header & Live Telemetry */}
+        <div className="np-sidebar-header">
+          <div className="flex items-center gap-2.5">
+            <div
+              className={`np-pulse-icon ${
+                pulseState === "HOT_ALERT" ? "np-pulse-hot" :
+                pulseState === "DISPATCHING" ? "np-pulse-dispatching" :
+                pulseState === "HUNTING" ? "np-pulse-hunting" :
+                pulseState === "RUNNING" ? "np-pulse-running" : "np-pulse-idle"
+              }`}
+              title={`Agent Engine State: ${pulseState}`}
             >
-              <span
-                className="theme-dot"
-                style={{ backgroundColor: THEMES.find(t => t.id === activeTheme)?.dotColor || "#58a6ff" }}
-              />
-              <span className="hidden sm:inline">Theme</span>
-              <span className="text-[10px]">▾</span>
-            </button>
-
-            {isThemeMenuOpen && (
-              <div
-                className="absolute right-0 mt-1.5 w-56 np-card p-1 z-50 shadow-lg border-theme"
-                onMouseLeave={() => setIsThemeMenuOpen(false)}
-              >
-                <div className="px-2.5 py-1.5 text-[10px] font-semibold text-theme-secondary uppercase tracking-wider border-b-theme">
-                  Appearance Theme
-                </div>
-                {THEMES.map((t) => (
-                  <button
-                    key={t.id}
-                    onClick={() => {
-                      setActiveTheme(t.id);
-                      setIsThemeMenuOpen(false);
-                    }}
-                    className={`w-full text-left px-2.5 py-2 rounded text-xs flex items-center justify-between hover:bg-hover transition-colors ${
-                      activeTheme === t.id ? "text-theme-accent font-semibold" : "text-theme-primary"
-                    }`}
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className="theme-dot" style={{ backgroundColor: t.dotColor }} />
-                      <div>
-                        <div>{t.name}</div>
-                        <div className="text-[10px] text-theme-muted">{t.desc}</div>
-                      </div>
-                    </div>
-                    {activeTheme === t.id && <span>✓</span>}
-                  </button>
-                ))}
+              <span>NP</span>
+            </div>
+            <div>
+              <div className="flex items-center gap-1.5">
+                <span className="font-bold text-sm tracking-tight text-theme-primary">
+                  Nexus-Pulse
+                </span>
+                <span className="badge badge-accent text-[9px] px-1 py-0">
+                  Level 2
+                </span>
               </div>
-            )}
+              <div className="text-[10px] text-theme-muted font-mono flex items-center gap-1">
+                <span className={`w-1.5 h-1.5 rounded-full ${
+                  pulseState === 'HOT_ALERT' ? 'bg-[var(--danger)] animate-pulse' :
+                  pulseState === 'DISPATCHING' ? 'bg-[var(--warning)] animate-pulse' :
+                  pulseState === 'HUNTING' ? 'bg-[var(--success)] animate-pulse' :
+                  'bg-[var(--accent)] animate-pulse'
+                }`} />
+                <span>{pulseState}</span>
+              </div>
+            </div>
           </div>
-
-          {/* Subtle UI Audio SFX Toggle */}
+          {/* Mobile close button */}
           <button
-            type="button"
-            onClick={() => {
-              const next = !soundEnabled;
-              setSoundEnabled(next);
-              if (next) setTimeout(() => playUiSound("action"), 50);
-            }}
-            className={`btn btn-sm flex items-center gap-1.5 ${soundEnabled ? "btn-secondary text-theme-accent" : "btn-ghost text-theme-muted"}`}
-            title={soundEnabled ? "UI Audio SFX Active (Click to Mute)" : "UI Audio SFX Muted (Click to Enable)"}
+            onClick={() => setIsMobileSidebarOpen(false)}
+            className="lg:hidden text-theme-muted hover:text-theme-primary text-sm p-1"
           >
-            <span>{soundEnabled ? "🔊" : "🔇"}</span>
-            <span className="hidden sm:inline text-[11px] font-mono">{soundEnabled ? "SFX: ON" : "SFX: OFF"}</span>
+            ✕
           </button>
+        </div>
 
-          {/* User Profile Pill & Sign Out */}
-          <div className="flex items-center gap-2 pl-2.5 border-l-theme">
-            <div className="text-right hidden sm:block">
-              <div className="text-xs font-semibold leading-tight text-theme-primary">{user.full_name || user.username}</div>
-              <div className="flex items-center gap-1 justify-end mt-0.5">
-                <span className="badge badge-gold uppercase text-[9px]">
+        {/* Scrollable Navigation & Personalized Profile */}
+        <div className="np-sidebar-scroll">
+          {/* Personalized User Identity & Welcome Greeting */}
+          <div className="np-sidebar-user-card">
+            <div className="w-8 h-8 rounded-full bg-[var(--accent-muted)] border border-[var(--accent)] flex items-center justify-center font-bold text-xs text-theme-accent shrink-0">
+              {(user.full_name || user.username || "NP").charAt(0).toUpperCase()}
+            </div>
+            <div className="min-w-0 flex-1">
+              <div className="text-[10px] text-theme-muted uppercase tracking-wider font-semibold">
+                Welcome back,
+              </div>
+              <div className="text-xs font-semibold text-theme-primary truncate" title={user.full_name || user.username}>
+                {user.full_name || user.username}
+              </div>
+              <div className="flex items-center gap-1 mt-0.5">
+                <span className="badge badge-gold text-[8px] uppercase px-1 py-0 font-mono">
                   {user.role}
                 </span>
-                {user.trial_status === "active" && (
-                  <span className="badge badge-accent text-[9px]" title="2-Day Free Trial">
-                    2-Day Trial
+                {user.role === "operator" && user.trial_active === 1 && user.subscription_status !== "active" && (
+                  <span className="badge badge-warning text-[8px] font-mono px-1 py-0 animate-pulse" title={`Trial expires: ${user.trial_expires_at}`}>
+                    ⏳ 2-Day Trial
+                  </span>
+                )}
+                {user.role === "operator" && user.subscription_status === "active" && (
+                  <span className="badge badge-success text-[8px] font-mono px-1 py-0">
+                    ✓ Active
                   </span>
                 )}
               </div>
             </div>
+          </div>
+
+          {/* Group 1: CORE WORKSPACE */}
+          <div className="np-sidebar-nav-group">
+            <div className="np-sidebar-group-title">Core Workspace</div>
+
             <button
-              onClick={handleLogout}
-              className="btn btn-ghost btn-sm btn-icon text-theme-muted hover:text-theme-danger"
-              title="Sign Out"
+              onClick={() => { setActiveTab("kanban"); setIsMobileSidebarOpen(false); SoundEffects.waterDrop(); }}
+              className={`np-sidebar-item ${activeTab === "kanban" ? "active" : ""}`}
             >
-              ⏻
+              <span className="flex items-center gap-2">
+                <span>📊</span>
+                <span>Pipeline</span>
+              </span>
+              <span className="badge badge-muted text-[10px] px-1.5 py-0 font-mono">{kanbanItems.length}</span>
+            </button>
+
+            <button
+              onClick={() => { setActiveTab("approval_gate"); setIsMobileSidebarOpen(false); SoundEffects.waterDrop(); }}
+              className={`np-sidebar-item ${activeTab === "approval_gate" ? "active" : ""}`}
+            >
+              <span className="flex items-center gap-2">
+                <span>🛡️</span>
+                <span>Approval Gate</span>
+              </span>
+              {pendingApprovals.length > 0 && (
+                <span className="badge badge-warning text-[10px] px-1.5 py-0 font-mono">{pendingApprovals.length}</span>
+              )}
+            </button>
+
+            <button
+              onClick={() => { setActiveTab("hot_leads"); setIsMobileSidebarOpen(false); SoundEffects.waterDrop(); }}
+              className={`np-sidebar-item ${activeTab === "hot_leads" ? "active" : ""}`}
+            >
+              <span className="flex items-center gap-2">
+                <span>🔥</span>
+                <span>Hot Leads</span>
+              </span>
+              {uniqueHotLeads.length > 0 && (
+                <span className="badge badge-danger text-[10px] px-1.5 py-0 font-mono animate-pulse">{uniqueHotLeads.length}</span>
+              )}
+            </button>
+
+            <button
+              onClick={() => { setActiveTab("rotator"); setIsMobileSidebarOpen(false); SoundEffects.waterDrop(); }}
+              className={`np-sidebar-item ${activeTab === "rotator" ? "active" : ""}`}
+            >
+              <span className="flex items-center gap-2">
+                <span>🔄</span>
+                <span>Inbox Rotator</span>
+              </span>
+              <span className="badge badge-muted text-[10px] px-1.5 py-0 font-mono">{mailboxes.length}</span>
+            </button>
+
+            <button
+              onClick={() => { setActiveTab("templates"); setIsMobileSidebarOpen(false); SoundEffects.waterDrop(); }}
+              className={`np-sidebar-item ${activeTab === "templates" ? "active" : ""}`}
+            >
+              <span className="flex items-center gap-2">
+                <span>📝</span>
+                <span>Proposals</span>
+              </span>
+              <span className="badge badge-muted text-[10px] px-1.5 py-0 font-mono">{templatesList.length}</span>
+            </button>
+
+            <button
+              onClick={() => { setActiveTab("analytics"); setIsMobileSidebarOpen(false); SoundEffects.waterDrop(); }}
+              className={`np-sidebar-item ${activeTab === "analytics" ? "active" : ""}`}
+            >
+              <span className="flex items-center gap-2">
+                <span>📈</span>
+                <span>Deliverability</span>
+              </span>
+            </button>
+          </div>
+
+          {/* Group 2: ADMINISTRATION (Admin Only) */}
+          {user.role === "admin" && (
+            <div className="np-sidebar-nav-group">
+              <div className="np-sidebar-group-title">Administration</div>
+
+              <button
+                onClick={() => { setActiveTab("billing_mgmt"); setIsMobileSidebarOpen(false); SoundEffects.waterDrop(); }}
+                className={`np-sidebar-item ${activeTab === "billing_mgmt" ? "active" : ""}`}
+              >
+                <span className="flex items-center gap-2">
+                  <span>💳</span>
+                  <span>Manual Billing</span>
+                </span>
+                {planRequests.length > 0 && (
+                  <span className="badge badge-warning text-[10px] px-1.5 py-0 font-mono">{planRequests.length}</span>
+                )}
+              </button>
+
+              <button
+                onClick={() => { setActiveTab("blacklist_mgmt"); setIsMobileSidebarOpen(false); SoundEffects.waterDrop(); }}
+                className={`np-sidebar-item ${activeTab === "blacklist_mgmt" ? "active" : ""}`}
+              >
+                <span className="flex items-center gap-2">
+                  <span>🚫</span>
+                  <span>Blacklist</span>
+                </span>
+              </button>
+
+              <button
+                onClick={() => { setActiveTab("operator_mgmt"); setIsMobileSidebarOpen(false); SoundEffects.waterDrop(); }}
+                className={`np-sidebar-item ${activeTab === "operator_mgmt" ? "active" : ""}`}
+              >
+                <span className="flex items-center gap-2">
+                  <span>👥</span>
+                  <span>Operators</span>
+                </span>
+                <span className="badge badge-muted text-[10px] px-1.5 py-0 font-mono">{operatorsList.length}</span>
+              </button>
+
+              <button
+                onClick={() => { setActiveTab("security_settings"); setIsMobileSidebarOpen(false); SoundEffects.waterDrop(); }}
+                className={`np-sidebar-item ${activeTab === "security_settings" ? "active" : ""}`}
+              >
+                <span className="flex items-center gap-2">
+                  <span>⚙️</span>
+                  <span>Security Profile</span>
+                </span>
+              </button>
+
+              <button
+                onClick={() => { setActiveTab("license_mgmt"); setIsMobileSidebarOpen(false); SoundEffects.waterDrop(); }}
+                className={`np-sidebar-item ${activeTab === "license_mgmt" ? "active" : ""}`}
+              >
+                <span className="flex items-center gap-2">
+                  <span>📜</span>
+                  <span>License & Telemetry</span>
+                </span>
+              </button>
+            </div>
+          )}
+
+          {/* Quick Primary Actions */}
+          <div className="pt-2 border-t border-[var(--border-subtle)] space-y-2">
+            <button
+              onClick={() => { setIsHuntModalOpen(true); setHuntProgress(null); }}
+              className="btn btn-primary btn-sm w-full justify-center shadow-sm"
+              title="Launch Targeted Lead Hunt"
+            >
+              <span>⚡ Hunt & Verify</span>
+            </button>
+
+            <button
+              onClick={() => setIsBackupModalOpen(true)}
+              className="btn btn-secondary btn-sm w-full justify-center"
+              title="Export Multi-Format Database Backup"
+            >
+              <span>📦 Backup Data</span>
             </button>
           </div>
         </div>
-      </header>
 
-      {/* NAVIGATION TAB BAR */}
-      <nav className="np-nav">
-        <button
-          onClick={() => setActiveTab("kanban")}
-          className={`np-nav-tab ${activeTab === "kanban" ? "active" : ""}`}
-        >
-          <span>📊 Pipeline ({kanbanItems.length})</span>
-        </button>
+        {/* Sidebar Bottom Status & Settings Card */}
+        <div className="np-sidebar-footer">
+          {/* Hardware Telemetry Badge */}
+          <div className="flex items-center justify-between text-[11px] font-mono text-theme-muted px-1">
+            <span className="flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-[var(--success)] animate-pulse" />
+              <span>{systemHealth?.machine_id || "NEXUS-E727"}</span>
+            </span>
+            <span className="badge badge-accent text-[9px] px-1 py-0">SECURE</span>
+          </div>
 
-        <button
-          onClick={() => setActiveTab("approval_gate")}
-          className={`np-nav-tab ${activeTab === "approval_gate" ? "active" : ""}`}
-        >
-          <span>🛡️ Approval Gate</span>
-          {pendingApprovals.length > 0 && (
-            <span className="badge badge-warning text-[10px] px-1.5 py-0">{pendingApprovals.length}</span>
-          )}
-        </button>
+          {/* Theme & SFX & Logout Controls Bar */}
+          <div className="flex items-center justify-between pt-1 border-t border-[var(--border-subtle)]">
+            {/* Theme Picker Dropdown */}
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => setIsThemeMenuOpen(!isThemeMenuOpen)}
+                className="btn btn-secondary btn-sm flex items-center gap-1.5 py-1 px-2"
+                title="Appearance Theme"
+              >
+                <span
+                  className="theme-dot"
+                  style={{ backgroundColor: THEMES.find(t => t.id === activeTheme)?.dotColor || "#38bdf8" }}
+                />
+                <span className="text-[11px] font-mono">Theme</span>
+                <span className="text-[9px]">▾</span>
+              </button>
 
-        <button
-          onClick={() => setActiveTab("hot_leads")}
-          className={`np-nav-tab ${activeTab === "hot_leads" ? "active" : ""}`}
-        >
-          <span>🔥 Hot Leads</span>
-          {uniqueHotLeads.length > 0 && (
-            <span className="badge badge-danger text-[10px] px-1.5 py-0 animate-pulse">{uniqueHotLeads.length}</span>
-          )}
-        </button>
+              {isThemeMenuOpen && (
+                <div
+                  className="absolute bottom-full left-0 mb-1.5 w-56 np-card p-1 z-50 shadow-2xl border-theme"
+                  onMouseLeave={() => setIsThemeMenuOpen(false)}
+                >
+                  <div className="px-2.5 py-1.5 text-[10px] font-semibold text-theme-secondary uppercase tracking-wider border-b-theme">
+                    Appearance Preset (6 Themes)
+                  </div>
+                  {THEMES.map((t) => (
+                    <button
+                      key={t.id}
+                      onClick={() => {
+                        setActiveTheme(t.id);
+                        setIsThemeMenuOpen(false);
+                        SoundEffects.glassChime();
+                      }}
+                      className={`w-full text-left px-2.5 py-1.5 rounded text-xs flex items-center justify-between hover:bg-hover transition-colors ${
+                        activeTheme === t.id ? "text-theme-accent font-semibold bg-[var(--accent-muted)]" : "text-theme-primary"
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="theme-dot" style={{ backgroundColor: t.dotColor }} />
+                        <div>
+                          <div>{t.name}</div>
+                          <div className="text-[9px] text-theme-muted leading-tight">{t.desc}</div>
+                        </div>
+                      </div>
+                      {activeTheme === t.id && <span className="text-theme-accent font-bold">✓</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
 
-        <button
-          onClick={() => setActiveTab("rotator")}
-          className={`np-nav-tab ${activeTab === "rotator" ? "active" : ""}`}
-        >
-          <span>🔄 Inbox Rotator ({mailboxes.length})</span>
-        </button>
+            {/* Audio Mute Toggle */}
+            <button
+              type="button"
+              onClick={() => {
+                const next = !soundEnabled;
+                setSoundEnabled(next);
+                if (next) setTimeout(() => playUiSound("glass_chime"), 50);
+              }}
+              className={`btn btn-sm py-1 px-2 ${soundEnabled ? "btn-secondary text-theme-accent" : "btn-ghost text-theme-muted"}`}
+              title={soundEnabled ? "UI Audio SFX Active (Click to Mute)" : "UI Audio SFX Muted (Click to Enable)"}
+            >
+              <span>{soundEnabled ? "🔊" : "🔇"}</span>
+            </button>
 
-        <button
-          onClick={() => setActiveTab("templates")}
-          className={`np-nav-tab ${activeTab === "templates" ? "active" : ""}`}
-        >
-          <span>📝 Proposals ({templatesList.length})</span>
-        </button>
+            {/* Logout */}
+            <button
+              onClick={handleLogout}
+              className="btn btn-ghost btn-sm py-1 px-2 text-theme-muted hover:text-theme-danger"
+              title="Sign Out"
+            >
+              <span>⏻</span>
+            </button>
+          </div>
+        </div>
+      </aside>
 
-        <button
-          onClick={() => setActiveTab("analytics")}
-          className={`np-nav-tab ${activeTab === "analytics" ? "active" : ""}`}
-        >
-          <span>📈 Deliverability</span>
-        </button>
-
-        {user.role === "admin" && (
-          <button
-            onClick={() => setActiveTab("billing_mgmt")}
-            className={`np-nav-tab ${activeTab === "billing_mgmt" ? "active" : ""}`}
-          >
-            <span>💳 Manual Billing</span>
-          </button>
+      {/* RIGHT MAIN WORKSPACE (Video 2) */}
+      <div className="np-main-wrapper">
+        {/* Global Notification Banner */}
+        {alertBanner && (
+          <div className={`px-4 py-2 text-xs font-medium border-b flex items-center justify-between ${
+            alertBanner.type === "success" ? "bg-[var(--success-muted)] text-[var(--success)] border-[var(--success)]" :
+            alertBanner.type === "error" ? "bg-[var(--danger-muted)] text-[var(--danger)] border-[var(--danger)]" :
+            "bg-[var(--accent-muted)] text-[var(--accent)] border-[var(--accent)]"
+          }`}>
+            <span>{alertBanner.message}</span>
+            <button onClick={() => setAlertBanner(null)} className="hover:opacity-75 font-bold ml-4 text-sm">✕</button>
+          </div>
         )}
 
-        {user.role === "admin" && (
-          <button
-            onClick={() => setActiveTab("blacklist_mgmt")}
-            className={`np-nav-tab ${activeTab === "blacklist_mgmt" ? "active" : ""}`}
-          >
-            <span>🚫 Blacklist</span>
-          </button>
-        )}
+        {/* Top Synchronized Context Header */}
+        <header className="np-context-header">
+          <div className="flex items-center gap-3">
+            <button
+              onClick={() => setIsMobileSidebarOpen(true)}
+              className="lg:hidden btn btn-secondary btn-sm p-1.5"
+              title="Open Navigation Menu"
+            >
+              ☰
+            </button>
+            <div>
+              <div className="text-[11px] text-theme-muted font-mono flex items-center gap-1.5">
+                <span>Nexus-Pulse</span>
+                <span>›</span>
+                <span className="text-theme-primary font-semibold">
+                  {activeTab === "kanban" ? "Pipeline Lifecycle" :
+                   activeTab === "approval_gate" ? "Human Approval Gate" :
+                   activeTab === "hot_leads" ? "Hot Lead Alert Room" :
+                   activeTab === "rotator" ? "Inbox Rotator & Domains" :
+                   activeTab === "templates" ? "Proposal Templates" :
+                   activeTab === "analytics" ? "Deliverability & Telemetry" :
+                   activeTab === "billing_mgmt" ? "Manual Plan & Billing Management" :
+                   activeTab === "blacklist_mgmt" ? "Blacklist & Suppression Vault" :
+                   activeTab === "operator_mgmt" ? "Operator Role Management" :
+                   activeTab === "security_settings" ? "Cryptographic Security Profile" :
+                   activeTab === "license_mgmt" ? "Licensing & Machine Lock" : activeTab}
+                </span>
+              </div>
+            </div>
+          </div>
 
-        {user.role === "admin" && (
-          <button
-            onClick={() => setActiveTab("operator_mgmt")}
-            className={`np-nav-tab ${activeTab === "operator_mgmt" ? "active" : ""}`}
-          >
-            <span>👥 Operators ({operatorsList.length})</span>
-          </button>
-        )}
+          {/* Center: Live Office Hours Clocks */}
+          <div className="hidden md:flex items-center gap-3 text-xs font-mono bg-elevated px-3 py-1 rounded-md border-theme">
+            <div className="flex items-center gap-1.5">
+              <span className="w-1.5 h-1.5 rounded-full bg-[var(--success)] animate-pulse" />
+              <span className="text-theme-secondary text-[11px]">Berlin:</span>
+              <span className="font-semibold text-theme-primary text-[11px]">
+                {timezones.germany?.current_local_time?.split(" ")[1] || "09:15:00"}
+              </span>
+              <span className="text-[9px] text-theme-success font-bold">
+                [{timezones.germany?.is_in_send_window ? "ACTIVE WINDOW" : "QUEUED"}]
+              </span>
+            </div>
+            <span className="text-theme-muted">|</span>
+            <div className="flex items-center gap-1.5">
+              <span className="text-theme-secondary text-[11px]">London:</span>
+              <span className="font-semibold text-theme-primary text-[11px]">
+                {timezones.united_kingdom?.current_local_time?.split(" ")[1] || "08:15:00"}
+              </span>
+              <span className="text-[9px] text-theme-success font-bold">
+                [{timezones.united_kingdom?.is_in_send_window ? "ACTIVE WINDOW" : "QUEUED"}]
+              </span>
+            </div>
+          </div>
 
-        {user.role === "admin" && (
-          <button
-            onClick={() => setActiveTab("security_settings")}
-            className={`np-nav-tab ${activeTab === "security_settings" ? "active" : ""}`}
-          >
-            <span>⚙️ Security Profile</span>
-          </button>
-        )}
+          {/* Right: Engine Telemetry State */}
+          <div className="flex items-center gap-2">
+            <div className="flex items-center gap-1.5 font-mono text-[11px] bg-elevated px-2.5 py-1 rounded border-theme">
+              <span className="text-theme-muted">Engine:</span>
+              <span className={
+                pulseState === 'HOT_ALERT' ? 'text-theme-danger font-bold animate-pulse' :
+                pulseState === 'DISPATCHING' ? 'text-theme-warning font-bold animate-pulse' :
+                pulseState === 'HUNTING' ? 'text-theme-success font-bold animate-pulse' :
+                'text-theme-accent font-bold'
+              }>{pulseState}</span>
+            </div>
+          </div>
+        </header>
 
-        {user.role === "admin" && (
-          <button
-            onClick={() => setActiveTab("license_mgmt")}
-            className={`np-nav-tab ${activeTab === "license_mgmt" ? "active" : ""}`}
-          >
-            <span>📜 License & Telemetry</span>
-          </button>
-        )}
-      </nav>
-
-      {/* MAIN CONTENT WORKSPACE */}
-      <main className="np-main-content">
+        {/* MAIN CONTENT WORKSPACE */}
+        <main className="np-main-content">
         {/* TAB 1: KANBAN LEAD PIPELINE */}
         {activeTab === "kanban" && (
           <div className="w-full space-y-4">
@@ -4870,6 +5218,7 @@ function doPost(e) {
           </div>
         )}
       </main>
+    </div>
 
       {/* MODAL: MULTI-FORMAT DATA BACKUP */}
       {isBackupModalOpen && (

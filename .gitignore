@@ -40,4 +40,5 @@ vault/partitions/**
 fix_*.py
 cleanup_*.py
 verify_*.py
+.babel-standalone.cache.js
 

@@ -107,7 +107,8 @@
   <script>
     // Apply saved theme before first paint to prevent Flash of Unstyled Content (FOUC)
     (function() {
-      var saved = localStorage.getItem('nexus_theme') || 'github-dark';
+      var saved = localStorage.getItem('nexus_theme') || 'obsidian-glass';
+      if (saved === 'github-dark') saved = 'obsidian-glass';
       document.documentElement.setAttribute('data-theme', saved);
     })();
 
