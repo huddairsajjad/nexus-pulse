@@ -654,7 +654,8 @@ def list_service_templates(current_user: Dict[str, Any] = Depends(get_current_us
     """Lists proposal templates belonging to the current tenant."""
     mgr = get_template_manager()
     op_id = current_user["id"] if current_user.get("role") == "operator" else None
-    return mgr.get_templates(operator_id=op_id)
+    owner_u = (current_user.get("username") or "").strip().lower()
+    return mgr.get_templates(operator_id=op_id, owner_username=owner_u)
 
 
 @router.post("/templates")
@@ -662,6 +663,7 @@ def create_service_template(req: TemplateCreateRequest, current_user: Dict[str, 
     """Composes and stores a new custom service proposal template."""
     mgr = get_template_manager()
     op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     try:
         return mgr.create_template(
             operator_id=op_id,
@@ -669,7 +671,8 @@ def create_service_template(req: TemplateCreateRequest, current_user: Dict[str, 
             niche=req.niche,
             subject_template=req.subject_template,
             body_template=req.body_template,
-            is_default=req.is_default or False
+            is_default=req.is_default or False,
+            owner_username=owner_u
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -680,6 +683,7 @@ def update_service_template(template_id: str, req: TemplateUpdateRequest, curren
     """Updates an existing custom proposal template."""
     mgr = get_template_manager()
     op_id = current_user["id"] if current_user.get("role") == "operator" else None
+    owner_u = (current_user.get("username") or "").strip().lower()
     try:
         return mgr.update_template(
             template_id=template_id,
@@ -688,7 +692,8 @@ def update_service_template(template_id: str, req: TemplateUpdateRequest, curren
             niche=req.niche,
             subject_template=req.subject_template,
             body_template=req.body_template,
-            is_default=req.is_default
+            is_default=req.is_default,
+            owner_username=owner_u
         )
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -699,8 +704,9 @@ def delete_service_template(template_id: str, current_user: Dict[str, Any] = Dep
     """Deletes a custom proposal template."""
     mgr = get_template_manager()
     op_id = current_user["id"] if current_user.get("role") == "operator" else None
+    owner_u = (current_user.get("username") or "").strip().lower()
     try:
-        deleted = mgr.delete_template(template_id, operator_id=op_id)
+        deleted = mgr.delete_template(template_id, operator_id=op_id, owner_username=owner_u)
         if not deleted:
             raise HTTPException(status_code=404, detail="Template not found.")
         return {"success": True, "deleted_template_id": template_id}
@@ -898,36 +904,50 @@ def get_kanban_leads(
 ):
     """
     Returns pipeline leads grouped by lifecycle status.
-    Enforces multi-tenant data isolation: operators only view their own leads.
+    Enforces multi-tenant data isolation: operators and admin view their own leads.
     """
     db = get_db_engine()
-    # Determine tenant filter
-    target_op = current_user["id"] if current_user.get("role") == "operator" else operator_id
+    owner_u = (current_user.get("username") or "").strip().lower()
+    op_id = current_user["id"]
+    is_admin = current_user.get("role") == "admin"
 
     with db.get_connection() as conn:
-        if target_op:
+        if is_admin and operator_id:
             rows = conn.execute("""
                 SELECT id, lead_id, channel, recipient, company_name, subject,
                        message_body, status, target_country, scheduled_for,
-                       approved_by, sent_at, mailbox_used, operator_id,
+                       approved_by, sent_at, mailbox_used, operator_id, owner_username,
                        opened_at, bounced_at, bounce_reason, replied_at, reply_snippet, created_at,
                        COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
                        COALESCE(industry_niche, 'Commercial Construction') as niche
                 FROM outreach_queue
-                WHERE operator_id = ? OR operator_id IS NULL
+                WHERE (operator_id = ? OR lower(owner_username) = ?)
                 ORDER BY created_at DESC
-            """, (target_op,)).fetchall()
+            """, (operator_id, operator_id.lower())).fetchall()
+        elif is_admin:
+            rows = conn.execute("""
+                SELECT id, lead_id, channel, recipient, company_name, subject,
+                       message_body, status, target_country, scheduled_for,
+                       approved_by, sent_at, mailbox_used, operator_id, owner_username,
+                       opened_at, bounced_at, bounce_reason, replied_at, reply_snippet, created_at,
+                       COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
+                       COALESCE(industry_niche, 'Commercial Construction') as niche
+                FROM outreach_queue
+                WHERE (lower(owner_username) = ? OR operator_id = ? OR owner_username = '' OR owner_username IS NULL)
+                ORDER BY created_at DESC
+            """, (owner_u, op_id)).fetchall()
         else:
             rows = conn.execute("""
                 SELECT id, lead_id, channel, recipient, company_name, subject,
                        message_body, status, target_country, scheduled_for,
-                       approved_by, sent_at, mailbox_used, operator_id,
+                       approved_by, sent_at, mailbox_used, operator_id, owner_username,
                        opened_at, bounced_at, bounce_reason, replied_at, reply_snippet, created_at,
                        COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
                        COALESCE(industry_niche, 'Commercial Construction') as niche
                 FROM outreach_queue
+                WHERE (lower(owner_username) = ? OR operator_id = ?)
                 ORDER BY created_at DESC
-            """).fetchall()
+            """, (owner_u, op_id)).fetchall()
 
         items = [dict(r) for r in rows]
 
@@ -974,15 +994,17 @@ def get_kanban_leads(
 def get_pending_outreach_approvals(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Lists items held in the mandatory approval gate for this tenant."""
     gate = get_approval_gate()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
-    return gate.get_pending_approvals(operator_id=target_op)
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
+    return gate.get_pending_approvals(operator_id=op_id, owner_username=owner_u)
 
 
 @router.post("/outreach/approve")
 def approve_outreach_item(req: ApproveOutreachRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Authorizes outreach item. Operators can authorize their own items; Admins can authorize any."""
+    """Authorizes outreach item. Strictly scoped per user workspace."""
     gate = get_approval_gate()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     approver_name = req.approver or current_user.get("username", "operator")
     try:
         return gate.approve_outreach_item(
@@ -992,7 +1014,8 @@ def approve_outreach_item(req: ApproveOutreachRequest, current_user: Dict[str, A
             edited_body=req.edited_body,
             edited_recipient=req.edited_recipient,
             edited_company_name=req.edited_company_name,
-            operator_id=target_op
+            operator_id=op_id,
+            owner_username=owner_u
         )
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1003,9 +1026,10 @@ def approve_outreach_item(req: ApproveOutreachRequest, current_user: Dict[str, A
 def delete_outreach_item(queue_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Permanently deletes a single lead item from the Approval Gate queue in 1 click."""
     gate = get_approval_gate()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     try:
-        return gate.delete_queue_item(queue_id, operator_id=target_op)
+        return gate.delete_queue_item(queue_id, operator_id=op_id, owner_username=owner_u)
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1017,9 +1041,10 @@ def unblock_outreach_item(req: UnblockLeadRequest, current_user: Dict[str, Any] 
     and restoring it to PENDING_APPROVAL in the Human Approval Gate.
     """
     gate = get_approval_gate()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     try:
-        return gate.unblock_lead(req.queue_id, operator_id=target_op)
+        return gate.unblock_lead(req.queue_id, operator_id=op_id, owner_username=owner_u)
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1029,30 +1054,33 @@ def unblock_outreach_item(req: UnblockLeadRequest, current_user: Dict[str, Any] 
 def purge_unapproved_gate(current_user: Dict[str, Any] = Depends(get_current_user)):
     """
     Clear Unapproved Gate:
-    Wipes all pending/unapproved leads held in the Approval Gate in 1 click so admin can run a fresh hunt.
+    Wipes all pending/unapproved leads held in the Approval Gate in 1 click strictly for this user.
     """
     gate = get_approval_gate()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
-    return gate.purge_unapproved_items(operator_id=target_op)
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
+    return gate.purge_unapproved_items(operator_id=op_id, owner_username=owner_u)
 
 
 @router.post("/outreach/batch-approve")
 def batch_approve_outreach(req: BatchApproveRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Batch approves all pending outreach items held in the gate for this tenant."""
     gate = get_approval_gate()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     approver_name = req.approver or current_user.get("username", "operator")
-    return gate.batch_approve_all(approver=approver_name, operator_id=target_op)
+    return gate.batch_approve_all(approver=approver_name, operator_id=op_id, owner_username=owner_u)
 
 
 @router.post("/outreach/reject")
 def reject_outreach_item(req: RejectOutreachRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Rejects outreach item held in the gate."""
     gate = get_approval_gate()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     approver_name = req.approver or current_user.get("username", "operator")
     try:
-        return gate.reject_outreach_item(req.queue_id, approver=approver_name, operator_id=target_op)
+        return gate.reject_outreach_item(req.queue_id, approver=approver_name, operator_id=op_id, owner_username=owner_u)
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1068,9 +1096,10 @@ def dispatch_approved_item(
     Supports bypass_window for immediate manual dispatch outside regional business hours.
     """
     gate = get_approval_gate()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     try:
-        res = gate.dispatch_approved_outreach(queue_id, operator_id=target_op, bypass_window=bool(bypass_window))
+        res = gate.dispatch_approved_outreach(queue_id, operator_id=op_id, owner_username=owner_u, bypass_window=bool(bypass_window))
         if not res.get("success"):
             err_msg = res.get("message") or res.get("reason") or "Dispatch failed."
             raise HTTPException(status_code=400, detail=err_msg)
@@ -1087,16 +1116,17 @@ def dispatch_now_trigger(
     """
     Manual / Weekend Override Trigger:
     Forces immediate queue dispatch across all eligible leads, bypassing regional window restrictions.
-    Admin can trigger globally; Operators trigger for their tenant leads.
+    Scoped strictly to the user's tenant leads and enrolled mailboxes.
     """
     gate = get_approval_gate()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     effective_bypass = True if req is None or req.bypass_window is None else bool(req.bypass_window)
     limit = req.limit if req else None
 
     if req and req.queue_id:
         try:
-            res = gate.dispatch_approved_outreach(req.queue_id, operator_id=target_op, bypass_window=effective_bypass)
+            res = gate.dispatch_approved_outreach(req.queue_id, operator_id=op_id, owner_username=owner_u, bypass_window=effective_bypass)
             if not res.get("success"):
                 err_msg = res.get("message") or res.get("reason") or "Dispatch failed."
                 raise HTTPException(status_code=400, detail=err_msg)
@@ -1109,7 +1139,7 @@ def dispatch_now_trigger(
         except (ValueError, PermissionError) as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-    return gate.dispatch_ready_queue(bypass_window=effective_bypass, operator_id=target_op, limit=limit)
+    return gate.dispatch_ready_queue(bypass_window=effective_bypass, operator_id=op_id, owner_username=owner_u, limit=limit)
 
 
 @router.get("/dispatcher/status")
@@ -1195,10 +1225,11 @@ def get_target_timezone_preview(
 @router.get("/outreach/mailboxes")
 @router.get("/mailboxes")
 def list_enrolled_mailboxes(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Returns sending mailboxes. Operators see their own; Admins see all."""
+    """Returns sending mailboxes. Strictly scoped per user workspace."""
     rotator = get_inbox_rotator()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
-    return rotator.get_all_mailboxes_status(operator_id=target_op)
+    target_op = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
+    return rotator.get_all_mailboxes_status(operator_id=target_op, owner_username=owner_u)
 
 
 @router.post("/mailboxes")
@@ -1206,6 +1237,7 @@ def enroll_mailbox(req: MailboxCreateRequest, current_user: Dict[str, Any] = Dep
     """Enrolls an active SMTP profile with per-mailbox daily sending cap and optional webhook relay."""
     rotator = get_inbox_rotator()
     op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     if req.webhook_url and req.webhook_url.strip():
         wh_url = req.webhook_url.strip()
         if not wh_url.startswith("https://"):
@@ -1217,6 +1249,7 @@ def enroll_mailbox(req: MailboxCreateRequest, current_user: Dict[str, Any] = Dep
             domain=req.domain,
             daily_limit=req.daily_limit or 45,
             operator_id=op_id,
+            owner_username=owner_u,
             smtp_host=req.smtp_host or "",
             smtp_port=req.smtp_port or 587,
             smtp_username=req.smtp_username or req.email_address,
@@ -1235,12 +1268,14 @@ def enroll_mailbox(req: MailboxCreateRequest, current_user: Dict[str, Any] = Dep
 def update_mailbox(mailbox_id: str, req: MailboxUpdateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Updates configuration for an enrolled mailbox."""
     db = get_db_engine()
+    owner_u = (current_user.get("username") or "").strip().lower()
     with db.get_connection() as conn:
-        existing = conn.execute("SELECT id, operator_id FROM mailbox_rotator WHERE id = ?", (mailbox_id,)).fetchone()
+        existing = conn.execute("SELECT id, operator_id, owner_username FROM mailbox_rotator WHERE id = ?", (mailbox_id,)).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="Mailbox not found.")
 
-        if current_user.get("role") != "admin" and existing["operator_id"] != current_user["id"]:
+        ex_owner = (existing["owner_username"] or "").strip().lower()
+        if current_user.get("role") != "admin" and existing["operator_id"] != current_user["id"] and ex_owner != owner_u:
             raise HTTPException(status_code=403, detail="Forbidden: You can only edit your own mailboxes.")
 
         fields = []
@@ -1289,12 +1324,14 @@ def update_mailbox(mailbox_id: str, req: MailboxUpdateRequest, current_user: Dic
 def delete_mailbox(mailbox_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Deletes an enrolled mailbox."""
     db = get_db_engine()
+    owner_u = (current_user.get("username") or "").strip().lower()
     with db.get_connection() as conn:
-        existing = conn.execute("SELECT id, operator_id, email_address FROM mailbox_rotator WHERE id = ?", (mailbox_id,)).fetchone()
+        existing = conn.execute("SELECT id, operator_id, owner_username, email_address FROM mailbox_rotator WHERE id = ?", (mailbox_id,)).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="Mailbox not found.")
 
-        if current_user.get("role") != "admin" and existing["operator_id"] != current_user["id"]:
+        ex_owner = (existing["owner_username"] or "").strip().lower()
+        if current_user.get("role") != "admin" and existing["operator_id"] != current_user["id"] and ex_owner != owner_u:
             raise HTTPException(status_code=403, detail="Forbidden: You can only delete your own mailboxes.")
 
         conn.execute("DELETE FROM mailbox_rotator WHERE id = ?", (mailbox_id,))
@@ -1308,10 +1345,12 @@ def delete_mailbox(mailbox_id: str, current_user: Dict[str, Any] = Depends(get_c
 # -------------------------------------------------------------
 @router.get("/outreach/hot-leads")
 def get_hot_leads(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Returns detected Hot Leads for this tenant."""
+    """Returns detected Hot Leads strictly scoped for this user."""
     listener = get_reply_listener()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
-    return listener.get_hot_lead_alerts(operator_id=target_op)
+    target_op = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
+    is_admin = current_user.get("role") == "admin"
+    return listener.get_hot_lead_alerts(operator_id=target_op, owner_username=owner_u, is_admin=is_admin)
 
 
 @router.post("/outreach/send-hot-reply")
@@ -1323,12 +1362,13 @@ def send_hot_reply(req: DispatchHotReplyRequest, current_user: Dict[str, Any] = 
 
     db = get_db_engine()
     rotator = get_inbox_rotator()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    target_op = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
 
     # Retrieve live mailbox credentials dynamically from database at execution time
     with db.get_connection() as conn:
         mb_row = None
-        mb_avail = rotator.get_next_available_mailbox(operator_id=target_op)
+        mb_avail = rotator.get_next_available_mailbox(operator_id=target_op, owner_username=owner_u)
         if mb_avail:
             mb_row = conn.execute("""
                 SELECT id, email_address, display_name, domain, daily_limit, sent_today,
@@ -1470,13 +1510,15 @@ def simulate_inbound_reply(req: SimulateReplyRequest, current_user: Dict[str, An
     and runs bounce suppression or hot lead alerts.
     """
     listener = get_reply_listener()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
+    target_op = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     return listener.process_incoming_reply(
         sender_email=req.sender_email,
         subject=req.subject,
         body=req.body,
         company_name=req.company_name,
-        operator_id=target_op
+        operator_id=target_op,
+        owner_username=owner_u
     )
 
 
@@ -1488,8 +1530,9 @@ def sync_inbound_replies(current_user: Dict[str, Any] = Depends(get_current_user
     transitions matched leads to 'REPLIED', and returns count of newly detected replies.
     """
     listener = get_reply_listener()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
-    res = listener.poll_enrolled_inboxes(operator_id=target_op)
+    target_op = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
+    res = listener.poll_enrolled_inboxes(operator_id=target_op, owner_username=owner_u)
     new_count = res.get("new_replies_count", 0)
     return {
         "success": True,
@@ -1507,46 +1550,60 @@ def poll_imap_inboxes(current_user: Dict[str, Any] = Depends(get_current_user)):
     Monitors enrolled IMAP inboxes for bounces and responses.
     """
     listener = get_reply_listener()
-    target_op = current_user["id"] if current_user.get("role") == "operator" else None
-    return listener.poll_enrolled_inboxes(operator_id=target_op)
+    target_op = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
+    return listener.poll_enrolled_inboxes(operator_id=target_op, owner_username=owner_u)
 
 
 # -------------------------------------------------------------
 # 11. DELIVERABILITY ANALYTICS DASHBOARD
 # -------------------------------------------------------------
 @router.get("/analytics/deliverability")
-def get_deliverability_analytics(current_user: Dict[str, Any] = Depends(get_current_user)):
+def get_deliverability_analytics(
+    operator_id: Optional[str] = None,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
     """
     Visual metric indicators tracking:
     Open Rates %, Bounce Rates %, Conversion Rates %, Sent, Delivered, and Suppressed.
+    Strictly scoped per user workspace.
     """
     db = get_db_engine()
-    op_id = current_user["id"] if current_user.get("role") == "operator" else None
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
+    is_admin = current_user.get("role") == "admin"
 
     with db.get_connection() as conn:
-        q_filter = "WHERE operator_id = ?" if op_id else ""
-        q_params = [op_id] if op_id else []
+        if is_admin and operator_id:
+            q_filter = "WHERE (operator_id = ? OR lower(owner_username) = ?)"
+            q_params = [operator_id, operator_id.lower()]
+        elif is_admin:
+            q_filter = "WHERE (lower(owner_username) = ? OR operator_id = ? OR owner_username = '' OR owner_username IS NULL)"
+            q_params = [owner_u, op_id]
+        else:
+            q_filter = "WHERE (lower(owner_username) = ? OR operator_id = ?)"
+            q_params = [owner_u, op_id]
 
         total_sent = conn.execute(f"""
             SELECT count(*) FROM outreach_queue
-            {q_filter} {'AND' if q_filter else 'WHERE'} (
+            {q_filter} AND (
                 dispatched_at IS NOT NULL
-                OR lower(status) IN ('sent', 'dispatched', 'replied', 'hot_lead', 'suppressed', 'blacklisted')
+                OR lower(status) IN ('sent', 'dispatched', 'replied', 'hot_lead', 'suppressed', 'blacklisted', 'closed')
             )
         """, q_params).fetchone()[0]
-        total_opened = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} opened_at IS NOT NULL", q_params).fetchone()[0]
-        total_bounced = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} (status = 'BOUNCED' OR bounced_at IS NOT NULL)", q_params).fetchone()[0]
+        total_opened = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND opened_at IS NOT NULL", q_params).fetchone()[0]
+        total_bounced = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND (status = 'BOUNCED' OR bounced_at IS NOT NULL)", q_params).fetchone()[0]
         
-        queue_replied = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status IN ('REPLIED', 'HOT_LEAD', 'CLOSED')", q_params).fetchone()[0]
+        queue_replied = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND status IN ('REPLIED', 'HOT_LEAD', 'CLOSED')", q_params).fetchone()[0]
         inbox_replied = conn.execute(f"SELECT count(DISTINCT lower(sender_email)) FROM inbox_replies {q_filter}", q_params).fetchone()[0]
         total_replied = max(queue_replied, inbox_replied)
 
-        queue_hot = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status IN ('HOT_LEAD', 'CLOSED')", q_params).fetchone()[0]
-        inbox_hot = conn.execute(f"SELECT count(DISTINCT lower(sender_email)) FROM inbox_replies {q_filter} {'AND' if q_filter else 'WHERE'} is_hot_lead = 1", q_params).fetchone()[0]
+        queue_hot = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND status IN ('HOT_LEAD', 'CLOSED')", q_params).fetchone()[0]
+        inbox_hot = conn.execute(f"SELECT count(DISTINCT lower(sender_email)) FROM inbox_replies {q_filter} AND is_hot_lead = 1", q_params).fetchone()[0]
         total_hot = max(queue_hot, inbox_hot)
 
-        total_queued = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} {'AND' if q_filter else 'WHERE'} status = 'PENDING_APPROVAL'", q_params).fetchone()[0]
-        total_suppressed = conn.execute("SELECT count(*) FROM suppressed_entities").fetchone()[0]
+        total_queued = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND status = 'PENDING_APPROVAL'", q_params).fetchone()[0]
+        total_suppressed = conn.execute(f"SELECT count(*) FROM suppressed_entities {q_filter}", q_params).fetchone()[0]
 
     delivered = max(0, total_sent - total_bounced)
     open_rate = min(100.0, max(0.0, round((min(total_opened, delivered) / delivered) * 100.0, 1))) if delivered > 0 else 0.0
@@ -1836,6 +1893,7 @@ async def _run_scrape_job(
     job_id: str,
     req: "ScrapeRequest",
     op_id: str,
+    owner_username: Optional[str] = None,
 ) -> None:
     """
     Async background worker that runs the full Hunt & Verify pipeline.
@@ -1863,30 +1921,34 @@ async def _run_scrape_job(
         region = country_prof.region or "Global"
 
     limit = max(1, min(req.max_results or 20, 100))
+    owner = (owner_username or "").strip().lower()
+    op_id = (op_id or "").strip()
 
     logger.info(
         f"[HUNT:{job_id}] Launching scrape pipeline: region='{region}', country='{country}', "
-        f"city='{city_override}', niche='{niche}', limit={limit}, operator='{op_id}'"
+        f"city='{city_override}', niche='{niche}', limit={limit}, operator='{op_id}', owner='{owner}'"
     )
     print(
         f"[HUNT:{job_id}] ▶ START — region='{region}' country='{country}' city='{city_override}' "
-        f"niche='{niche}' limit={limit} operator='{op_id}'",
+        f"niche='{niche}' limit={limit} operator='{op_id}' owner='{owner}'",
         flush=True,
     )
 
-    # ── Pre-load known domains for zero-dup discovery exclusion ─────────────
+    # ── Pre-load known domains for zero-dup discovery exclusion (scoped strictly to current user) ─────────────
     _existing_domains: set = set()
     try:
         with db.get_connection() as _pre_conn:
-            _d_rows = _pre_conn.execute(
-                "SELECT normalized_key FROM dedup_registry WHERE entity_type='domain'"
-            ).fetchall()
+            _d_rows = _pre_conn.execute("""
+                SELECT normalized_key FROM dedup_registry
+                WHERE entity_type='domain' AND (lower(owner_username) = ? OR operator_id = ?)
+            """, (owner, op_id)).fetchall()
             _existing_domains = {r[0].strip().lower() for r in _d_rows if r[0]}
-            _q_rows = _pre_conn.execute(
-                "SELECT DISTINCT lower(substr(recipient, instr(recipient,'@')+1)) FROM outreach_queue WHERE status != 'BOUNCED'"
-            ).fetchall()
+            _q_rows = _pre_conn.execute("""
+                SELECT DISTINCT lower(substr(recipient, instr(recipient,'@')+1)) FROM outreach_queue
+                WHERE status != 'BOUNCED' AND (lower(owner_username) = ? OR operator_id = ?)
+            """, (owner, op_id)).fetchall()
             _existing_domains.update(r[0] for r in _q_rows if r[0])
-        logger.info(f"[HUNT:{job_id}] Pre-loaded {len(_existing_domains)} known domains for dedup exclusion.")
+        logger.info(f"[HUNT:{job_id}] Pre-loaded {len(_existing_domains)} known domains for user '{owner}' dedup exclusion.")
     except Exception as _pre_e:
         logger.warning(f"[HUNT:{job_id}] Pre-load dedup error: {_pre_e}")
 
@@ -1951,26 +2013,20 @@ async def _run_scrape_job(
                     rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "BLACKLIST_BLOCKED", "details": bl_reason})
                 return
 
-            if reply_listener.is_suppressed(domain_part):
+            if reply_listener.is_suppressed(domain_part, operator_id=op_id):
                 async with db_lock:
                     rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "SUPPRESSION_BLOCKED", "details": "Domain in suppression list"})
                 return
 
             try:
                 with db.get_connection() as _dedup_conn:
-                    _hist_seen, _hist_reason = is_historically_seen(domain_part, "", _dedup_conn)
+                    _hist_seen, _hist_reason = is_historically_seen(domain_part, "", _dedup_conn, owner_username=owner, operator_id=op_id)
                 if _hist_seen:
                     async with db_lock:
                         rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "HISTORICAL_DUPLICATE", "details": _hist_reason})
                     return
             except Exception as _dedup_err:
                 logger.debug(f"[HUNT:{job_id}] Dedup check error: {_dedup_err}")
-
-            mx_result = verify_mx_record(domain_part, timeout=5)
-            if not mx_result.get("deliverable", True):
-                async with db_lock:
-                    rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "NO_MX_RECORD", "details": mx_result.get("error", "No MX record")})
-                return
 
             async with crawl_sem:
                 if _cancelled() or len(verified_leads) >= limit:
@@ -1989,50 +2045,97 @@ async def _run_scrape_job(
                     return
 
                 total_emails_extracted += len(lead.all_emails)
-                lead_summary = {
-                    "id": lead.id or f"{lead.domain}_{lead.primary_email}",
-                    "domain": lead.domain,
-                    "company_name": lead.company_name,
-                    "primary_email": lead.primary_email,
-                    "email_tier": lead.primary_email_tier.value,
-                    "quality_tag": lead.quality_tag,
-                    "priority_score": lead.priority_score,
-                    "tech_stack": lead.tech_stack.raw_technologies
-                }
-                scraped_leads_summary.append(lead_summary)
 
-                pres = orchestrator.process_and_preserve_lead(lead, operator_id=op_id)
-                if pres["success"]:
-                    q_res = gate.queue_outreach(
-                        lead_id=pres["lead_id"],
-                        company_name=pres["company_name"],
-                        recipient=pres["primary_email"],
-                        country=country, niche=niche, channel="EMAIL",
-                        tech_stack=pres.get("tech_stack"),
-                        operator_id=op_id, city=city_override
-                    )
-                    if q_res.get("queue_id"):
-                        verified_leads.append(pres)
-                        print(f"[HUNT:{job_id}] ✓ VERIFIED #{len(verified_leads)}/{limit} — {lead.domain} <{lead.primary_email}>", flush=True)
-                        try:
-                            with db.get_connection() as _reg_conn:
-                                register_domain_seen(lead.domain, lead.primary_email, pres.get("lead_id"), _reg_conn)
-                        except Exception:
-                            pass
-                        _existing_domains.add(lead.domain.lower())
+                # Multi-Email Extraction: Queue up to 3 distinct valid emails per organization
+                candidate_emails = lead.all_emails[:3]
+                saved_any_for_company = False
+
+                for scraped_em in candidate_emails:
+                    if _cancelled() or len(verified_leads) >= limit:
+                        break
+
+                    target_email = (scraped_em.email or "").strip().lower()
+                    if not target_email or "@" not in target_email:
+                        continue
+
+                    em_domain = target_email.split("@")[-1]
+
+                    # MX verification on the target email domain
+                    mx_result = verify_mx_record(em_domain, timeout=4)
+                    if not mx_result.get("deliverable", True):
+                        rejected_leads.append({
+                            "domain": domain_part, "email": target_email,
+                            "reason": "NO_MX_RECORD", "details": mx_result.get("error", "No MX record")
+                        })
+                        continue
+
+                    # Check if this specific email is already queued for this user
+                    with db.get_connection() as _check_c:
+                        is_seen_em, _ = is_historically_seen("", target_email, _check_c, owner_username=owner, operator_id=op_id)
+                    if is_seen_em:
+                        rejected_leads.append({
+                            "domain": domain_part, "email": target_email,
+                            "reason": "HISTORICAL_DUPLICATE", "details": "Email already seen in user workspace"
+                        })
+                        continue
+
+                    # Clone lead specific to this email contact
+                    contact_lead = lead.model_copy(deep=True)
+                    contact_lead.primary_email = target_email
+                    contact_lead.primary_email_tier = scraped_em.tier
+                    contact_lead.priority_score = max(scraped_em.priority_score, lead.priority_score)
+
+                    lead_summary = {
+                        "id": contact_lead.id or f"{contact_lead.domain}_{target_email}",
+                        "domain": contact_lead.domain,
+                        "company_name": contact_lead.company_name,
+                        "primary_email": target_email,
+                        "email_tier": contact_lead.primary_email_tier.value,
+                        "quality_tag": contact_lead.quality_tag,
+                        "priority_score": contact_lead.priority_score,
+                        "tech_stack": contact_lead.tech_stack.raw_technologies
+                    }
+                    scraped_leads_summary.append(lead_summary)
+
+                    pres = orchestrator.process_and_preserve_lead(contact_lead, operator_id=op_id, owner_username=owner)
+                    if pres.get("success"):
+                        q_res = gate.queue_outreach(
+                            lead_id=pres["lead_id"],
+                            company_name=pres["company_name"],
+                            recipient=target_email,
+                            country=country,
+                            niche=niche,
+                            channel="EMAIL",
+                            tech_stack=pres.get("tech_stack"),
+                            operator_id=op_id,
+                            owner_username=owner,
+                            city=city_override
+                        )
+                        if q_res.get("queue_id"):
+                            verified_leads.append(pres)
+                            saved_any_for_company = True
+                            print(f"[HUNT:{job_id}] ✓ VERIFIED #{len(verified_leads)}/{limit} — {lead.domain} <{target_email}> ({scraped_em.tier.value})", flush=True)
+                            try:
+                                with db.get_connection() as _reg_conn:
+                                    register_domain_seen(lead.domain, target_email, pres.get("lead_id"), _reg_conn, owner_username=owner)
+                            except Exception:
+                                pass
+                        else:
+                            rejected_leads.append({
+                                "domain": lead.domain, "email": target_email,
+                                "reason": q_res.get("status", "GATE_REJECTED"),
+                                "diagnostic": q_res.get("reason", "Lead blocked by Deduplication Guard"),
+                                "status": q_res.get("status", "DUPLICATE")
+                            })
                     else:
                         rejected_leads.append({
-                            "domain": lead.domain, "email": lead.primary_email,
-                            "reason": q_res.get("status", "GATE_REJECTED"),
-                            "diagnostic": q_res.get("reason", "Lead blocked by Deduplication Guard"),
-                            "status": q_res.get("status", "DUPLICATE")
+                            "domain": lead.domain, "email": target_email,
+                            "reason": pres.get("reason"), "diagnostic": pres.get("diagnostic"),
+                            "status": pres.get("status")
                         })
-                else:
-                    rejected_leads.append({
-                        "domain": lead.domain, "email": lead.primary_email,
-                        "reason": pres.get("reason"), "diagnostic": pres.get("diagnostic"),
-                        "status": pres.get("status")
-                    })
+
+                if saved_any_for_company:
+                    _existing_domains.add(lead.domain.lower())
 
                 _update_job(job_id, progress={
                     "scraped_raw": len(scraped_leads_summary),
@@ -2122,8 +2225,21 @@ async def _run_scrape_job(
                     break
 
         if _cancelled():
-            logger.info(f"[HUNT:{job_id}] Cancelled by operator — stopping crawl cleanly.")
-            _update_job(job_id, status="CANCELLED", completed_at=datetime.now(timezone.utc).isoformat())
+            logger.info(f"[HUNT:{job_id}] Cancelled by operator — stopping crawl cleanly and preserving {len(verified_leads)} leads.")
+            cancelled_result = {
+                "status": "CANCELLED",
+                "target": {"country": country, "niche": niche, "city": city_override, "region": region},
+                "scraped_count": len(scraped_leads_summary),
+                "verified_count": len(verified_leads),
+                "leads_preserved_count": len(verified_leads),
+                "leads_rejected_count": len(rejected_leads),
+                "scraped_leads": scraped_leads_summary,
+                "verified_leads": verified_leads,
+                "rejected_leads": rejected_leads,
+                "processed_leads": verified_leads,
+                "message": f"Hunt stopped by operator. {len(verified_leads)} verified leads preserved in pipeline."
+            }
+            _update_job(job_id, status="CANCELLED", completed_at=datetime.now(timezone.utc).isoformat(), result=cancelled_result)
             return
 
         # Final audit logging
@@ -2209,9 +2325,10 @@ async def launch_scrape_pipeline(
     Zero-Seed Policy: NO fake or synthetic companies are generated.
     """
     op_id = current_user["id"]
+    owner_username = (current_user.get("username") or "").strip().lower()
     job_id = str(uuid.uuid4())
     _register_job(job_id, op_id)
-    background_tasks.add_task(_run_scrape_job, job_id, req, op_id)
+    background_tasks.add_task(_run_scrape_job, job_id, req, op_id, owner_username)
     return {
         "status": "STARTED",
         "job_id": job_id,
@@ -2228,9 +2345,10 @@ def run_full_pipeline_run(sample_targets: Optional[List[Dict[str, str]]] = None,
     """
     orchestrator = NexusPulseOrchestrator()
     op_id = current_user["id"]
+    owner_username = (current_user.get("username") or "").strip().lower()
     targets = sample_targets or []
 
-    pipeline_res = orchestrator.execute_targeted_pipeline(sample_targets=targets, operator_id=op_id)
+    pipeline_res = orchestrator.execute_targeted_pipeline(sample_targets=targets, operator_id=op_id, owner_username=owner_username)
 
     # Queue preserved leads into Human Approval Gate
     gate = get_approval_gate()
@@ -2244,7 +2362,8 @@ def run_full_pipeline_run(sample_targets: Optional[List[Dict[str, str]]] = None,
             niche=pipeline_res["target"]["niche"],
             channel="EMAIL",
             tech_stack=lead_info.get("tech_stack"),
-            operator_id=op_id
+            operator_id=op_id,
+            owner_username=owner_username
         )
         queued_in_gate.append(q_item)
 
@@ -2320,8 +2439,9 @@ def update_runtime_config(req: ConfigUpdateRequest, current_user: Dict[str, Any]
 @router.post("/vault/backup")
 def trigger_snapshot_backup(current_user: Dict[str, Any] = Depends(get_current_user)):
     vault = get_vault_manager()
-    op_id = current_user["id"] if current_user.get("role") == "operator" else None
-    return vault.export_global_snapshot_backups(operator_id=op_id)
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
+    return vault.export_global_snapshot_backups(operator_id=op_id, owner_username=owner_u)
 
 
 @router.get("/backup")
@@ -2337,8 +2457,9 @@ def trigger_snapshot_backup(current_user: Dict[str, Any] = Depends(get_current_u
 def backup_and_download(format: Optional[str] = "json", current_user: Dict[str, Any] = Depends(get_current_user)):
     """Exports and downloads vault snapshots directly."""
     vault = get_vault_manager()
-    op_id = current_user["id"] if current_user.get("role") == "operator" else None
-    result = vault.export_global_snapshot_backups(operator_id=op_id)
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
+    result = vault.export_global_snapshot_backups(operator_id=op_id, owner_username=owner_u)
 
     fmt = (format or "json").lower().strip()
     if fmt == "csv":

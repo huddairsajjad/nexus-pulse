@@ -31,29 +31,35 @@ class InboxRotator:
             WHERE last_reset_date != ?
         """, (today_str, today_str))
 
-    def get_next_available_mailbox(self, operator_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def get_next_available_mailbox(
+        self,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         Auto-switching load balancer:
         Selects the next active mailbox that has not exceeded its daily cap (e.g., 40-50).
         Automatically transitions to the next available SMTP profile once an inbox hits its cap,
         preventing workflow interruption.
-        Supports multi-tenant operator isolation.
+        Supports strict multi-tenant operator and user isolation.
         """
         with self.db.get_connection() as conn:
             self._reset_quotas_if_new_day(conn)
 
             query = """
                 SELECT id, email_address, display_name, domain, daily_limit, sent_today,
-                       operator_id, smtp_host, smtp_port, smtp_username, smtp_password,
+                       operator_id, owner_username, smtp_host, smtp_port, smtp_username, smtp_password,
                        imap_host, imap_port, imap_username, imap_password,
                        COALESCE(webhook_url, '') as webhook_url
                 FROM mailbox_rotator
                 WHERE is_active = 1 AND sent_today < daily_limit
             """
             params: List[Any] = []
-            if operator_id:
-                query += " AND (operator_id = ? OR operator_id IS NULL OR operator_id = '')"
-                params.append(operator_id)
+            owner = (owner_username or "").strip().lower()
+            op_id = (operator_id or "").strip()
+            if owner or op_id:
+                query += " AND (lower(owner_username) = ? OR operator_id = ?)"
+                params.extend([owner, op_id])
 
             query += " ORDER BY sent_today ASC, email_address ASC LIMIT 1"
             row = conn.execute(query, params).fetchone()
@@ -72,10 +78,14 @@ class InboxRotator:
             """, (mailbox_id_or_email, mailbox_id_or_email))
             conn.commit()
 
-    def get_all_mailboxes_status(self, operator_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    def get_all_mailboxes_status(
+        self,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
         """
         Returns live statistics across enrolled sending inboxes.
-        Filters by operator_id for paying clients, or returns all for super admins.
+        Strictly filters by owner_username / operator_id for total multi-tenant isolation.
         """
         with self.db.get_connection() as conn:
             self._reset_quotas_if_new_day(conn)
@@ -83,7 +93,7 @@ class InboxRotator:
             query = """
                 SELECT id, email_address, display_name, domain, daily_limit, sent_today,
                        (daily_limit - sent_today) as remaining_quota, is_active,
-                       operator_id,
+                       operator_id, owner_username,
                        COALESCE(smtp_host, '') as smtp_host,
                        COALESCE(smtp_port, 587) as smtp_port,
                        COALESCE(smtp_username, '') as smtp_username,
@@ -96,9 +106,11 @@ class InboxRotator:
                 FROM mailbox_rotator
             """
             params: List[Any] = []
-            if operator_id:
-                query += " WHERE operator_id = ? OR operator_id IS NULL OR operator_id = ''"
-                params.append(operator_id)
+            owner = (owner_username or "").strip().lower()
+            op_id = (operator_id or "").strip()
+            if owner or op_id:
+                query += " WHERE (lower(owner_username) = ? OR operator_id = ?)"
+                params.extend([owner, op_id])
 
             query += " ORDER BY domain ASC, email_address ASC"
             rows = conn.execute(query, params).fetchall()
@@ -111,6 +123,7 @@ class InboxRotator:
         domain: Optional[str] = None,
         daily_limit: int = 45,
         operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None,
         smtp_host: str = "",
         smtp_port: int = 587,
         smtp_username: str = "",
@@ -121,7 +134,7 @@ class InboxRotator:
         imap_password: str = "",
         webhook_url: str = ""
     ) -> Dict[str, Any]:
-        """Enrolls a new SMTP/IMAP mailbox profile bound to an operator."""
+        """Enrolls a new SMTP/IMAP mailbox profile bound to an operator and owner_username."""
         email = email_address.strip().lower()
         if not email or "@" not in email:
             raise ValueError("Valid email address is required.")
@@ -129,6 +142,7 @@ class InboxRotator:
         dom = (domain or email.split("@")[-1]).strip().lower()
         mb_id = str(uuid.uuid4())
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        owner = (owner_username or "").strip()
 
         with self.db.get_connection() as conn:
             existing = conn.execute("SELECT id FROM mailbox_rotator WHERE lower(email_address) = ?", (email,)).fetchone()
@@ -138,14 +152,14 @@ class InboxRotator:
             conn.execute("""
                 INSERT INTO mailbox_rotator (
                     id, email_address, display_name, domain, daily_limit, sent_today,
-                    last_reset_date, is_active, operator_id,
+                    last_reset_date, is_active, operator_id, owner_username,
                     smtp_host, smtp_port, smtp_username, smtp_password,
                     imap_host, imap_port, imap_username, imap_password,
                     webhook_url
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 mb_id, email, display_name.strip(), dom, daily_limit, today_str,
-                operator_id,
+                operator_id, owner,
                 smtp_host.strip(), smtp_port, smtp_username.strip(), smtp_password,
                 imap_host.strip(), imap_port, imap_username.strip(), imap_password,
                 webhook_url.strip()
@@ -159,6 +173,7 @@ class InboxRotator:
             "domain": dom,
             "daily_limit": daily_limit,
             "operator_id": operator_id,
+            "owner_username": owner,
             "webhook_url": webhook_url.strip()
         }
 

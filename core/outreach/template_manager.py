@@ -23,20 +23,50 @@ class TemplateManager:
     def __init__(self):
         self.db = get_db_engine()
 
-    def get_templates(self, operator_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Lists custom templates for an operator or all for admin."""
+    def get_templates(
+        self,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Lists custom templates for an operator/user or global templates."""
+        owner = (owner_username or "").strip().lower()
+        if not owner and operator_id:
+            try:
+                with self.db.get_connection() as u_conn:
+                    u_row = u_conn.execute("SELECT username FROM users WHERE id = ?", (operator_id,)).fetchone()
+                    if u_row and u_row[0]:
+                        owner = u_row[0].strip().lower()
+            except Exception:
+                pass
+        op_id = (operator_id or "").strip()
         with self.db.get_connection() as conn:
-            if operator_id:
+            if owner and op_id:
                 rows = conn.execute("""
-                    SELECT id, operator_id, title, niche, subject_template, body_template,
+                    SELECT id, operator_id, owner_username, title, niche, subject_template, body_template,
                            is_default, created_at, updated_at
                     FROM service_templates
-                    WHERE operator_id = ? OR operator_id = 'global'
+                    WHERE (lower(owner_username) = ? OR operator_id = ? OR operator_id = 'global')
                     ORDER BY is_default DESC, title ASC
-                """, (operator_id,)).fetchall()
+                """, (owner, op_id)).fetchall()
+            elif owner:
+                rows = conn.execute("""
+                    SELECT id, operator_id, owner_username, title, niche, subject_template, body_template,
+                           is_default, created_at, updated_at
+                    FROM service_templates
+                    WHERE (lower(owner_username) = ? OR operator_id = 'global')
+                    ORDER BY is_default DESC, title ASC
+                """, (owner,)).fetchall()
+            elif op_id:
+                rows = conn.execute("""
+                    SELECT id, operator_id, owner_username, title, niche, subject_template, body_template,
+                           is_default, created_at, updated_at
+                    FROM service_templates
+                    WHERE (operator_id = ? OR operator_id = 'global')
+                    ORDER BY is_default DESC, title ASC
+                """, (op_id,)).fetchall()
             else:
                 rows = conn.execute("""
-                    SELECT id, operator_id, title, niche, subject_template, body_template,
+                    SELECT id, operator_id, owner_username, title, niche, subject_template, body_template,
                            is_default, created_at, updated_at
                     FROM service_templates
                     ORDER BY operator_id ASC, is_default DESC, title ASC
@@ -47,7 +77,7 @@ class TemplateManager:
         """Retrieves a single template by ID."""
         with self.db.get_connection() as conn:
             row = conn.execute("""
-                SELECT id, operator_id, title, niche, subject_template, body_template,
+                SELECT id, operator_id, owner_username, title, niche, subject_template, body_template,
                        is_default, created_at, updated_at
                 FROM service_templates
                 WHERE id = ?
@@ -61,13 +91,23 @@ class TemplateManager:
         niche: str,
         subject_template: str,
         body_template: str,
-        is_default: bool = False
+        is_default: bool = False,
+        owner_username: Optional[str] = None
     ) -> Dict[str, Any]:
         """Creates a custom service proposal template."""
         clean_title = title.strip()
         clean_niche = niche.strip()
         clean_subj = subject_template.strip()
         clean_body = body_template.strip()
+        owner = (owner_username or "").strip().lower()
+        if not owner and operator_id:
+            try:
+                with self.db.get_connection() as u_conn:
+                    u_row = u_conn.execute("SELECT username FROM users WHERE id = ?", (operator_id,)).fetchone()
+                    if u_row and u_row[0]:
+                        owner = u_row[0].strip().lower()
+            except Exception:
+                pass
 
         if not clean_title or not clean_subj or not clean_body:
             raise ValueError("Title, subject template, and body template are required.")
@@ -77,19 +117,26 @@ class TemplateManager:
 
         with self.db.get_connection() as conn:
             if is_default:
-                conn.execute("""
-                    UPDATE service_templates
-                    SET is_default = 0
-                    WHERE operator_id = ?
-                """, (operator_id,))
+                if owner:
+                    conn.execute("""
+                        UPDATE service_templates
+                        SET is_default = 0
+                        WHERE lower(owner_username) = ? OR operator_id = ?
+                    """, (owner, operator_id))
+                else:
+                    conn.execute("""
+                        UPDATE service_templates
+                        SET is_default = 0
+                        WHERE operator_id = ?
+                    """, (operator_id,))
 
             conn.execute("""
                 INSERT INTO service_templates (
-                    id, operator_id, title, niche, subject_template, body_template,
+                    id, operator_id, owner_username, title, niche, subject_template, body_template,
                     is_default, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                t_id, operator_id, clean_title, clean_niche, clean_subj, clean_body,
+                t_id, operator_id, owner, clean_title, clean_niche, clean_subj, clean_body,
                 1 if is_default else 0, now_str, now_str
             ))
             conn.commit()
@@ -97,6 +144,7 @@ class TemplateManager:
         return {
             "id": t_id,
             "operator_id": operator_id,
+            "owner_username": owner,
             "title": clean_title,
             "niche": clean_niche,
             "subject_template": clean_subj,
@@ -113,16 +161,31 @@ class TemplateManager:
         niche: Optional[str] = None,
         subject_template: Optional[str] = None,
         body_template: Optional[str] = None,
-        is_default: Optional[bool] = None
+        is_default: Optional[bool] = None,
+        owner_username: Optional[str] = None
     ) -> Dict[str, Any]:
         """Updates an existing proposal template."""
+        owner = (owner_username or "").strip().lower()
+        if not owner and operator_id:
+            try:
+                with self.db.get_connection() as u_conn:
+                    u_row = u_conn.execute("SELECT username FROM users WHERE id = ?", (operator_id,)).fetchone()
+                    if u_row and u_row[0]:
+                        owner = u_row[0].strip().lower()
+            except Exception:
+                pass
         with self.db.get_connection() as conn:
-            existing = conn.execute("SELECT id, operator_id FROM service_templates WHERE id = ?", (template_id,)).fetchone()
+            existing = conn.execute("SELECT id, operator_id, owner_username FROM service_templates WHERE id = ?", (template_id,)).fetchone()
             if not existing:
                 raise ValueError("Template not found.")
 
-            if operator_id and existing["operator_id"] != operator_id and operator_id != "admin":
-                raise PermissionError("Unauthorized to modify this template.")
+            ex_owner = (existing["owner_username"] or "").strip().lower()
+            ex_op = (existing["operator_id"] or "").strip()
+            if operator_id != "admin":
+                if owner and ex_owner and ex_owner != owner:
+                    raise PermissionError("Unauthorized to modify this template.")
+                elif operator_id and ex_op and ex_op != operator_id:
+                    raise PermissionError("Unauthorized to modify this template.")
 
             fields = []
             values = []
@@ -136,7 +199,10 @@ class TemplateManager:
                 fields.append("body_template = ?"); values.append(body_template.strip())
             if is_default is not None:
                 if is_default:
-                    conn.execute("UPDATE service_templates SET is_default = 0 WHERE operator_id = ?", (existing["operator_id"],))
+                    if owner:
+                        conn.execute("UPDATE service_templates SET is_default = 0 WHERE lower(owner_username) = ? OR operator_id = ?", (owner, existing["operator_id"]))
+                    else:
+                        conn.execute("UPDATE service_templates SET is_default = 0 WHERE operator_id = ?", (existing["operator_id"],))
                 fields.append("is_default = ?"); values.append(1 if is_default else 0)
 
             now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -148,14 +214,33 @@ class TemplateManager:
 
         return {"id": template_id, "updated": True}
 
-    def delete_template(self, template_id: str, operator_id: Optional[str] = None) -> bool:
+    def delete_template(
+        self,
+        template_id: str,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None
+    ) -> bool:
         """Deletes a custom template."""
+        owner = (owner_username or "").strip().lower()
+        if not owner and operator_id:
+            try:
+                with self.db.get_connection() as u_conn:
+                    u_row = u_conn.execute("SELECT username FROM users WHERE id = ?", (operator_id,)).fetchone()
+                    if u_row and u_row[0]:
+                        owner = u_row[0].strip().lower()
+            except Exception:
+                pass
         with self.db.get_connection() as conn:
-            existing = conn.execute("SELECT id, operator_id FROM service_templates WHERE id = ?", (template_id,)).fetchone()
+            existing = conn.execute("SELECT id, operator_id, owner_username FROM service_templates WHERE id = ?", (template_id,)).fetchone()
             if not existing:
                 return False
-            if operator_id and existing["operator_id"] != operator_id and operator_id != "admin":
-                raise PermissionError("Unauthorized to delete this template.")
+            ex_owner = (existing["owner_username"] or "").strip().lower()
+            ex_op = (existing["operator_id"] or "").strip()
+            if operator_id != "admin":
+                if owner and ex_owner and ex_owner != owner:
+                    raise PermissionError("Unauthorized to delete this template.")
+                elif operator_id and ex_op and ex_op != operator_id:
+                    raise PermissionError("Unauthorized to delete this template.")
             conn.execute("DELETE FROM service_templates WHERE id = ?", (template_id,))
             conn.commit()
             return True

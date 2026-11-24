@@ -298,7 +298,8 @@ class IMAPReplyListener:
         clean: str,
         entity_type: str,
         reason: str,
-        operator_id: Optional[str]
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None
     ) -> None:
         # Never store or suppress root public email provider domains (e.g. gmail.com)
         if "@" not in clean and clean in PUBLIC_EMAIL_DOMAINS:
@@ -306,18 +307,19 @@ class IMAPReplyListener:
 
         domain = clean.split("@")[-1] if "@" in clean else clean
         is_pub = is_public_email_domain(domain)
+        owner = (owner_username or "").strip().lower()
 
         # 1. Insert into suppressed_entities
         conn.execute("""
-            INSERT OR IGNORE INTO suppressed_entities (entity, entity_type, reason, operator_id)
-            VALUES (?, ?, ?, ?)
-        """, (clean, entity_type, reason, operator_id))
+            INSERT OR IGNORE INTO suppressed_entities (entity, entity_type, reason, operator_id, owner_username)
+            VALUES (?, ?, ?, ?, ?)
+        """, (clean, entity_type, reason, operator_id, owner))
 
         # 2. Maintain dnc_blacklist for backwards compatibility
         conn.execute("""
-            INSERT OR IGNORE INTO dnc_blacklist (entity, entity_type, reason)
-            VALUES (?, ?, ?)
-        """, (clean, entity_type, reason))
+            INSERT OR IGNORE INTO dnc_blacklist (entity, entity_type, reason, owner_username)
+            VALUES (?, ?, ?, ?)
+        """, (clean, entity_type, reason, owner))
 
         # 3. Update deduplication registry
         conn.execute("""
@@ -361,6 +363,7 @@ class IMAPReplyListener:
         entity: str,
         reason: str = "OPT_OUT",
         operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None,
         conn: Optional[Any] = None
     ) -> None:
         """
@@ -377,10 +380,10 @@ class IMAPReplyListener:
         entity_type = "email" if "@" in clean else "domain"
 
         if conn is not None:
-            self._do_suppress(conn, clean, entity_type, reason, operator_id)
+            self._do_suppress(conn, clean, entity_type, reason, operator_id, owner_username)
         else:
             with self.db.get_connection() as c:
-                self._do_suppress(c, clean, entity_type, reason, operator_id)
+                self._do_suppress(c, clean, entity_type, reason, operator_id, owner_username)
                 c.commit()
 
     def process_incoming_reply(
@@ -393,11 +396,12 @@ class IMAPReplyListener:
         operator_id: Optional[str] = None,
         in_reply_to: Optional[str] = None,
         references: Optional[str] = None,
-        message_id: Optional[str] = None
+        message_id: Optional[str] = None,
+        owner_username: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Processes an incoming response:
-        - Resolves originating lead & queue item via recipient email, In-Reply-To, or Re: subjects.
+        - Resolves originating lead & queue item via recipient email, In-Reply-To, or Re: subjects scoped per workspace.
         - Detects bounces -> flags lead as BOUNCED and suppresses email/domain
         - Detects unsubscribes -> flags as SUPPRESSED and adds to suppressed_entities
         - Detects hot leads -> updates outreach_queue to HOT_LEAD, routes to Hot Leads with 1-click draft
@@ -416,76 +420,99 @@ class IMAPReplyListener:
 
         classification, is_hot = ReplyClassifier.classify(subject, body, clean_sender)
         reply_id = str(uuid.uuid4())
+        owner = (owner_username or "").strip().lower()
+        op_id = (operator_id or "").strip()
 
         with self.db.get_connection() as conn:
             # 1. Multi-vector match against outreach_queue (In-Reply-To, recipient email, or Re: subject)
             matching_q = None
 
+            owner_filter_sql = ""
+            owner_params: List[Any] = []
+            if owner or op_id:
+                owner_filter_sql = " AND (lower(owner_username) = ? OR operator_id = ?)"
+                owner_params = [owner, op_id]
+
             # Vector A: In-Reply-To or References matching tracking_id or message_id
             if in_reply_to:
                 clean_irt = in_reply_to.strip().strip("<>")
-                matching_q = conn.execute("""
+                sql_a = f"""
                     SELECT * FROM outreach_queue
-                    WHERE tracking_id = ?
+                    WHERE (tracking_id = ?
                        OR (message_id IS NOT NULL AND (message_id = ? OR message_id = ?))
-                       OR ? LIKE '%' || tracking_id || '%'
+                       OR ? LIKE '%' || tracking_id || '%')
+                       {owner_filter_sql}
                     ORDER BY created_at DESC LIMIT 1
-                """, (clean_irt, in_reply_to.strip(), f"<{clean_irt}>", in_reply_to)).fetchone()
+                """
+                matching_q = conn.execute(sql_a, [clean_irt, in_reply_to.strip(), f"<{clean_irt}>", in_reply_to] + owner_params).fetchone()
 
             if not matching_q and references:
                 clean_ref = references.strip().strip("<>")
-                matching_q = conn.execute("""
+                sql_ref = f"""
                     SELECT * FROM outreach_queue
-                    WHERE tracking_id = ?
+                    WHERE (tracking_id = ?
                        OR (message_id IS NOT NULL AND message_id LIKE ?)
-                       OR ? LIKE '%' || tracking_id || '%'
+                       OR ? LIKE '%' || tracking_id || '%')
+                       {owner_filter_sql}
                     ORDER BY created_at DESC LIMIT 1
-                """, (clean_ref, f"%{clean_ref}%", references)).fetchone()
+                """
+                matching_q = conn.execute(sql_ref, [clean_ref, f"%{clean_ref}%", references] + owner_params).fetchone()
 
             # Vector B: Recipient email match (case-insensitive)
             if not matching_q and clean_sender:
-                matching_q = conn.execute("""
+                sql_b = f"""
                     SELECT * FROM outreach_queue
                     WHERE lower(recipient) = ?
+                       {owner_filter_sql}
                     ORDER BY created_at DESC LIMIT 1
-                """, (clean_sender,)).fetchone()
+                """
+                matching_q = conn.execute(sql_b, [clean_sender] + owner_params).fetchone()
 
             # Vector C: Normalized Re: subject match
             if not matching_q and clean_subject and len(clean_subject) >= 3:
-                matching_q = conn.execute("""
+                sql_c = f"""
                     SELECT * FROM outreach_queue
-                    WHERE lower(trim(subject)) = lower(?)
+                    WHERE (lower(trim(subject)) = lower(?)
                        OR lower(trim(subject)) LIKE lower(?)
-                       OR lower(?) LIKE '%' || lower(trim(subject)) || '%'
+                       OR lower(?) LIKE '%' || lower(trim(subject)) || '%')
+                       {owner_filter_sql}
                     ORDER BY created_at DESC LIMIT 1
-                """, (clean_subject, f"%{clean_subject}%", clean_subject)).fetchone()
+                """
+                matching_q = conn.execute(sql_c, [clean_subject, f"%{clean_subject}%", clean_subject] + owner_params).fetchone()
 
             # Vector D: Sender email matches a lead's recipient (most recent SENT/DISPATCHED first)
             if not matching_q and clean_sender:
-                matching_q = conn.execute("""
+                sql_d = f"""
                     SELECT * FROM outreach_queue
                     WHERE lower(recipient) = ?
                       AND status IN ('SENT', 'DISPATCHED', 'APPROVED', 'SCHEDULED')
+                      {owner_filter_sql}
                     ORDER BY sent_at DESC, created_at DESC LIMIT 1
-                """, (clean_sender,)).fetchone()
+                """
+                matching_q = conn.execute(sql_d, [clean_sender] + owner_params).fetchone()
 
             # Vector E: Corporate domain fuzzy match (non-public domains only)
             if not matching_q and domain_part and not is_public_email_domain(domain_part):
-                matching_q = conn.execute("""
+                sql_e = f"""
                     SELECT * FROM outreach_queue
                     WHERE lower(recipient) LIKE ?
                       AND status IN ('SENT', 'DISPATCHED', 'APPROVED', 'SCHEDULED')
+                      {owner_filter_sql}
                     ORDER BY sent_at DESC, created_at DESC LIMIT 1
-                """, (f"%@{domain_part}",)).fetchone()
+                """
+                matching_q = conn.execute(sql_e, [f"%@{domain_part}"] + owner_params).fetchone()
 
             if matching_q:
+                matching_q_dict = dict(matching_q)
                 if not lead_id:
-                    lead_id = matching_q["lead_id"]
-                if not company_name and matching_q["company_name"]:
-                    comp = matching_q["company_name"]
-                if not operator_id and matching_q["operator_id"]:
-                    operator_id = matching_q["operator_id"]
-                matching_qid = matching_q["id"]
+                    lead_id = matching_q_dict.get("lead_id")
+                if not company_name and matching_q_dict.get("company_name"):
+                    comp = matching_q_dict["company_name"]
+                if not op_id and matching_q_dict.get("operator_id"):
+                    op_id = matching_q_dict["operator_id"]
+                if not owner and matching_q_dict.get("owner_username"):
+                    owner = matching_q_dict["owner_username"]
+                matching_qid = matching_q_dict.get("id")
             else:
                 matching_qid = None
 
@@ -518,10 +545,10 @@ class IMAPReplyListener:
                     if not any(ign in e.lower() for ign in ("mailer-daemon", "postmaster", "mail-server", clean_sender))
                 ]
                 for br in bounced_recipients:
-                    self.suppress_entity(br, reason="BOUNCE", operator_id=operator_id, conn=conn)
+                    self.suppress_entity(br, reason="BOUNCE", operator_id=op_id, conn=conn)
                     br_dom = br.split("@")[-1] if "@" in br else ""
                     if br_dom and not is_public_email_domain(br_dom):
-                        self.suppress_entity(br_dom, reason="BOUNCE", operator_id=operator_id, conn=conn)
+                        self.suppress_entity(br_dom, reason="BOUNCE", operator_id=op_id, conn=conn)
                     conn.execute("""
                         UPDATE outreach_queue
                         SET status = 'BOUNCED',
@@ -531,9 +558,9 @@ class IMAPReplyListener:
                         WHERE lower(recipient) = ?
                     """, (subject[:100], br))
 
-                self.suppress_entity(clean_sender, reason="BOUNCE", operator_id=operator_id, conn=conn)
+                self.suppress_entity(clean_sender, reason="BOUNCE", operator_id=op_id, conn=conn)
                 if domain_part and not is_public_email_domain(domain_part):
-                    self.suppress_entity(domain_part, reason="BOUNCE", operator_id=operator_id, conn=conn)
+                    self.suppress_entity(domain_part, reason="BOUNCE", operator_id=op_id, conn=conn)
 
                 if matching_qid:
                     conn.execute("""
@@ -542,20 +569,11 @@ class IMAPReplyListener:
                         WHERE id = ?
                     """, (subject[:100], matching_qid))
 
-                conn.execute("""
-                    UPDATE outreach_queue
-                    SET status = 'BOUNCED',
-                        scheduled_for = NULL,
-                        bounced_at = CURRENT_TIMESTAMP,
-                        bounce_reason = ?
-                    WHERE lower(recipient) = ?
-                """, (subject[:100], clean_sender))
-
             # Case 2: UNSUBSCRIBE / OPT-OUT
             elif classification == "UNSUBSCRIBE":
-                self.suppress_entity(clean_sender, reason="UNSUBSCRIBE", operator_id=operator_id, conn=conn)
+                self.suppress_entity(clean_sender, reason="UNSUBSCRIBE", operator_id=op_id, conn=conn)
                 if domain_part and not is_public_email_domain(domain_part):
-                    self.suppress_entity(domain_part, reason="UNSUBSCRIBE", operator_id=operator_id, conn=conn)
+                    self.suppress_entity(domain_part, reason="UNSUBSCRIBE", operator_id=op_id, conn=conn)
 
                 try:
                     existing_bl = conn.execute("SELECT id FROM blacklist_rules WHERE lower(pattern) = ?", (clean_sender,)).fetchone()
@@ -573,12 +591,12 @@ class IMAPReplyListener:
                         SET status = 'SUPPRESSED', scheduled_for = NULL, bounce_reason = 'Suppressed: UNSUBSCRIBE'
                         WHERE id = ?
                     """, (matching_qid,))
-
-                conn.execute("""
-                    UPDATE outreach_queue
-                    SET status = 'SUPPRESSED', scheduled_for = NULL, bounce_reason = 'Suppressed: UNSUBSCRIBE'
-                    WHERE lower(recipient) = ?
-                """, (clean_sender,))
+                elif owner or op_id:
+                    conn.execute("""
+                        UPDATE outreach_queue
+                        SET status = 'SUPPRESSED', scheduled_for = NULL, bounce_reason = 'Suppressed: UNSUBSCRIBE'
+                        WHERE lower(recipient) = ? AND (lower(owner_username) = ? OR operator_id = ?)
+                    """, (clean_sender, owner, op_id))
 
             # Case 3: HOT LEAD
             elif is_hot:
@@ -590,14 +608,14 @@ class IMAPReplyListener:
                             reply_snippet = ?
                         WHERE id = ?
                     """, (snippet, matching_qid))
-
-                conn.execute("""
-                    UPDATE outreach_queue
-                    SET status = 'HOT_LEAD',
-                        replied_at = CURRENT_TIMESTAMP,
-                        reply_snippet = ?
-                    WHERE lower(recipient) = ?
-                """, (snippet, clean_sender))
+                elif owner or op_id:
+                    conn.execute("""
+                        UPDATE outreach_queue
+                        SET status = 'HOT_LEAD',
+                            replied_at = CURRENT_TIMESTAMP,
+                            reply_snippet = ?
+                        WHERE lower(recipient) = ? AND (lower(owner_username) = ? OR operator_id = ?)
+                    """, (snippet, clean_sender, owner, op_id))
 
             # Case 4: NEUTRAL / STANDARD REPLY
             else:
@@ -609,33 +627,57 @@ class IMAPReplyListener:
                             reply_snippet = ?
                         WHERE id = ?
                     """, (snippet, matching_qid))
+                elif owner or op_id:
+                    conn.execute("""
+                        UPDATE outreach_queue
+                        SET status = 'REPLIED',
+                            replied_at = CURRENT_TIMESTAMP,
+                            reply_snippet = ?
+                        WHERE lower(recipient) = ? AND (lower(owner_username) = ? OR operator_id = ?)
+                          AND status IN ('SENT', 'DISPATCHED', 'APPROVED', 'SCHEDULED')
+                    """, (snippet, clean_sender, owner, op_id))
 
-                conn.execute("""
-                    UPDATE outreach_queue
-                    SET status = 'REPLIED',
-                        replied_at = CURRENT_TIMESTAMP,
-                        reply_snippet = ?
-                    WHERE lower(recipient) = ? AND status IN ('SENT', 'DISPATCHED', 'APPROVED', 'SCHEDULED')
-                """, (snippet, clean_sender))
-
-            # Log into inbox_replies — upsert in place to prevent duplicate cards
+            # Log into inbox_replies — upsert in place to prevent duplicate cards per user
             existing_rep = None
             if message_id:
-                existing_rep = conn.execute(
-                    "SELECT id, is_hot_lead, status FROM inbox_replies WHERE message_id = ? LIMIT 1",
-                    (message_id,)
-                ).fetchone()
+                if owner or op_id:
+                    existing_rep = conn.execute("""
+                        SELECT id, is_hot_lead, status FROM inbox_replies
+                        WHERE message_id = ? AND (lower(owner_username) = ? OR operator_id = ?)
+                        LIMIT 1
+                    """, (message_id, owner, op_id)).fetchone()
+                else:
+                    existing_rep = conn.execute(
+                        "SELECT id, is_hot_lead, status FROM inbox_replies WHERE message_id = ? LIMIT 1",
+                        (message_id,)
+                    ).fetchone()
+
             if not existing_rep and lead_id:
-                existing_rep = conn.execute(
-                    "SELECT id, is_hot_lead, status FROM inbox_replies WHERE lead_id = ? ORDER BY received_at DESC LIMIT 1",
-                    (lead_id,)
-                ).fetchone()
+                if owner or op_id:
+                    existing_rep = conn.execute("""
+                        SELECT id, is_hot_lead, status FROM inbox_replies
+                        WHERE lead_id = ? AND (lower(owner_username) = ? OR operator_id = ?)
+                        ORDER BY received_at DESC LIMIT 1
+                    """, (lead_id, owner, op_id)).fetchone()
+                else:
+                    existing_rep = conn.execute(
+                        "SELECT id, is_hot_lead, status FROM inbox_replies WHERE lead_id = ? ORDER BY received_at DESC LIMIT 1",
+                        (lead_id,)
+                    ).fetchone()
+
             if not existing_rep and clean_sender:
-                existing_rep = conn.execute("""
-                    SELECT id, is_hot_lead, status FROM inbox_replies
-                    WHERE lower(sender_email) = ?
-                    ORDER BY received_at DESC LIMIT 1
-                """, (clean_sender,)).fetchone()
+                if owner or op_id:
+                    existing_rep = conn.execute("""
+                        SELECT id, is_hot_lead, status FROM inbox_replies
+                        WHERE lower(sender_email) = ? AND (lower(owner_username) = ? OR operator_id = ?)
+                        ORDER BY received_at DESC LIMIT 1
+                    """, (clean_sender, owner, op_id)).fetchone()
+                else:
+                    existing_rep = conn.execute("""
+                        SELECT id, is_hot_lead, status FROM inbox_replies
+                        WHERE lower(sender_email) = ?
+                        ORDER BY received_at DESC LIMIT 1
+                    """, (clean_sender,)).fetchone()
 
             if existing_rep:
                 reply_id = existing_rep["id"]
@@ -650,13 +692,14 @@ class IMAPReplyListener:
                         ai_suggested_reply = CASE WHEN ? != '' THEN ? ELSE ai_suggested_reply END,
                         received_at = CURRENT_TIMESTAMP,
                         operator_id = COALESCE(?, operator_id),
+                        owner_username = CASE WHEN ? != '' THEN ? ELSE owner_username END,
                         message_id = COALESCE(?, message_id)
                     WHERE id = ?
                 """, (
                     lead_id, comp, subject, body, classification,
                     1 if is_hot else 0,
                     ai_reply, ai_reply,
-                    operator_id, message_id or None,
+                    op_id or None, owner, owner, message_id or None,
                     reply_id
                 ))
             else:
@@ -664,12 +707,12 @@ class IMAPReplyListener:
                     INSERT INTO inbox_replies (
                         id, lead_id, sender_email, company_name, subject,
                         message_body, classification, is_hot_lead, ai_suggested_reply,
-                        operator_id, message_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        operator_id, owner_username, message_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     reply_id, lead_id, clean_sender, comp, subject,
                     body, classification, 1 if is_hot else 0, ai_reply,
-                    operator_id, message_id or None
+                    op_id or None, owner, message_id or None
                 ))
 
             # Terminate active follow-up sequences for this recipient
@@ -703,7 +746,11 @@ class IMAPReplyListener:
             "blacklisted": classification in ("UNSUBSCRIBE", "BOUNCE")
         }
 
-    def poll_enrolled_inboxes(self, operator_id: Optional[str] = None) -> Dict[str, Any]:
+    def poll_enrolled_inboxes(
+        self,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Inbound IMAP reply detection connecting to imap.gmail.com:993 (SSL/TLS).
         Scans recent messages (last 48 hours, both read and unread) in INBOX,
@@ -714,16 +761,19 @@ class IMAPReplyListener:
         results: List[Dict[str, Any]] = []
         errors: List[str] = []
 
+        owner = (owner_username or "").strip().lower()
+        op_id_filter = (operator_id or "").strip()
+
         with self.db.get_connection() as conn:
-            if operator_id:
+            if owner or op_id_filter:
                 mailboxes = conn.execute("""
-                    SELECT id, email_address, imap_host, imap_port, imap_username, imap_password, smtp_password, operator_id
+                    SELECT id, email_address, imap_host, imap_port, imap_username, imap_password, smtp_password, operator_id, owner_username
                     FROM mailbox_rotator
-                    WHERE is_active = 1 AND (operator_id = ? OR operator_id IS NULL)
-                """, (operator_id,)).fetchall()
+                    WHERE is_active = 1 AND (lower(owner_username) = ? OR operator_id = ?)
+                """, (owner, op_id_filter)).fetchall()
             else:
                 mailboxes = conn.execute("""
-                    SELECT id, email_address, imap_host, imap_port, imap_username, imap_password, smtp_password, operator_id
+                    SELECT id, email_address, imap_host, imap_port, imap_username, imap_password, smtp_password, operator_id, owner_username
                     FROM mailbox_rotator
                     WHERE is_active = 1
                 """).fetchall()
@@ -754,6 +804,7 @@ class IMAPReplyListener:
             user = (mb["imap_username"] or mb["email_address"] or "").strip()
             raw_pwd = mb["imap_password"] or mb["smtp_password"] or ""
             pwd = re.sub(r'\s+', '', raw_pwd)
+            mb_owner = (mb["owner_username"] or owner or "").strip().lower()
             op_id = mb["operator_id"] or operator_id
 
             if not user or not pwd:
@@ -867,7 +918,8 @@ class IMAPReplyListener:
                                         operator_id=op_id,
                                         in_reply_to=in_reply_to,
                                         references=references,
-                                        message_id=raw_message_id
+                                        message_id=raw_message_id,
+                                        owner_username=mb_owner
                                     )
                                     results.append(proc)
                         except Exception as msg_err:
@@ -889,23 +941,40 @@ class IMAPReplyListener:
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
 
-    def get_hot_lead_alerts(self, operator_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Returns hot lead replies requiring action, filtered by tenant, strictly deduplicated by lead/sender."""
+    def get_hot_lead_alerts(
+        self,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None,
+        is_admin: bool = False
+    ) -> List[Dict[str, Any]]:
+        """Returns hot lead replies requiring action, filtered by tenant/user, strictly deduplicated by lead/sender."""
+        owner = (owner_username or "").strip().lower()
+        op_id = (operator_id or "").strip()
+
         with self.db.get_connection() as conn:
-            if operator_id:
+            if is_admin and not op_id:
                 rows = conn.execute("""
                     SELECT id, lead_id, sender_email, company_name, subject,
                            message_body, classification, ai_suggested_reply, received_at, status,
-                           operator_id
+                           operator_id, owner_username
                     FROM inbox_replies
-                    WHERE is_hot_lead = 1 AND (operator_id = ? OR operator_id IS NULL)
+                    WHERE is_hot_lead = 1 AND (lower(owner_username) = ? OR operator_id = ? OR owner_username = '' OR owner_username IS NULL)
                     ORDER BY received_at DESC
-                """, (operator_id,)).fetchall()
+                """, (owner, op_id)).fetchall()
+            elif owner or op_id:
+                rows = conn.execute("""
+                    SELECT id, lead_id, sender_email, company_name, subject,
+                           message_body, classification, ai_suggested_reply, received_at, status,
+                           operator_id, owner_username
+                    FROM inbox_replies
+                    WHERE is_hot_lead = 1 AND (lower(owner_username) = ? OR operator_id = ?)
+                    ORDER BY received_at DESC
+                """, (owner, op_id)).fetchall()
             else:
                 rows = conn.execute("""
                     SELECT id, lead_id, sender_email, company_name, subject,
                            message_body, classification, ai_suggested_reply, received_at, status,
-                           operator_id
+                           operator_id, owner_username
                     FROM inbox_replies
                     WHERE is_hot_lead = 1
                     ORDER BY received_at DESC
@@ -927,23 +996,30 @@ class IMAPReplyListener:
                 deduped.append(item)
             return deduped
 
-    def get_all_replies(self, operator_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Returns all logged replies, filtered by tenant, deduplicated by lead/sender."""
+    def get_all_replies(
+        self,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Returns all logged replies, filtered by tenant/user, deduplicated by lead/sender."""
+        owner = (owner_username or "").strip().lower()
+        op_id = (operator_id or "").strip()
+
         with self.db.get_connection() as conn:
-            if operator_id:
+            if owner or op_id:
                 rows = conn.execute("""
                     SELECT id, lead_id, sender_email, company_name, subject,
                            message_body, classification, is_hot_lead, received_at, status,
-                           operator_id
+                           operator_id, owner_username
                     FROM inbox_replies
-                    WHERE operator_id = ? OR operator_id IS NULL
+                    WHERE (lower(owner_username) = ? OR operator_id = ?)
                     ORDER BY received_at DESC
-                """, (operator_id,)).fetchall()
+                """, (owner, op_id)).fetchall()
             else:
                 rows = conn.execute("""
                     SELECT id, lead_id, sender_email, company_name, subject,
                            message_body, classification, is_hot_lead, received_at, status,
-                           operator_id
+                           operator_id, owner_username
                     FROM inbox_replies
                     ORDER BY received_at DESC
                 """).fetchall()
@@ -964,19 +1040,26 @@ class IMAPReplyListener:
                 deduped.append(item)
             return deduped
 
-    def get_suppressed_entities(self, operator_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Returns list of suppressed entities for CAN-SPAM / GDPR compliance."""
+    def get_suppressed_entities(
+        self,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Returns list of suppressed entities for CAN-SPAM / GDPR compliance, filtered per user."""
+        owner = (owner_username or "").strip().lower()
+        op_id = (operator_id or "").strip()
+
         with self.db.get_connection() as conn:
-            if operator_id:
+            if owner or op_id:
                 rows = conn.execute("""
-                    SELECT id, entity, entity_type, reason, operator_id, suppressed_at
+                    SELECT id, entity, entity_type, reason, operator_id, owner_username, suppressed_at
                     FROM suppressed_entities
-                    WHERE operator_id = ? OR operator_id IS NULL
+                    WHERE (lower(owner_username) = ? OR operator_id = ?)
                     ORDER BY suppressed_at DESC
-                """, (operator_id,)).fetchall()
+                """, (owner, op_id)).fetchall()
             else:
                 rows = conn.execute("""
-                    SELECT id, entity, entity_type, reason, operator_id, suppressed_at
+                    SELECT id, entity, entity_type, reason, operator_id, owner_username, suppressed_at
                     FROM suppressed_entities
                     ORDER BY suppressed_at DESC
                 """).fetchall()

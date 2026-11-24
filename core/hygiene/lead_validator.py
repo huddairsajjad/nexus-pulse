@@ -588,40 +588,60 @@ class LeadValidationFilter:
         cls,
         email: str,
         db_conn: Any,
-        domain: Optional[str] = None
+        domain: Optional[str] = None,
+        owner_username: Optional[str] = None,
+        operator_id: Optional[str] = None
     ) -> Tuple[bool, str]:
         """
         Verifies that newly scraped email does not already exist in:
-        1. Outreach Pipeline / History (outreach_queue - PENDING, APPROVED, SCHEDULED, SENT, REPLIED, etc.)
-        2. Global Deduplication Registry (dedup_registry)
+        1. Outreach Pipeline / History (outreach_queue - PENDING, APPROVED, SCHEDULED, SENT, REPLIED, etc.) scoped per user
+        2. Deduplication Registry (dedup_registry) scoped per user
         3. Global Blacklist Rules (blacklist_rules)
-        4. Global Suppression List (suppressed_entities / dnc_blacklist)
+        4. Suppression List (suppressed_entities / dnc_blacklist) scoped per user or global
         Returns: (is_blocked: bool, reason: str)
         """
         clean_email = email.strip().lower()
         clean_domain = (domain or clean_email.split("@")[-1]).strip().lower()
+        owner = (owner_username or "").strip().lower()
+        op_id = (operator_id or "").strip()
 
-        # 1. Check outreach_queue for any record of this email
-        row = db_conn.execute("""
-            SELECT id, status, company_name, created_at
-            FROM outreach_queue
-            WHERE lower(recipient) = ?
-            LIMIT 1
-        """, (clean_email,)).fetchone()
+        # 1. Check outreach_queue for any record of this email in this user's workspace
+        if owner or op_id:
+            row = db_conn.execute("""
+                SELECT id, status, company_name, created_at
+                FROM outreach_queue
+                WHERE lower(recipient) = ? AND (lower(owner_username) = ? OR operator_id = ?)
+                LIMIT 1
+            """, (clean_email, owner, op_id)).fetchone()
+        else:
+            row = db_conn.execute("""
+                SELECT id, status, company_name, created_at
+                FROM outreach_queue
+                WHERE lower(recipient) = ?
+                LIMIT 1
+            """, (clean_email,)).fetchone()
         if row:
-            return True, f"Lead already exists in outreach queue/history (Status: {row['status']})"
+            return True, f"Lead already exists in your outreach queue/history (Status: {row['status']})"
 
-        # 2. Check dedup_registry
-        row_dedup = db_conn.execute("""
-            SELECT status, last_processed_at
-            FROM dedup_registry
-            WHERE normalized_key = ?
-            LIMIT 1
-        """, (clean_email,)).fetchone()
+        # 2. Check dedup_registry scoped per user
+        if owner:
+            row_dedup = db_conn.execute("""
+                SELECT status, last_processed_at
+                FROM dedup_registry
+                WHERE normalized_key = ? AND lower(owner_username) = ?
+                LIMIT 1
+            """, (clean_email, owner)).fetchone()
+        else:
+            row_dedup = db_conn.execute("""
+                SELECT status, last_processed_at
+                FROM dedup_registry
+                WHERE normalized_key = ?
+                LIMIT 1
+            """, (clean_email,)).fetchone()
         if row_dedup and row_dedup["status"] in ("CONTACTED", "SENT", "BLACKLISTED"):
-            return True, f"Email registered as {row_dedup['status']} in deduplication shield"
+            return True, f"Email registered as {row_dedup['status']} in your deduplication shield"
 
-        # 3. Check blacklist_rules
+        # 3. Check blacklist_rules (global system exclusion rules)
         rules = db_conn.execute("SELECT pattern, reason FROM blacklist_rules").fetchall()
         for r in rules:
             pat = r["pattern"].lower().strip()
@@ -632,12 +652,20 @@ class LeadValidationFilter:
             if pat.startswith("*.") and clean_domain.endswith(pat[1:]):
                 return True, f"Blocked by Blacklist wildcard rule: {pat} ({r['reason']})"
 
-        # 4. Check suppressed_entities
-        suppressed = db_conn.execute("""
-            SELECT reason FROM suppressed_entities
-            WHERE lower(entity) = ? OR lower(entity) = ?
-            LIMIT 1
-        """, (clean_email, clean_domain)).fetchone()
+        # 4. Check suppressed_entities scoped per user or global
+        if owner or op_id:
+            suppressed = db_conn.execute("""
+                SELECT reason FROM suppressed_entities
+                WHERE (lower(entity) = ? OR lower(entity) = ?)
+                  AND (lower(owner_username) = ? OR operator_id = ? OR owner_username = '' OR owner_username IS NULL)
+                LIMIT 1
+            """, (clean_email, clean_domain, owner, op_id)).fetchone()
+        else:
+            suppressed = db_conn.execute("""
+                SELECT reason FROM suppressed_entities
+                WHERE lower(entity) = ? OR lower(entity) = ?
+                LIMIT 1
+            """, (clean_email, clean_domain)).fetchone()
         if suppressed:
             return True, f"Entity suppressed due to opt-out or bounce: ({suppressed['reason']})"
 

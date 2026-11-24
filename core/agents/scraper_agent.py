@@ -1267,19 +1267,26 @@ class DeepScraperAgent:
                     headers=headers_dict,
                 )
 
-                if lead and lead.all_emails:
+                if lead and lead.all_emails and len(lead.all_emails) >= 3:
                     logger.info(
-                        f"[SCRAPER] ✅ Root page hit on {target_url}: "
+                        f"[SCRAPER] ✅ Root page hit on {target_url} (3+ emails): "
                         f"{len(lead.all_emails)} email(s) | Primary: {lead.primary_email} | "
                         f"Company: {lead.company_name}"
                     )
+                    lead.all_emails = lead.all_emails[:3]
                     return lead
 
                 # ── Attempt 2: Discover contact subpages ─────────────
-                logger.info(
-                    f"[SCRAPER] No emails on root of {target_url}. "
-                    f"Scanning for contact/about subpages..."
-                )
+                if lead and lead.all_emails:
+                    logger.info(
+                        f"[SCRAPER] Root page found {len(lead.all_emails)} email(s) on {target_url}. "
+                        f"Scanning subpages to extract up to 3 distinct contacts..."
+                    )
+                else:
+                    logger.info(
+                        f"[SCRAPER] No emails on root of {target_url}. "
+                        f"Scanning for contact/about subpages..."
+                    )
                 soup = BeautifulSoup(resp.text, "html.parser")
                 candidate_subpages: List[str] = []
                 primary_contacts: List[str] = []
@@ -1366,6 +1373,12 @@ class DeepScraperAgent:
                 subpage_tasks = [_fetch_subpage(su) for su in candidate_subpages]
                 sub_results = await asyncio.gather(*subpage_tasks, return_exceptions=True)
 
+                # Aggregate emails across root and subpages up to 3 distinct contacts
+                all_found_emails: Dict[str, ScrapedEmail] = {}
+                if lead and lead.all_emails:
+                    for em in lead.all_emails:
+                        all_found_emails[em.email.lower().strip()] = em
+
                 for res in sub_results:
                     if is_cancelled and is_cancelled():
                         return None
@@ -1382,18 +1395,33 @@ class DeepScraperAgent:
                                 inherited_niche_score=root_niche_score,
                             )
                             if sub_lead and sub_lead.all_emails:
-                                logger.info(
-                                    f"[SCRAPER] ✅ Subpage hit: {sub_url} → "
-                                    f"{len(sub_lead.all_emails)} email(s) | Primary: {sub_lead.primary_email}"
-                                )
-                                # Preserve root page company name if subpage title is generic
-                                if lead and lead.company_name and len(lead.company_name) > 3:
-                                    sub_lead.company_name = lead.company_name
-                                return sub_lead
+                                for em in sub_lead.all_emails:
+                                    em_clean = em.email.lower().strip()
+                                    if em_clean not in all_found_emails:
+                                        all_found_emails[em_clean] = em
+                                if not lead:
+                                    lead = sub_lead
+                                elif (not lead.company_name or len(lead.company_name) <= 2) and sub_lead.company_name:
+                                    lead.company_name = sub_lead.company_name
+                                if len(all_found_emails) >= 3:
+                                    break
                             else:
                                 logger.debug(f"[SCRAPER] No valid emails on subpage {sub_url}")
                         except Exception as parse_err:
                             logger.debug(f"[SCRAPER] Subpage parsing error for {sub_url}: {parse_err}")
+
+                if all_found_emails and lead:
+                    # Sort by priority score descending
+                    ranked_list = sorted(all_found_emails.values(), key=lambda e: e.priority_score, reverse=True)
+                    # Keep up to 3 distinct valid emails
+                    lead.all_emails = ranked_list[:3]
+                    lead.primary_email = lead.all_emails[0].email
+                    lead.primary_email_tier = lead.all_emails[0].tier
+                    logger.info(
+                        f"[SCRAPER] ✅ Aggregated {len(lead.all_emails)} distinct email(s) for {base_domain} "
+                        f"(Primary: {lead.primary_email}): {[e.email for e in lead.all_emails]}"
+                    )
+                    return lead
 
                 logger.warning(
                     f"[SCRAPER] ✗ Discarding {target_url}: "

@@ -86,33 +86,79 @@ class DatabaseEngine:
     def _init_schema(self) -> None:
         """Initializes database tables and performance indices."""
         with self.get_connection() as conn:
-            # 1. Global Deduplication Registry
+            # 1. Per-User Scoped Deduplication Registry
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS dedup_registry (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     entity_type TEXT NOT NULL,           -- 'domain', 'email', 'company'
-                    normalized_key TEXT NOT NULL UNIQUE, -- clean lowercase string
+                    normalized_key TEXT NOT NULL,        -- clean lowercase string
                     hash_fingerprint TEXT NOT NULL,      -- sha256 hex
                     status TEXT NOT NULL DEFAULT 'SCRAPED', -- 'SCRAPED', 'VERIFIED', 'CONTACTED', 'BLACKLISTED'
                     first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     last_processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    lead_id TEXT
+                    lead_id TEXT,
+                    alias_group TEXT,
+                    domain TEXT,
+                    owner_username TEXT DEFAULT ''
                 );
             """)
+            # Migration check: ensure owner_username exists and composite unique index is enforced
+            existing_dd_cols = {col["name"] for col in conn.execute("PRAGMA table_info(dedup_registry)").fetchall()}
+            if "owner_username" not in existing_dd_cols:
+                try:
+                    conn.execute("ALTER TABLE dedup_registry ADD COLUMN owner_username TEXT DEFAULT '';")
+                except Exception:
+                    pass
+            if "alias_group" not in existing_dd_cols:
+                try:
+                    conn.execute("ALTER TABLE dedup_registry ADD COLUMN alias_group TEXT;")
+                except Exception:
+                    pass
+            if "domain" not in existing_dd_cols:
+                try:
+                    conn.execute("ALTER TABLE dedup_registry ADD COLUMN domain TEXT;")
+                except Exception:
+                    pass
+
+            # Check if dedup_registry has single-column unique constraint on normalized_key (autoindex)
+            # If so, migrate to table with composite uniqueness (normalized_key, owner_username)
+            needs_recreate = False
+            for idx_info in conn.execute("PRAGMA index_list(dedup_registry)").fetchall():
+                if idx_info["unique"]:
+                    cols = [r[2] for r in conn.execute(f"PRAGMA index_info({idx_info['name']})").fetchall()]
+                    if cols == ["normalized_key"]:
+                        needs_recreate = True
+                        break
+
+            if needs_recreate:
+                conn.execute("""
+                    CREATE TABLE dedup_registry_mig (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        entity_type TEXT NOT NULL,
+                        normalized_key TEXT NOT NULL,
+                        hash_fingerprint TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'SCRAPED',
+                        first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        lead_id TEXT,
+                        alias_group TEXT,
+                        domain TEXT,
+                        owner_username TEXT DEFAULT ''
+                    );
+                """)
+                conn.execute("""
+                    INSERT OR IGNORE INTO dedup_registry_mig
+                    (id, entity_type, normalized_key, hash_fingerprint, status, first_seen_at, last_processed_at, lead_id, alias_group, domain, owner_username)
+                    SELECT id, entity_type, normalized_key, hash_fingerprint, status, first_seen_at, last_processed_at, lead_id, alias_group, domain, COALESCE(owner_username, '')
+                    FROM dedup_registry;
+                """)
+                conn.execute("DROP TABLE dedup_registry;")
+                conn.execute("ALTER TABLE dedup_registry_mig RENAME TO dedup_registry;")
+
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_dedup_key_owner ON dedup_registry(normalized_key, owner_username);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dedup_hash ON dedup_registry(hash_fingerprint);")
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_dedup_key ON dedup_registry(normalized_key);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dedup_owner ON dedup_registry(owner_username);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_dedup_status ON dedup_registry(status);")
-            # Migration: add alias_group and domain columns if not present (Feature 2)
-            try:
-                conn.execute("ALTER TABLE dedup_registry ADD COLUMN alias_group TEXT")
-                conn.commit()
-            except Exception:
-                pass  # Column already exists
-            try:
-                conn.execute("ALTER TABLE dedup_registry ADD COLUMN domain TEXT")
-                conn.commit()
-            except Exception:
-                pass  # Column already exists
 
             # 2. Vault Leads (Encrypted Record Storage)
             conn.execute("""
@@ -213,7 +259,14 @@ class DatabaseEngine:
                 conn.execute("ALTER TABLE vault_leads ADD COLUMN operator_id TEXT;")
             if "unsubscribed" not in existing_vl_cols:
                 conn.execute("ALTER TABLE vault_leads ADD COLUMN unsubscribed INTEGER NOT NULL DEFAULT 0;")
+            if "owner_username" not in existing_vl_cols:
+                conn.execute("ALTER TABLE vault_leads ADD COLUMN owner_username TEXT DEFAULT '';")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_operator ON vault_leads(operator_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_owner ON vault_leads(owner_username);")
+            try:
+                conn.execute("UPDATE vault_leads SET owner_username = (SELECT username FROM users WHERE users.id = vault_leads.operator_id) WHERE (owner_username IS NULL OR owner_username = '') AND operator_id IS NOT NULL;")
+            except Exception:
+                pass
 
             # 5. Outreach Queue (Human Approval Gate & Scheduled Dispatch)
             conn.execute("""
@@ -246,6 +299,7 @@ class DatabaseEngine:
             existing_oq_cols = {col["name"] for col in conn.execute("PRAGMA table_info(outreach_queue)").fetchall()}
             oq_migrations = [
                 ("operator_id", "TEXT"),
+                ("owner_username", "TEXT DEFAULT ''"),
                 ("tracking_id", "TEXT"),
                 ("opened_at", "TIMESTAMP"),
                 ("bounced_at", "TIMESTAMP"),
@@ -261,9 +315,15 @@ class DatabaseEngine:
                 if col_name not in existing_oq_cols:
                     conn.execute(f"ALTER TABLE outreach_queue ADD COLUMN {col_name} {col_def};")
 
+            try:
+                conn.execute("UPDATE outreach_queue SET owner_username = (SELECT username FROM users WHERE users.id = outreach_queue.operator_id) WHERE (owner_username IS NULL OR owner_username = '') AND operator_id IS NOT NULL;")
+            except Exception:
+                pass
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_status ON outreach_queue(status);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_lead ON outreach_queue(lead_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_operator ON outreach_queue(operator_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_owner ON outreach_queue(owner_username);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_msgid ON outreach_queue(message_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_tracking ON outreach_queue(tracking_id);")
 
@@ -299,6 +359,7 @@ class DatabaseEngine:
                 ("smtp_username", "TEXT DEFAULT ''"),
                 ("smtp_password", "TEXT DEFAULT ''"),
                 ("operator_id", "TEXT"),
+                ("owner_username", "TEXT DEFAULT ''"),
                 ("imap_host", "TEXT DEFAULT ''"),
                 ("imap_port", "INTEGER DEFAULT 993"),
                 ("imap_username", "TEXT DEFAULT ''"),
@@ -309,7 +370,13 @@ class DatabaseEngine:
                 if col_name not in existing_mb_cols:
                     conn.execute(f"ALTER TABLE mailbox_rotator ADD COLUMN {col_name} {col_def};")
 
+            try:
+                conn.execute("UPDATE mailbox_rotator SET owner_username = (SELECT username FROM users WHERE users.id = mailbox_rotator.operator_id) WHERE (owner_username IS NULL OR owner_username = '') AND operator_id IS NOT NULL;")
+            except Exception:
+                pass
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_operator ON mailbox_rotator(operator_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_owner ON mailbox_rotator(owner_username);")
 
             # 7. Inbox Replies, AI Classification & Hot Lead Alerts
             conn.execute("""
@@ -325,20 +392,29 @@ class DatabaseEngine:
                     ai_suggested_reply TEXT,
                     received_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     status TEXT NOT NULL DEFAULT 'UNREAD', -- 'UNREAD', 'RESOLVED', 'REPLIED'
-                    operator_id TEXT
+                    operator_id TEXT,
+                    owner_username TEXT DEFAULT ''
                 );
             """)
             # Dynamic migration for inbox_replies columns
             existing_rep_cols = {col["name"] for col in conn.execute("PRAGMA table_info(inbox_replies)").fetchall()}
             if "operator_id" not in existing_rep_cols:
                 conn.execute("ALTER TABLE inbox_replies ADD COLUMN operator_id TEXT;")
+            if "owner_username" not in existing_rep_cols:
+                conn.execute("ALTER TABLE inbox_replies ADD COLUMN owner_username TEXT DEFAULT '';")
             # Item 4: Message-ID deduplication column
             if "message_id" not in existing_rep_cols:
                 conn.execute("ALTER TABLE inbox_replies ADD COLUMN message_id TEXT;")
 
+            try:
+                conn.execute("UPDATE inbox_replies SET owner_username = (SELECT username FROM users WHERE users.id = inbox_replies.operator_id) WHERE (owner_username IS NULL OR owner_username = '') AND operator_id IS NOT NULL;")
+            except Exception:
+                pass
+
             conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_hot ON inbox_replies(is_hot_lead);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_class ON inbox_replies(classification);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_operator ON inbox_replies(operator_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_owner ON inbox_replies(owner_username);")
             # Unique index on message_id for fast dedup lookups (NULL values are excluded from uniqueness)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_msgid ON inbox_replies(message_id);")
 
@@ -400,13 +476,22 @@ class DatabaseEngine:
                     body_template TEXT NOT NULL,
                     is_default INTEGER NOT NULL DEFAULT 0,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    owner_username TEXT DEFAULT ''
                 );
             """)
+            existing_tpl_cols = {col["name"] for col in conn.execute("PRAGMA table_info(service_templates)").fetchall()}
+            if "owner_username" not in existing_tpl_cols:
+                conn.execute("ALTER TABLE service_templates ADD COLUMN owner_username TEXT DEFAULT '';")
+            try:
+                conn.execute("UPDATE service_templates SET owner_username = (SELECT username FROM users WHERE users.id = service_templates.operator_id) WHERE (owner_username IS NULL OR owner_username = '') AND operator_id IS NOT NULL;")
+            except Exception:
+                pass
             conn.execute("CREATE INDEX IF NOT EXISTS idx_template_operator ON service_templates(operator_id);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_template_owner ON service_templates(owner_username);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_template_niche ON service_templates(niche);")
 
-            # 12. Global Suppressed Domains / Emails (Unsubscribes & Bounces)
+            # 12. Global & Per-User Suppressed Domains / Emails (Unsubscribes & Bounces)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS suppressed_entities (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -414,10 +499,27 @@ class DatabaseEngine:
                     entity_type TEXT NOT NULL,   -- 'email', 'domain'
                     reason TEXT NOT NULL,        -- 'UNSUBSCRIBE', 'BOUNCE', 'SPAM_COMPLAINT', 'MANUAL_OPT_OUT'
                     operator_id TEXT,
+                    owner_username TEXT DEFAULT '',
                     suppressed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            existing_sup_cols = {col["name"] for col in conn.execute("PRAGMA table_info(suppressed_entities)").fetchall()}
+            if "owner_username" not in existing_sup_cols:
+                conn.execute("ALTER TABLE suppressed_entities ADD COLUMN owner_username TEXT DEFAULT '';")
+            try:
+                conn.execute("UPDATE suppressed_entities SET owner_username = (SELECT username FROM users WHERE users.id = suppressed_entities.operator_id) WHERE (owner_username IS NULL OR owner_username = '') AND operator_id IS NOT NULL;")
+            except Exception:
+                pass
             conn.execute("CREATE INDEX IF NOT EXISTS idx_suppressed_entity ON suppressed_entities(entity);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_suppressed_owner ON suppressed_entities(owner_username);")
+
+            # 9. Permanent DNC / GDPR Blacklist
+            existing_dnc_cols = {col["name"] for col in conn.execute("PRAGMA table_info(dnc_blacklist)").fetchall()}
+            if "owner_username" not in existing_dnc_cols:
+                conn.execute("ALTER TABLE dnc_blacklist ADD COLUMN owner_username TEXT DEFAULT '';")
+            if "is_global" not in existing_dnc_cols:
+                conn.execute("ALTER TABLE dnc_blacklist ADD COLUMN is_global INTEGER DEFAULT 0;")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dnc_owner ON dnc_blacklist(owner_username);")
 
             # 13. Global Domain Blacklist Rules
             conn.execute("""

@@ -509,27 +509,43 @@ function NexusPulseApp() {
 
   // Single consistent source of truth for active Hot Leads across top tabs, alerts & board
   const uniqueHotLeads = useMemo(() => {
-    const seen = new Set();
+    const seenEmails = new Set();
+    const seenLeadIds = new Set();
+    const seenItemIds = new Set();
     const result = [];
-    // 1. Hot leads from incoming IMAP replies
+
+    const isSeenAndMark = (item) => {
+      const email = (item.sender_email || item.recipient || item.primary_email || "").toLowerCase().trim();
+      const leadId = (item.lead_id || "").toLowerCase().trim();
+      const itemId = (item.id || "").toLowerCase().trim();
+
+      if (email && seenEmails.has(email)) return true;
+      if (leadId && seenLeadIds.has(leadId)) return true;
+      if (itemId && seenItemIds.has(itemId)) return true;
+
+      if (email) seenEmails.add(email);
+      if (leadId) seenLeadIds.add(leadId);
+      if (itemId) seenItemIds.add(itemId);
+      return false;
+    };
+
+    // 1. Hot leads from incoming IMAP replies (highest priority / contains reply snippet & ai suggested draft)
     (hotLeads || []).forEach((hl) => {
-      const key = (hl.lead_id || hl.sender_email || hl.recipient || hl.id || "").toLowerCase().trim();
-      if (key && !seen.has(key)) {
-        seen.add(key);
+      if (!isSeenAndMark(hl)) {
         result.push(hl);
       }
     });
+
     // 2. Hot leads from pipeline Kanban items
     (kanbanItems || []).forEach((item) => {
       const norm = normalizeLeadStatus(item.status);
       if (norm === "HOT_LEAD" || promotedToHotLeadIds.has(item.id)) {
-        const key = (item.recipient || item.id || "").toLowerCase().trim();
-        if (key && !seen.has(key)) {
-          seen.add(key);
+        if (!isSeenAndMark(item)) {
           result.push(item);
         }
       }
     });
+
     return result;
   }, [hotLeads, kanbanItems, promotedToHotLeadIds]);
 
@@ -1514,7 +1530,8 @@ function doPost(e) {
               setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
               setIsHuntModalOpen(false);
               fetchData();
-              setAlertBanner({ type: "info", message: "Crawl was cancelled." });
+              const preservedCount = statusData.result?.leads_preserved_count || statusData.result?.verified_count || 0;
+              setAlertBanner({ type: "info", message: `Crawl stopped by operator. ${preservedCount} verified lead(s) preserved in pipeline.` });
             } else if (statusData.status === "ERROR") {
               clearInterval(pollTimer);
               scrapePollTimerRef.current = null;
@@ -1870,7 +1887,7 @@ function doPost(e) {
   const handleOpenHotLeadModal = (lead) => {
     setSelectedHotLead(lead);
     // Strip quoted > thread lines, On ... wrote headers, and email continuation noise
-    const rawInquiry = lead.reply_snippet || lead.incoming_message || lead.last_reply_body || "";
+    const rawInquiry = lead.message_body || lead.reply_snippet || lead.incoming_message || lead.last_reply_body || "";
     const inquiryText = rawInquiry
       .split("\n")
       .filter(line => !line.trim().startsWith(">") && !/^on\s.+wrote:$/i.test(line.trim()))
@@ -1912,11 +1929,16 @@ function doPost(e) {
         message: `Executive Response dispatched to ${data.recipient || recipient} via ${data.dispatched_via || data.inbox_used || "SMTP"}!`
       });
       // Sync lead to Converted/CLOSED in kanban + remove from hot leads
+      const recipLower = (recipient || "").toLowerCase().trim();
       setHotLeads(prev => prev.filter(h =>
-        h.id !== replyId && h.lead_id !== selectedHotLead?.lead_id
+        h.id !== replyId &&
+        h.lead_id !== selectedHotLead?.lead_id &&
+        (h.sender_email || "").toLowerCase().trim() !== recipLower
       ));
       setKanbanItems(prev => prev.map(item =>
-        (item.id === selectedHotLead?.id || item.lead_id === selectedHotLead?.lead_id)
+        (item.id === selectedHotLead?.id ||
+         item.lead_id === selectedHotLead?.lead_id ||
+         (item.recipient || "").toLowerCase().trim() === recipLower)
           ? { ...item, status: "CLOSED" } : item
       ));
       fetchData();

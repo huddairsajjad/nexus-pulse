@@ -77,13 +77,21 @@ class NexusPulseOrchestrator:
             "dedup_metrics": dedup_stats
         }
 
-    def process_and_preserve_lead(self, raw_lead: Lead, operator_id: Optional[str] = None) -> Dict[str, Any]:
+    def process_and_preserve_lead(
+        self,
+        raw_lead: Lead,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None
+    ) -> Dict[str, Any]:
         """
         Takes a raw scraped Lead, applies Blacklist and Suppression checks,
         drops junk domains (wixpress.com, sentry-next.wixpress.com, sentry.io) and invalid prefixes,
         applies Deduplication Shield, runs Zero-Bounce Hygiene Shield,
-        and archives to Category Vault with tenant operator_id.
+        and archives to Category Vault with tenant operator_id and owner_username.
         """
+        owner = (owner_username or "").strip()
+        op_id = (operator_id or "").strip()
+
         # 0. Junk Domain & System Prefix Hygiene Drop
         if LeadValidationFilter.is_junk_domain(raw_lead.domain):
             return {
@@ -123,10 +131,11 @@ class NexusPulseOrchestrator:
                 "primary_email": raw_lead.primary_email
             }
 
-        # 2. Pipeline, Sent History & Blacklist Deduplication Guard
+        # 2. Pipeline, Sent History & Blacklist Deduplication Guard (scoped to this user)
         with self.db.get_connection() as conn:
             is_dup_guard, guard_reason = LeadValidationFilter.is_lead_duplicate_or_blacklisted(
-                raw_lead.primary_email, conn, domain=raw_lead.domain
+                raw_lead.primary_email, conn, domain=raw_lead.domain,
+                owner_username=owner, operator_id=op_id
             )
             if is_dup_guard:
                 return {
@@ -207,7 +216,7 @@ class NexusPulseOrchestrator:
         self.dedup.register_lead(raw_lead, status="VERIFIED")
 
         # 6. Store in Category Vault & Synchronize Partitions (JSON, CSV, Excel)
-        store_res = self.vault.store_lead(raw_lead, operator_id=operator_id)
+        store_res = self.vault.store_lead(raw_lead, operator_id=op_id, owner_username=owner)
 
         # 7. Mirror lead to MongoDB with unique constraint indexing
         try:
@@ -223,7 +232,8 @@ class NexusPulseOrchestrator:
                 "niche": raw_lead.industry_niche,
                 "quality_tag": raw_lead.quality_tag,
                 "priority_score": raw_lead.priority_score,
-                "operator_id": operator_id,
+                "operator_id": op_id,
+                "owner_username": owner,
                 "unsubscribed": False
             })
         except Exception:

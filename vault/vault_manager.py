@@ -97,14 +97,20 @@ class CategoryVaultManager:
             "Scraped At": lead.scraped_at
         }
 
-    def store_lead(self, lead: Lead, operator_id: Optional[str] = None) -> Dict[str, str]:
+    def store_lead(
+        self,
+        lead: Lead,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None
+    ) -> Dict[str, str]:
         """
         Stores lead into encrypted SQLite vault and appends to partitioned files.
-        Maintains tenant operator_id isolation.
+        Maintains tenant operator_id and owner_username isolation.
         """
         lead_dict = lead.model_dump()
         lead_id = lead.id or f"{_sanitize_path_segment(lead.domain)}_{_sanitize_path_segment(lead.primary_email)}"
         lead.id = lead_id
+        owner = (owner_username or "").strip()
 
         # 1. Encrypt and store in database
         encrypted_blob = self.crypto.encrypt_json(lead_dict)
@@ -112,18 +118,19 @@ class CategoryVaultManager:
             conn.execute("""
                 INSERT INTO vault_leads (
                     id, domain, primary_email, company_name, country,
-                    city, niche, quality_tag, priority_score, encrypted_payload, operator_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    city, niche, quality_tag, priority_score, encrypted_payload, operator_id, owner_username
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     primary_email = excluded.primary_email,
                     quality_tag = excluded.quality_tag,
                     priority_score = excluded.priority_score,
                     encrypted_payload = excluded.encrypted_payload,
-                    operator_id = COALESCE(excluded.operator_id, vault_leads.operator_id);
+                    operator_id = COALESCE(excluded.operator_id, vault_leads.operator_id),
+                    owner_username = CASE WHEN excluded.owner_username != '' THEN excluded.owner_username ELSE vault_leads.owner_username END;
             """, (
                 lead.id, lead.domain, lead.primary_email, lead.company_name,
                 lead.target_country, lead.target_city, lead.industry_niche,
-                lead.quality_tag, lead.priority_score, encrypted_blob, operator_id
+                lead.quality_tag, lead.priority_score, encrypted_blob, operator_id, owner
             ))
             conn.commit()
 
@@ -171,17 +178,28 @@ class CategoryVaultManager:
             "xlsx_path": str(xlsx_file)
         }
 
-    def export_global_snapshot_backups(self, operator_id: Optional[str] = None) -> Dict[str, str]:
+    def export_global_snapshot_backups(
+        self,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None
+    ) -> Dict[str, str]:
         """
         Creates timestamped consolidated snapshot backups of all verified leads
         across all categories inside vault/backups/ in JSON, CSV, and Excel formats.
-        Supports filtering by operator_id.
+        Supports filtering strictly by operator_id and owner_username.
         """
         # Fetch all leads from database and decrypt
         leads: List[Lead] = []
+        owner = (owner_username or "").strip().lower()
+        op_id = (operator_id or "").strip()
+
         with self.db.get_connection() as conn:
-            if operator_id:
-                rows = conn.execute("SELECT encrypted_payload FROM vault_leads WHERE operator_id = ? OR operator_id IS NULL ORDER BY priority_score DESC", (operator_id,)).fetchall()
+            if owner or op_id:
+                rows = conn.execute("""
+                    SELECT encrypted_payload FROM vault_leads
+                    WHERE (lower(owner_username) = ? OR operator_id = ?)
+                    ORDER BY priority_score DESC
+                """, (owner, op_id)).fetchall()
             else:
                 rows = conn.execute("SELECT encrypted_payload FROM vault_leads ORDER BY priority_score DESC").fetchall()
             for row in rows:

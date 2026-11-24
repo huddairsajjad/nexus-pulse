@@ -37,27 +37,34 @@ def _make_in_memory_conn():
             last_processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             lead_id TEXT,
             alias_group TEXT,
-            domain TEXT
+            domain TEXT,
+            owner_username TEXT DEFAULT ''
         )
     """)
     conn.execute("""
         CREATE TABLE vault_leads (
             id TEXT PRIMARY KEY,
             domain TEXT NOT NULL,
-            primary_email TEXT
+            primary_email TEXT,
+            owner_username TEXT DEFAULT '',
+            operator_id TEXT DEFAULT ''
         )
     """)
     conn.execute("""
         CREATE TABLE outreach_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            recipient TEXT NOT NULL
+            recipient TEXT NOT NULL,
+            owner_username TEXT DEFAULT '',
+            operator_id TEXT DEFAULT ''
         )
     """)
     conn.execute("""
         CREATE TABLE suppressed_entities (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             entity TEXT NOT NULL,
-            entity_type TEXT
+            entity_type TEXT,
+            owner_username TEXT DEFAULT '',
+            operator_id TEXT DEFAULT ''
         )
     """)
     conn.execute("""

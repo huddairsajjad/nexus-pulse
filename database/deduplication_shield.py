@@ -45,7 +45,8 @@ class DeduplicationShield:
         self,
         domain: str,
         email: str,
-        company_name: Optional[str] = None
+        company_name: Optional[str] = None,
+        owner_username: Optional[str] = None
     ) -> Tuple[bool, str]:
         """
         Checks if domain, email, or company has already been processed.
@@ -53,20 +54,24 @@ class DeduplicationShield:
         """
         clean_domain = _normalize_domain(domain)
         clean_email = _normalize_email(email)
+        owner = (owner_username or "").strip().lower()
+
+        owner_filter = "AND (lower(owner_username) = ? OR owner_username = '')" if owner else ""
+        owner_params = [owner] if owner else []
 
         with self.db.get_connection() as conn:
             # 1. Check Domain
             row = conn.execute(
-                "SELECT status, last_processed_at FROM dedup_registry WHERE entity_type = 'domain' AND normalized_key = ?",
-                (clean_domain,)
+                f"SELECT status, last_processed_at FROM dedup_registry WHERE entity_type = 'domain' AND normalized_key = ? {owner_filter}",
+                [clean_domain] + owner_params
             ).fetchone()
             if row:
                 return True, f"Domain '{clean_domain}' already processed (Status: {row['status']}, Date: {row['last_processed_at']})"
 
             # 2. Check Email
             row = conn.execute(
-                "SELECT status, last_processed_at FROM dedup_registry WHERE entity_type = 'email' AND normalized_key = ?",
-                (clean_email,)
+                f"SELECT status, last_processed_at FROM dedup_registry WHERE entity_type = 'email' AND normalized_key = ? {owner_filter}",
+                [clean_email] + owner_params
             ).fetchone()
             if row:
                 return True, f"Email '{clean_email}' already processed (Status: {row['status']}, Date: {row['last_processed_at']})"
@@ -76,15 +81,15 @@ class DeduplicationShield:
                 clean_comp = _normalize_company(company_name)
                 if len(clean_comp) >= 3:
                     row = conn.execute(
-                        "SELECT status FROM dedup_registry WHERE entity_type = 'company' AND normalized_key = ?",
-                        (clean_comp,)
+                        f"SELECT status FROM dedup_registry WHERE entity_type = 'company' AND normalized_key = ? {owner_filter}",
+                        [clean_comp] + owner_params
                     ).fetchone()
                     if row:
                         return True, f"Company '{company_name}' already registered (Status: {row['status']})"
 
         return False, "NEW_ENTITY"
 
-    def register_lead(self, lead: Lead, status: str = "VERIFIED") -> None:
+    def register_lead(self, lead: Lead, status: str = "VERIFIED", owner_username: Optional[str] = None) -> None:
         """
         Registers lead entities (domain, all emails, company) into dedup registry.
         """
@@ -92,6 +97,7 @@ class DeduplicationShield:
         clean_email = _normalize_email(lead.primary_email)
         clean_comp = _normalize_company(lead.company_name)
         lead_id = lead.id or compute_sha256(f"{clean_domain}:{clean_email}")
+        owner = (owner_username or "").strip().lower()
 
         entities = [
             ("domain", clean_domain, compute_sha256(clean_domain)),
@@ -110,13 +116,13 @@ class DeduplicationShield:
         with self.db.get_connection() as conn:
             for entity_type, key, sha in entities:
                 conn.execute("""
-                    INSERT INTO dedup_registry (entity_type, normalized_key, hash_fingerprint, status, lead_id)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(normalized_key) DO UPDATE SET
+                    INSERT INTO dedup_registry (entity_type, normalized_key, hash_fingerprint, status, lead_id, owner_username)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(normalized_key, owner_username) DO UPDATE SET
                         last_processed_at = CURRENT_TIMESTAMP,
                         status = excluded.status,
                         lead_id = excluded.lead_id;
-                """, (entity_type, key, sha, status, lead_id))
+                """, (entity_type, key, sha, status, lead_id, owner))
             conn.commit()
 
     def filter_new_leads(self, leads: List[Lead]) -> List[Lead]:
