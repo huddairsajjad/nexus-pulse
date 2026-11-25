@@ -45,6 +45,9 @@ from vault.vault_manager import get_vault_manager
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 UI_DIR = PROJECT_ROOT / "ui"
 
+from dotenv import load_dotenv
+load_dotenv(PROJECT_ROOT / ".env", override=False)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

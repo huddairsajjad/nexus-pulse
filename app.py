@@ -31,11 +31,15 @@ import os
 import sys
 import threading
 from pathlib import Path
+from dotenv import load_dotenv
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# Load local .env if present (process env takes precedence for cloud/Railway)
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 import uvicorn
 from api.app import app

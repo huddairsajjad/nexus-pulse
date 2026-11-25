@@ -613,6 +613,7 @@ function NexusPulseApp() {
   const [huntNiche, setHuntNiche] = useState("Commercial Construction");
   const [huntMaxResults, setHuntMaxResults] = useState(10);
   const [isHunting, setIsHunting] = useState(false);
+  const isHuntingRef = useRef(false);
   const [huntProgress, setHuntProgress] = useState(null);
   const [activeScrapeJobId, setActiveScrapeJobId] = useState(null);
   const scrapePollTimerRef = useRef(null);
@@ -751,7 +752,7 @@ function NexusPulseApp() {
           setPulseState("HOT_ALERT");
         } else if (isDispatchingNow || (dispRes && dispRes.status === "DISPATCHING")) {
           setPulseState("DISPATCHING");
-        } else if (isHunting) {
+        } else if (isHuntingRef.current) {
           setPulseState("HUNTING");
         } else if (dispRes && dispRes.status === "RUNNING") {
           setPulseState("RUNNING");
@@ -761,7 +762,7 @@ function NexusPulseApp() {
           setPulseState("RUNNING");
         }
       } else if (dispRes && dispRes.status) {
-        setPulseState(dispRes.status === "DISPATCHING" ? "DISPATCHING" : (isHunting ? "HUNTING" : "RUNNING"));
+        setPulseState(dispRes.status === "DISPATCHING" ? "DISPATCHING" : (isHuntingRef.current ? "HUNTING" : "RUNNING"));
       }
       if (Array.isArray(mailboxesRes)) setMailboxes(mailboxesRes);
       if (tzRes) setTimezones(tzRes);
@@ -1394,6 +1395,7 @@ function doPost(e) {
     }
     const jobId = activeScrapeJobId;
     setActiveScrapeJobId(null);
+    isHuntingRef.current = false;
     setIsHunting(false);
     setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
     setIsHuntModalOpen(false);
@@ -1417,8 +1419,9 @@ function doPost(e) {
 
   const handleLaunchScrapePipeline = async (e) => {
     if (e) e.preventDefault();
-    if (isHunting) return;
+    if (isHuntingRef.current) return;
 
+    isHuntingRef.current = true;
     setIsHunting(true);
     setPulseState("HUNTING");
     setHuntProgress(null);
@@ -1454,6 +1457,7 @@ function doPost(e) {
       try {
         data = await resp.json();
       } catch (parseErr) {
+        isHuntingRef.current = false;
         setIsHunting(false);
         setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
         setAlertBanner({
@@ -1464,6 +1468,7 @@ function doPost(e) {
       }
 
       if (!resp.ok) {
+        isHuntingRef.current = false;
         setIsHunting(false);
         setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
         setAlertBanner({
@@ -1500,6 +1505,7 @@ function doPost(e) {
               clearInterval(pollTimer);
               scrapePollTimerRef.current = null;
               setActiveScrapeJobId(null);
+              isHuntingRef.current = false;
               setIsHunting(false);
               setPulseState("RUNNING");
               setIsHuntModalOpen(false);
@@ -1526,21 +1532,23 @@ function doPost(e) {
               clearInterval(pollTimer);
               scrapePollTimerRef.current = null;
               setActiveScrapeJobId(null);
+              isHuntingRef.current = false;
               setIsHunting(false);
               setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
               setIsHuntModalOpen(false);
               fetchData();
               const preservedCount = statusData.result?.leads_preserved_count || statusData.result?.verified_count || 0;
               setAlertBanner({ type: "info", message: `Crawl stopped by operator. ${preservedCount} verified lead(s) preserved in pipeline.` });
-            } else if (statusData.status === "ERROR") {
+            } else if (statusData.status === "ERROR" || statusData.status === "FAILED") {
               clearInterval(pollTimer);
               scrapePollTimerRef.current = null;
               setActiveScrapeJobId(null);
+              isHuntingRef.current = false;
               setIsHunting(false);
               setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
               setIsHuntModalOpen(false);
               fetchData();
-              setAlertBanner({ type: "danger", message: `Scrape error: ${statusData.error || "Unknown error"}` });
+              setAlertBanner({ type: "danger", message: `Scrape error: ${statusData.error || statusData.message || "Unknown error"}` });
             } else {
               // IN_PROGRESS: update progress if available
               if (statusData.progress) {
@@ -1555,6 +1563,7 @@ function doPost(e) {
         scrapePollTimerRef.current = pollTimer;
       } else {
         // Synchronous fallback response
+        isHuntingRef.current = false;
         setIsHunting(false);
         setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
         setIsHuntModalOpen(false);
@@ -1580,6 +1589,7 @@ function doPost(e) {
         console.error("Scrape error:", err);
         setAlertBanner({ type: "danger", message: "Failed to connect to /api/scrape endpoint." });
       }
+      isHuntingRef.current = false;
       setIsHunting(false);
       setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "IDLE");
     }

@@ -19,19 +19,35 @@ import asyncio
 import base64
 import html
 import logging
+import os
 import re
 import time
 import urllib.parse
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 import httpx
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 from ..models import Lead, TechStack, EmailTier, ScrapedEmail
 from .priority_finder import PriorityEmailFinder
 from core.hygiene.lead_validator import LeadValidationFilter
 
 logger = logging.getLogger("nexus.scraper")
+
+
+class SerperAPIError(RuntimeError):
+    """Raised when Serper.dev API returns an error status or error message."""
+    pass
+
+
+class MissingSerperApiKeyError(SerperAPIError):
+    """Raised when SERPER_API_KEY is missing in env or .env."""
+    pass
 
 # ---------------------------------------------------------------------------
 # Try modern `ddgs` package first, fall back to legacy `duckduckgo_search`
@@ -78,6 +94,7 @@ DISCARD_DOMAINS = {
     "slideshare.", "scribd.", "baidu.", "carigold.", "meta.com", "threads.net",
     "merriam-webster.", "dictionary.", "thefreedictionary.", "vocabulary.com",
     "cambridge.org", "collinsdictionary.", "oxfordlearnersdictionaries.", "britannica.",
+    "rozee.pk", "mustakbil.com", "olx.com", "olx.com.pk", "daraz.pk", "zameen.com", "graana.com", "pakwheels.com",
 }
 
 # Junk email domains / prefixes handled by LeadValidationFilter but also
@@ -236,26 +253,131 @@ class TechStackDetector:
 
 
 # ===========================================================================
-# SearchDiscoveryAgent — Multi-Provider, Cloud-Resilient
+# Serper.dev Country & Language Mapping
+# ===========================================================================
+SERPER_COUNTRY_CODES: Dict[str, str] = {
+    "pakistan": "pk",
+    "germany": "de",
+    "deutschland": "de",
+    "united kingdom": "gb",
+    "uk": "gb",
+    "great britain": "gb",
+    "england": "gb",
+    "united states": "us",
+    "usa": "us",
+    "canada": "ca",
+    "australia": "au",
+    "france": "fr",
+    "italy": "it",
+    "spain": "es",
+    "netherlands": "nl",
+    "switzerland": "ch",
+    "austria": "at",
+    "belgium": "be",
+    "united arab emirates": "ae",
+    "uae": "ae",
+    "saudi arabia": "sa",
+    "qatar": "qa",
+    "singapore": "sg",
+    "malaysia": "my",
+    "india": "in",
+    "brazil": "br",
+    "mexico": "mx",
+    "turkey": "tr",
+    "poland": "pl",
+    "sweden": "se",
+    "norway": "no",
+    "denmark": "dk",
+    "finland": "fi",
+    "ireland": "ie",
+    "new zealand": "nz",
+    "south africa": "za",
+    "china": "cn",
+    "japan": "jp",
+}
+
+SERPER_LANGUAGE_CODES: Dict[str, str] = {
+    "pk": "en",
+    "de": "de",
+    "at": "de",
+    "ch": "de",
+    "gb": "en",
+    "us": "en",
+    "ca": "en",
+    "au": "en",
+    "fr": "fr",
+    "be": "fr",
+    "it": "it",
+    "es": "es",
+    "mx": "es",
+    "nl": "nl",
+    "ae": "en",
+    "sa": "ar",
+    "qa": "ar",
+    "sg": "en",
+    "my": "en",
+    "in": "en",
+    "br": "pt",
+    "tr": "tr",
+    "pl": "pl",
+    "se": "sv",
+    "no": "no",
+    "dk": "da",
+    "fi": "fi",
+}
+
+def resolve_serper_gl(country: str) -> str:
+    c = (country or "").strip().lower()
+    return SERPER_COUNTRY_CODES.get(c, "us")
+
+def resolve_serper_hl(country: str) -> str:
+    gl = resolve_serper_gl(country)
+    return SERPER_LANGUAGE_CODES.get(gl, "en")
+
+
+# ===========================================================================
+# SearchDiscoveryAgent — Serper.dev Fast Lead Discovery Engine
 # ===========================================================================
 class SearchDiscoveryAgent:
     """
-    Autonomous B2B Search Discovery Engine with cascading 3-provider fallback.
+    High-Speed Autonomous B2B Lead Discovery Engine powered by Serper.dev JSON APIs.
+    Endpoints:
+      - https://google.serper.dev/places (Google Places / Verified Local Commercial Businesses)
+      - https://google.serper.dev/search (Google Organic Commercial Web Search)
+    Authenticated via header 'X-API-KEY' loaded from SERPER_API_KEY (.env / os.environ).
 
-    Provider 1 (Primary):   ddgs / duckduckgo-search Python library
-                            Uses DDGS().text() with backend='lite', then 'html'.
-                            Works well from Railway datacenters — library handles
-                            cookies and anti-bot measures internally.
-    Provider 2 (Secondary): Bing HTML scraper with base64 redirect unpack.
-    Provider 3 (Tertiary):  DuckDuckGo Lite HTTP POST (legacy, unchanged).
-
-    Each provider is tried per query; we stop once we have enough unique URLs.
-    All providers share the same sanitization and discard logic.
-    Full logging is emitted at every step for Railway Deploy Log visibility.
+    Features:
+      - Bounded request timeouts (5–8s) & controlled concurrency
+      - Continual query and pagination expansion for exact lead quota fulfillment
+      - Instant cancellation checks between calls to halt execution without hanging
+      - Automatic directory, social network, and aggregator exclusion
+      - Zero-Seed Policy: 100% real leads from live web sources; zero dummy/mock data.
     """
 
-    def __init__(self, timeout_seconds: float = 10.0):
+    def __init__(self, timeout_seconds: float = 7.0, serper_api_key: Optional[str] = None):
         self.timeout = timeout_seconds
+        self._api_key = serper_api_key
+        self.discovered_metadata: Dict[str, Dict[str, Any]] = {}
+
+    def get_api_key(self) -> str:
+        """Reads SERPER_API_KEY from environment or .env without hardcoding."""
+        if self._api_key and self._api_key.strip():
+            return self._api_key.strip()
+        try:
+            load_dotenv(PROJECT_ROOT / ".env", override=False)
+        except Exception:
+            pass
+        return os.environ.get("SERPER_API_KEY", "").strip()
+
+    def check_api_key(self) -> str:
+        """Verifies SERPER_API_KEY is present; raises explicit MissingSerperApiKeyError if missing."""
+        key = self.get_api_key()
+        if not key:
+            raise MissingSerperApiKeyError(
+                "SERPER_API_KEY is not configured in .env or environment variables. "
+                "Please add a valid Serper.dev API key to enable live lead discovery."
+            )
+        return key
 
     # ------------------------------------------------------------------
     # URL cleaning & validation helpers
@@ -337,442 +459,326 @@ class SearchDiscoveryAgent:
 
     @classmethod
     def sanitize_search_query(cls, query: str) -> str:
-        """
-        Sanitises query for direct HTTP search engines.
-        Strips nested quotes, boolean OR, and site: operators that
-        cause many search engines to return 0 results.
-        DDGS library handles these operators natively, so we only sanitise
-        for Bing/DDG-Lite HTTP paths.
-        """
+        """Sanitises search query string."""
         cleaned = re.sub(r'["()]', '', query)
         cleaned = re.sub(r'\bOR\b', '', cleaned)
         cleaned = re.sub(r'site:\S+', '', cleaned)
         cleaned = " ".join(cleaned.split())
         return cleaned
 
-    # ------------------------------------------------------------------
-    # Provider 1: DDGS library (ddgs / duckduckgo-search)
-    # ------------------------------------------------------------------
-    def _ddgs_search(self, query: str, max_results: int = 15) -> List[str]:
-        """
-        Runs a synchronous DDGS text search with lite→html backend fallback.
-        Returns list of raw result URLs (before clean_candidate_url).
-        """
-        if _DDGS is None:
-            logger.warning("[PROVIDER-1 DDGS] Library not installed — skipping")
-            return []
-
-        urls: List[str] = []
-        for backend in ("api", "html", "lite"):
-            try:
-                logger.info(f"[PROVIDER-1 DDGS] backend='{backend}' query='{query}'")
-                with _DDGS(timeout=int(self.timeout)) as ddgs_client:
-                    results = list(ddgs_client.text(query, max_results=max_results, backend=backend, safesearch="on"))
-                logger.info(f"[PROVIDER-1 DDGS] backend='{backend}' returned {len(results)} raw results")
-                for r in results:
-                    href = r.get("href") or r.get("link") or ""
-                    if href:
-                        urls.append(href)
-                if urls:
-                    logger.info(f"[PROVIDER-1 DDGS] backend='{backend}' succeeded: {len(urls)} candidate URLs")
-                    return urls
-            except Exception as ex:
-                logger.debug(f"[PROVIDER-1 DDGS] backend='{backend}' exception: {ex}")
-
-        return []
-
-    # ------------------------------------------------------------------
-    # Provider 2: Bing HTML Scraper (multi-page async pagination)
-    # ------------------------------------------------------------------
-    async def _bing_search(self, query: str, client: httpx.AsyncClient, max_results: int = 30) -> List[str]:
-        """
-        Performs a Bing web search and extracts organic result URLs across multiple pages.
-        Handles Bing's base64-encoded redirect links (/ck/a?!).
-        """
-        clean_q = self.sanitize_search_query(query)
-        urls: List[str] = []
-        page_offsets = [1, 11, 21, 31][:max(1, min((max_results + 9) // 10, 4))]
-
-        for first_offset in page_offsets:
-            try:
-                resp = await client.get(
-                    "https://www.bing.com/search",
-                    params={"q": clean_q, "first": str(first_offset), "setlang": "en", "adlt": "strict"},
-                )
-                if resp.status_code != 200:
-                    break
-
-                soup = BeautifulSoup(resp.text, "html.parser")
-                selectors = [
-                    "li.b_algo h2 a",
-                    "li.b_algo .b_title a",
-                    "li.b_algo .b_algoheader a",
-                    "li.b_algo h3 a",
-                ]
-                page_found = 0
-                for sel in selectors:
-                    anchors = soup.select(sel)
-                    for a in anchors:
-                        href = a.get("href", "").strip()
-                        if href and href not in urls:
-                            urls.append(href)
-                            page_found += 1
-                    if page_found >= 10:
-                        break
-
-                if page_found == 0:
-                    break
-            except Exception as ex:
-                logger.debug(f"[PROVIDER-2 BING] offset={first_offset} exception: {ex}")
-                break
-
-        logger.info(f"[PROVIDER-2 BING] Extracted {len(urls)} raw anchors for '{clean_q}'")
-        return urls
-
-    # ------------------------------------------------------------------
-    # Provider 3: Yahoo Search HTML (async)
-    # ------------------------------------------------------------------
-    async def _yahoo_search(self, query: str, client: httpx.AsyncClient, max_results: int = 20) -> List[str]:
-        """Performs a Yahoo search and extracts organic result URLs."""
-        clean_q = self.sanitize_search_query(query)
-        urls: List[str] = []
-        try:
-            resp = await client.get(
-                "https://search.yahoo.com/search",
-                params={"p": clean_q, "n": str(max_results)},
-            )
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                selectors = [
-                    "div.compTitle h3 a",
-                    "ol.searchCenterMiddle li h3 a",
-                    "div.algo h3 a",
-                    "h3.title a",
-                ]
-                for sel in selectors:
-                    anchors = soup.select(sel)
-                    for a in anchors:
-                        href = a.get("href", "").strip()
-                        if href and href not in urls:
-                            urls.append(href)
-                logger.info(f"[PROVIDER-3 YAHOO] Extracted {len(urls)} raw anchors for '{clean_q}'")
-        except Exception as ex:
-            logger.debug(f"[PROVIDER-3 YAHOO] Exception: {ex}")
-        return urls
-
-    # ------------------------------------------------------------------
-    # Provider 4: Brave Search HTML (async)
-    # ------------------------------------------------------------------
-    async def _brave_search(self, query: str, client: httpx.AsyncClient, max_results: int = 20) -> List[str]:
-        """Performs a Brave web search and extracts organic result URLs."""
-        clean_q = self.sanitize_search_query(query)
-        urls: List[str] = []
-        try:
-            resp = await client.get(
-                "https://search.brave.com/search",
-                params={"q": clean_q, "source": "web"},
-            )
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                selectors = [
-                    "a.heading-link",
-                    "a.snippet",
-                    "div.snippet a[href^='http']",
-                    "a[data-test-id='result-link']",
-                ]
-                for sel in selectors:
-                    anchors = soup.select(sel)
-                    for a in anchors:
-                        href = a.get("href", "").strip()
-                        if href and href not in urls:
-                            urls.append(href)
-                logger.info(f"[PROVIDER-4 BRAVE] Extracted {len(urls)} raw anchors for '{clean_q}'")
-        except Exception as ex:
-            logger.debug(f"[PROVIDER-4 BRAVE] Exception: {ex}")
-        return urls
-
-    # ------------------------------------------------------------------
-    # Provider 5: DuckDuckGo Lite HTTP POST (legacy, async)
-    # ------------------------------------------------------------------
-    async def _ddg_lite_post(self, query: str, client: httpx.AsyncClient) -> List[str]:
-        """Legacy DDG Lite POST fallback (useful backup)."""
-        clean_q = self.sanitize_search_query(query)
-        urls: List[str] = []
-        try:
-            resp = await client.post("https://lite.duckduckgo.com/lite/", data={"q": clean_q})
-            if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                for a_tag in soup.select(".result-link"):
-                    href = a_tag.get("href", "")
-                    if href and href not in urls:
-                        urls.append(href)
-                logger.info(f"[PROVIDER-5 DDG-LITE] Returned {len(urls)} raw links for '{clean_q}'")
-        except Exception as ex:
-            logger.debug(f"[PROVIDER-5 DDG-LITE] Exception: {ex}")
-        return urls
-
-    # ------------------------------------------------------------------
-    # Query variation generator for a niche+city pair
-    # ------------------------------------------------------------------
     @staticmethod
     def build_query_variations(niche: str, city: str, country: str) -> List[str]:
-        """
-        Generates diverse query variations designed to surface real B2B company
-        contact pages rather than directories, blogs, or social networks.
-        Dynamically adapts between construction-specific and universal multi-niche commercial queries.
-
-        CLOUD-DATACENTER STRATEGY: Broad, unquoted queries are listed FIRST because
-        heavily-quoted queries consistently fail on Railway/cloud IPs (Bing/DDGS filter them).
-        Quoted/precise variations are added afterward as supplementary depth queries.
-        """
+        """Generates diverse search queries for niche, city, and country."""
         n = niche.strip()
         c = city.strip()
-        n_lower = n.lower()
-        construction_keywords = (
-            "construction", "contractor", "hochbau", "tiefbau", "bâtiment",
-            "building", "roofing", "mep", "tga", "civil", "infrastructure",
-            "architecture", "architect", "engineering", "plumbing", "electrical",
-            "bauunternehmen", "travaux", "edificación", "general contractors"
-        )
-        is_construction = any(ck in n_lower for ck in construction_keywords)
-
-        if is_construction:
-            return [
-                # Cloud-friendly broad queries FIRST (no heavy quoting)
-                f"{n} companies {c} contact email",
-                f"{n} contractors {c} email",
-                f"{n} {c} company website contact",
-                f"{n} general contractors {c} contact email",
-                f'{n} {c} "contact us" email',
-                # Deeper quoted variations
-                f'"{n}" "{c}" "estimating" OR "tenders" contact email',
-                f'"{n}" contractors "{c}" contact email',
-                f'"{n}" firms "{c}" contact phone email',
-                f'{n} company "{c}" "{country}" contact',
-                f'"{n}" suppliers "{c}" "{country}" email',
-            ]
-        else:
-            return [
-                # Cloud-friendly broad queries FIRST (no heavy quoting — works on cloud IPs)
-                f"{n} companies {c} contact email",
-                f"{n} {c} company email",
-                f"{n} {c} contact us",
-                f"{n} agency {c} email contact",
-                f"{n} software {c} company contact",
-                f"{n} {c} {country} company website",
-                f"{n} {c} business email info",
-                # Quoted variations for deeper recall
-                f'"{n}" "{c}" contact email',
-                f'"{n}" "{c}" "contact us" email',
-                f'"{n}" agency OR company OR firm "{c}" email',
-                f'"{n}" "{c}" inurl:contact',
-                f'"{n}" "{c}" ("inquiries" OR "office") email',
-                f'"{n}" "{c}" official website contact',
-                f'"{n}" "{c}" "info@" OR "contact@"',
-                f'"{n}" specialists "{c}" contact phone',
-            ]
-
-    # ------------------------------------------------------------------
-    # GitHub Org Discovery — works from cloud datacenter IPs (60 req/hr)
-    # ------------------------------------------------------------------
-    async def _github_org_search(self, city: str, niche: str, max_results: int = 20) -> List[str]:
-        """
-        Queries the GitHub public search API for organisations located in the target city.
-        GitHub does NOT block cloud/datacenter IPs and requires no auth (60 req/hr limit).
-        Returns a list of company website URLs harvested from GitHub org profiles.
-        """
-        urls: List[str] = []
-        queries = [
-            f'location:"{city}" type:org {niche}',
-            f'location:"{city}" type:org',
+        co = country.strip()
+        return [
+            f"{n} in {c} {co}",
+            f"{n} companies {c}",
+            f"{n} contractors in {c} contact",
+            f"{n} firms {c} email",
+            f"best {n} {c} official website",
+            f"{n} services in {c}",
+            f"{n} {c} contact email",
+            f"{n} {c} tenders projects",
+            f"{n} commercial {c} contact",
+            f"{n} suppliers in {c} {co}",
         ]
-        try:
-            async with httpx.AsyncClient(
-                headers={"User-Agent": "NexusPulse/2.0", "Accept": "application/vnd.github+json"},
-                timeout=10.0,
-                verify=False,
-                follow_redirects=True,
-            ) as gh_client:
-                for q in queries:
-                    if len(urls) >= max_results:
-                        break
-                    try:
-                        r = await gh_client.get(
-                            "https://api.github.com/search/users",
-                            params={"q": q, "per_page": min(max_results, 30), "type": "org"},
-                        )
-                        logger.info(f"[GITHUB-DISCOVERY] query='{q}' status={r.status_code}")
-                        if r.status_code != 200:
-                            continue
-                        items = r.json().get("items", [])
-                        for item in items:
-                            if len(urls) >= max_results:
-                                break
-                            login = item.get("login", "")
-                            if not login:
-                                continue
-                            try:
-                                r2 = await gh_client.get(f"https://api.github.com/users/{login}", timeout=5.0)
-                                if r2.status_code == 200:
-                                    profile = r2.json()
-                                    blog = (profile.get("blog") or "").strip()
-                                    if blog and not blog.startswith("http"):
-                                        blog = f"https://{blog}"
-                                    if blog and blog.startswith("http"):
-                                        urls.append(blog)
-                                        logger.info(f"[GITHUB-DISCOVERY] ✓ {login} → {blog}")
-                            except Exception as _gh_user_ex:
-                                logger.debug(f"[GITHUB-DISCOVERY] User fetch error for {login}: {_gh_user_ex}")
-                    except Exception as _gh_q_ex:
-                        logger.debug(f"[GITHUB-DISCOVERY] Query error '{q}': {_gh_q_ex}")
-        except Exception as _gh_ex:
-            logger.debug(f"[GITHUB-DISCOVERY] Session error: {_gh_ex}")
-        logger.info(f"[GITHUB-DISCOVERY] Harvested {len(urls)} org website URLs for city='{city}' niche='{niche}'")
-        return urls
 
     # ------------------------------------------------------------------
-    # Main discovery entry point (Parallel Multi-Source)
+    # Serper Places JSON API (https://google.serper.dev/places)
+    # ------------------------------------------------------------------
+    async def query_serper_places(
+        self,
+        query: str,
+        country: str,
+        client: httpx.AsyncClient,
+        is_cancelled: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """Queries Serper Places API to discover verified local commercial businesses."""
+        if is_cancelled and is_cancelled():
+            return []
+        key = self.check_api_key()
+        gl = resolve_serper_gl(country)
+        hl = resolve_serper_hl(country)
+        headers = {
+            "X-API-KEY": key,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "q": query.strip(),
+            "gl": gl,
+            "hl": hl,
+        }
+        logger.info(f"[SERPER:PLACES] Requesting: '{query}' (gl={gl}, hl={hl})")
+        try:
+            resp = await client.post(
+                "https://google.serper.dev/places",
+                json=payload,
+                headers=headers,
+                timeout=self.timeout,
+            )
+        except Exception as ex:
+            logger.error(f"[SERPER:PLACES] Network/HTTP error: {ex}")
+            raise SerperAPIError(f"Serper.dev places request failed: {ex}") from ex
+
+        if resp.status_code == 401:
+            raise SerperAPIError("Serper.dev API error (401): Unauthorized. Invalid SERPER_API_KEY.")
+        if resp.status_code == 403:
+            raise SerperAPIError("Serper.dev API error (403): Forbidden. Check account permissions.")
+        if resp.status_code == 429:
+            raise SerperAPIError("Serper.dev API error (429): Quota exceeded or rate limited on Serper.dev.")
+        if resp.status_code >= 400:
+            raise SerperAPIError(f"Serper.dev API error ({resp.status_code}): {resp.text}")
+
+        try:
+            data = resp.json()
+        except Exception as parse_err:
+            raise SerperAPIError(f"Serper.dev places response JSON parse error: {parse_err}") from parse_err
+
+        places = data.get("places", [])
+        logger.info(f"[SERPER:PLACES] Found {len(places)} listings for '{query}'")
+        return places
+
+    # ------------------------------------------------------------------
+    # Serper Search JSON API (https://google.serper.dev/search)
+    # ------------------------------------------------------------------
+    async def query_serper_search(
+        self,
+        query: str,
+        country: str,
+        page: int,
+        client: httpx.AsyncClient,
+        num: int = 20,
+        is_cancelled: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """Queries Serper Search API for Google organic search results with pagination."""
+        if is_cancelled and is_cancelled():
+            return []
+        key = self.check_api_key()
+        gl = resolve_serper_gl(country)
+        hl = resolve_serper_hl(country)
+        headers = {
+            "X-API-KEY": key,
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "q": query.strip(),
+            "gl": gl,
+            "hl": hl,
+            "num": num,
+            "page": page,
+        }
+        logger.info(f"[SERPER:SEARCH] Requesting: '{query}' (page={page}, gl={gl}, hl={hl})")
+        try:
+            resp = await client.post(
+                "https://google.serper.dev/search",
+                json=payload,
+                headers=headers,
+                timeout=self.timeout,
+            )
+        except Exception as ex:
+            logger.error(f"[SERPER:SEARCH] Network/HTTP error: {ex}")
+            raise SerperAPIError(f"Serper.dev search request failed: {ex}") from ex
+
+        if resp.status_code == 401:
+            raise SerperAPIError("Serper.dev API error (401): Unauthorized. Invalid SERPER_API_KEY.")
+        if resp.status_code == 403:
+            raise SerperAPIError("Serper.dev API error (403): Forbidden. Check account permissions.")
+        if resp.status_code == 429:
+            raise SerperAPIError("Serper.dev API error (429): Quota exceeded or rate limited on Serper.dev.")
+        if resp.status_code >= 400:
+            raise SerperAPIError(f"Serper.dev API error ({resp.status_code}): {resp.text}")
+
+        try:
+            data = resp.json()
+        except Exception as parse_err:
+            raise SerperAPIError(f"Serper.dev search response JSON parse error: {parse_err}") from parse_err
+
+        items: List[Dict[str, Any]] = []
+        for org in data.get("organic", []):
+            link = org.get("link", "")
+            title = org.get("title", "")
+            snippet = org.get("snippet", "")
+            if link:
+                items.append({
+                    "title": title,
+                    "link": link,
+                    "snippet": snippet,
+                    "source": "serper_organic"
+                })
+        for pl in data.get("places", []):
+            website = pl.get("website", "")
+            if website:
+                items.append({
+                    "title": pl.get("title", ""),
+                    "link": website,
+                    "phone": pl.get("phoneNumber", ""),
+                    "address": pl.get("address", ""),
+                    "source": "serper_places"
+                })
+        logger.info(f"[SERPER:SEARCH] Found {len(items)} candidate links for '{query}' (page={page})")
+        return items
+
+    # ------------------------------------------------------------------
+    # Main Discovery Entry Point: Fast Serper Places & Search Pipeline
     # ------------------------------------------------------------------
     async def discover_candidate_urls(
         self,
-        queries: List[Dict[str, str]],
+        queries: Optional[List[Any]] = None,
         limit: int = 20,
-        country: str = "United Kingdom",
-        city: str = "London",
+        country: str = "Pakistan",
+        city: str = "Lahore",
         niche: str = "Commercial Construction",
         excluded_domains: Optional[Set[str]] = None,
         is_cancelled: Optional[Any] = None,
     ) -> List[str]:
         """
-        Runs the parallel multi-source search pipeline across Bing, DDGS, Yahoo, Brave, and DDG-Lite,
-        returning up to `limit` unique company root-domain URLs, automatically excluding already
-        captured/seen domains.
+        Runs high-speed domain discovery via Serper.dev Places and Search APIs.
+        Expands queries and pagination until the candidate domain requirement is met.
+        Strictly enforces cancellation checks to halt immediately on cancel.
         """
+        if is_cancelled and is_cancelled():
+            logger.info("[SERPER:DISCOVERY] Cancellation signal observed before start — aborting.")
+            return []
+
+        # Validate that SERPER_API_KEY is present; raises explicit MissingSerperApiKeyError if missing
+        self.check_api_key()
+
         discovered_urls: List[str] = []
         seen_domains: Set[str] = set()
         excluded: Set[str] = {d.strip().lower() for d in (excluded_domains or set()) if d}
 
-        if is_cancelled and is_cancelled():
-            logger.info("[DISCOVERY] Cancellation signal observed before start — aborting discovery.")
-            return []
+        # Need sufficient unique candidate domains so downstream crawl delivers requested limit
+        needed_domains = max(limit * 3, 20)
 
-        # Build the full query list: existing localised queries first, then
-        # add our own commercial intent variations as extra fallback queries.
-        all_queries: List[str] = []
-        for q_item in queries:
-            if isinstance(q_item, dict):
-                raw_q = q_item.get("query", "")
-            elif isinstance(q_item, str):
-                raw_q = q_item.strip()
-            else:
-                raw_q = str(q_item).strip()
-            if raw_q and raw_q not in all_queries:
-                all_queries.append(raw_q)
-
-        variation_queries = self.build_query_variations(niche, city, country)
-        for vq in variation_queries:
-            if vq not in all_queries:
-                all_queries.append(vq)
+        def _register_candidate(raw_url: str, title: str = "", phone: str = "", address: str = "", source: str = "") -> bool:
+            if not raw_url:
+                return False
+            clean_u = self.clean_candidate_url(raw_url)
+            if not clean_u:
+                return False
+            dom = urlparse(clean_u).netloc.replace("www.", "").lower().split(":")[0]
+            if not dom or dom in excluded or dom in seen_domains:
+                return False
+            seen_domains.add(dom)
+            discovered_urls.append(clean_u)
+            self.discovered_metadata[dom] = {
+                "url": clean_u,
+                "title": title.strip() if title else "",
+                "phone": phone.strip() if phone else "",
+                "address": address.strip() if address else "",
+                "source": source
+            }
+            logger.info(f"[SERPER:DISCOVERY] ✓ Accepted [{source}] {clean_u} ({dom})")
+            return True
 
         logger.info(
-            f"[DISCOVERY] Starting multi-source parallel search | niche='{niche}' | city='{city}' "
-            f"| country='{country}' | queries={len(all_queries)} | limit={limit} | excluded={len(excluded)}"
+            f"[SERPER:DISCOVERY] Starting Serper lead discovery | niche='{niche}' | city='{city}' "
+            f"| country='{country}' | target_domains={needed_domains} | excluded={len(excluded)}"
         )
 
-        def _register_urls(raw_list: List[str], provider_name: str) -> int:
-            """Cleans and deduplicates raw URLs; returns count of new additions."""
-            added = 0
-            for raw_url in raw_list:
-                if not raw_url:
-                    continue
-                u = self.clean_candidate_url(raw_url)
-                if not u:
-                    continue
-                domain = urlparse(u).netloc.replace("www.", "").lower()
-                if not domain:
-                    continue
-                if domain in excluded:
-                    continue
-                if domain not in seen_domains:
-                    seen_domains.add(domain)
-                    discovered_urls.append(u)
-                    added += 1
-                    logger.info(f"[DISCOVERY] ✓ Accepted [{provider_name}] {u}")
-                    if len(discovered_urls) >= limit:
-                        break
-            return added
-
         async with httpx.AsyncClient(
-            headers=_rotated_headers(),
             timeout=self.timeout,
+            headers=_rotated_headers(),
             follow_redirects=True,
             verify=False,
         ) as client:
-
-            # Run GitHub org search concurrently with the first search query batch
-            # GitHub is unblocked on Railway cloud IPs and reliably returns real company websites
-            _github_task_done = False
-
-            for query_str in all_queries:
+            # 1. Serper Places API: Real local commercial businesses
+            places_queries = [
+                f"{niche} in {city} {country}",
+                f"{niche} companies in {city}",
+                f"{niche} contractors in {city}",
+                f"{niche} firms in {city}",
+            ]
+            for pq in places_queries:
                 if is_cancelled and is_cancelled():
-                    logger.info("[DISCOVERY] Cancellation signal observed — stopping discovery.")
+                    logger.info("[SERPER:DISCOVERY] Cancellation observed during places discovery.")
                     break
-                if len(discovered_urls) >= limit:
+                if len(discovered_urls) >= needed_domains:
+                    break
+                try:
+                    places = await self.query_serper_places(pq, country, client, is_cancelled=is_cancelled)
+                    for pl in places:
+                        w = pl.get("website")
+                        if w:
+                            _register_candidate(
+                                w,
+                                title=pl.get("title", ""),
+                                phone=pl.get("phoneNumber", ""),
+                                address=pl.get("address", ""),
+                                source="serper_places"
+                            )
+                            if len(discovered_urls) >= needed_domains:
+                                break
+                except SerperAPIError:
+                    raise
+                except Exception as ex:
+                    logger.warning(f"[SERPER:DISCOVERY] Places query '{pq}' warning: {ex}")
+
+            # 2. Serper Search API: Multi-page organic search
+            search_query_list: List[str] = []
+            if queries:
+                for q in queries:
+                    q_str = q.get("query") if isinstance(q, dict) else str(q)
+                    q_str = q_str.strip() if q_str else ""
+                    if q_str and q_str not in search_query_list:
+                        search_query_list.append(q_str)
+
+            built_queries = [
+                f"{niche} in {city} {country}",
+                f"{niche} companies {city} {country}",
+                f"{niche} contractors {city} official website",
+                f"best {niche} in {city}",
+                f"{niche} firms {city} email contact",
+                f"{niche} services in {city}",
+                f"{niche} {city} tenders projects",
+                f"{niche} commercial {city} contact",
+                f"{niche} suppliers in {city}",
+            ]
+            for bq in built_queries:
+                if bq not in search_query_list:
+                    search_query_list.append(bq)
+
+            for sq in search_query_list:
+                if is_cancelled and is_cancelled():
+                    logger.info("[SERPER:DISCOVERY] Cancellation observed during organic search.")
+                    break
+                if len(discovered_urls) >= needed_domains:
                     break
 
-                logger.info(f"[DISCOVERY] ━━ Processing query: '{query_str[:80]}...' ━━")
-
-                # Launch search providers in parallel for maximum recall
-                # On first query, also fire GitHub org search as a bonus provider
-                if not _github_task_done:
-                    _github_task_done = True
-                    tasks = [
-                        asyncio.get_event_loop().run_in_executor(
-                            None, self._ddgs_search, query_str, max(limit * 2, 20)
-                        ),
-                        self._bing_search(query_str, client, max_results=max(limit * 2, 25)),
-                        self._yahoo_search(query_str, client, max_results=max(limit, 15)),
-                        self._brave_search(query_str, client, max_results=max(limit, 15)),
-                        self._github_org_search(city, niche, max_results=min(limit, 25)),
-                    ]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    p_names = ["DDGS", "BING", "YAHOO", "BRAVE", "GITHUB"]
-                else:
-                    tasks = [
-                        asyncio.get_event_loop().run_in_executor(
-                            None, self._ddgs_search, query_str, max(limit * 2, 20)
-                        ),
-                        self._bing_search(query_str, client, max_results=max(limit * 2, 25)),
-                        self._yahoo_search(query_str, client, max_results=max(limit, 15)),
-                        self._brave_search(query_str, client, max_results=max(limit, 15)),
-                    ]
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    p_names = ["DDGS", "BING", "YAHOO", "BRAVE"]
-
-                # Process results from all successful providers
-                for i, res in enumerate(results):
-                    if isinstance(res, list) and res:
-                        _register_urls(res, p_names[i])
-                        if len(discovered_urls) >= limit:
+                for page in (1, 2, 3):
+                    if is_cancelled and is_cancelled():
+                        break
+                    if len(discovered_urls) >= needed_domains:
+                        break
+                    try:
+                        search_items = await self.query_serper_search(
+                            sq, country, page=page, client=client, num=20, is_cancelled=is_cancelled
+                        )
+                        if not search_items:
                             break
-
-                # If still under limit and all yielded few, query DDG Lite
-                if len(discovered_urls) < limit:
-                    lite_res = await self._ddg_lite_post(query_str, client)
-                    if lite_res:
-                        _register_urls(lite_res, "DDG-LITE")
-
-                if is_cancelled and is_cancelled():
-                    break
-                if len(discovered_urls) >= limit:
-                    break
+                        for item in search_items:
+                            link = item.get("link")
+                            if link:
+                                _register_candidate(
+                                    link,
+                                    title=item.get("title", ""),
+                                    phone=item.get("phone", ""),
+                                    address=item.get("address", ""),
+                                    source=item.get("source", "serper_organic")
+                                )
+                                if len(discovered_urls) >= needed_domains:
+                                    break
+                    except SerperAPIError:
+                        raise
+                    except Exception as ex:
+                        logger.warning(f"[SERPER:DISCOVERY] Search query '{sq}' (page {page}) warning: {ex}")
+                        break
 
         total = len(discovered_urls)
-        logger.info(
-            f"[DISCOVERY] ✅ Multi-source search complete — {total} unique candidate domains discovered "
-            f"(limit={limit})"
-        )
-        return discovered_urls[:limit]
+        logger.info(f"[SERPER:DISCOVERY] Discovery complete — {total} unique candidate domains collected (limit={limit})")
+        return discovered_urls[:needed_domains]
 
 
 # ===========================================================================
@@ -1191,6 +1197,7 @@ class DeepScraperAgent:
         city: str = "London",
         niche: str = "Commercial Construction",
         is_cancelled: Optional[Any] = None,
+        known_metadata: Optional[Dict[str, Any]] = None,
     ) -> Optional[Lead]:
         """
         Asynchronously scrapes a target company URL with strict short connect/read timeouts.
@@ -1267,13 +1274,20 @@ class DeepScraperAgent:
                     headers=headers_dict,
                 )
 
-                if lead and lead.all_emails and len(lead.all_emails) >= 3:
+                if lead and lead.all_emails and len(lead.all_emails) >= 4:
                     logger.info(
-                        f"[SCRAPER] ✅ Root page hit on {target_url} (3+ emails): "
+                        f"[SCRAPER] ✅ Root page hit on {target_url} (4 emails): "
                         f"{len(lead.all_emails)} email(s) | Primary: {lead.primary_email} | "
                         f"Company: {lead.company_name}"
                     )
-                    lead.all_emails = lead.all_emails[:3]
+                    lead.all_emails = lead.all_emails[:4]
+                    if known_metadata:
+                        k_title = (known_metadata.get("title") or "").strip()
+                        if k_title and (not lead.company_name or len(lead.company_name) <= 3 or lead.company_name.lower() == base_domain.split('.')[0]):
+                            lead.company_name = k_title
+                        k_phone = (known_metadata.get("phone") or "").strip()
+                        if k_phone and k_phone not in lead.phone_numbers:
+                            lead.phone_numbers.append(k_phone)
                     return lead
 
                 # ── Attempt 2: Discover contact subpages ─────────────
@@ -1403,7 +1417,7 @@ class DeepScraperAgent:
                                     lead = sub_lead
                                 elif (not lead.company_name or len(lead.company_name) <= 2) and sub_lead.company_name:
                                     lead.company_name = sub_lead.company_name
-                                if len(all_found_emails) >= 3:
+                                if len(all_found_emails) >= 4:
                                     break
                             else:
                                 logger.debug(f"[SCRAPER] No valid emails on subpage {sub_url}")
@@ -1413,10 +1427,17 @@ class DeepScraperAgent:
                 if all_found_emails and lead:
                     # Sort by priority score descending
                     ranked_list = sorted(all_found_emails.values(), key=lambda e: e.priority_score, reverse=True)
-                    # Keep up to 3 distinct valid emails
-                    lead.all_emails = ranked_list[:3]
+                    # Keep up to 4 distinct valid emails
+                    lead.all_emails = ranked_list[:4]
                     lead.primary_email = lead.all_emails[0].email
                     lead.primary_email_tier = lead.all_emails[0].tier
+                    if known_metadata:
+                        k_title = (known_metadata.get("title") or "").strip()
+                        if k_title and (not lead.company_name or len(lead.company_name) <= 3 or lead.company_name.lower() == base_domain.split('.')[0]):
+                            lead.company_name = k_title
+                        k_phone = (known_metadata.get("phone") or "").strip()
+                        if k_phone and k_phone not in lead.phone_numbers:
+                            lead.phone_numbers.append(k_phone)
                     logger.info(
                         f"[SCRAPER] ✅ Aggregated {len(lead.all_emails)} distinct email(s) for {base_domain} "
                         f"(Primary: {lead.primary_email}): {[e.email for e in lead.all_emails]}"

@@ -670,3 +670,6 @@ class LeadValidationFilter:
             return True, f"Entity suppressed due to opt-out or bounce: ({suppressed['reason']})"
 
         return False, "Lead is fresh and unique"
+
+
+is_lead_duplicate_or_blacklisted = LeadValidationFilter.is_lead_duplicate_or_blacklisted

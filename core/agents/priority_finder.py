@@ -30,7 +30,7 @@ TIER_2_PREFIXES = {
     "director", "managing-director", "md", "ceo", "commercial",
     "contracts", "projects", "operations", "management", "partner",
     "executive", "head", "vp", "president", "sales", "businessdev", "bd",
-    "geschaeftsfuehrung", "direction", "gerencia"
+    "geschaeftsfuehrung", "direction", "gerencia", "legal", "counsel"
 }
 
 TIER_3_PREFIXES = {

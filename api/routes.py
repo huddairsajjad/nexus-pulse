@@ -38,6 +38,7 @@ def _register_job(job_id: str, op_id: str) -> None:
             "result": None,
             "error": None,
             "cancelled": False,
+            "cancel_event": threading.Event(),
         }
 
 
@@ -55,7 +56,16 @@ def _get_job(job_id: str) -> Optional[Dict[str, Any]]:
 def _is_job_cancelled(job_id: str) -> bool:
     with _scrape_jobs_lock:
         job = _scrape_jobs.get(job_id)
-        return bool(job and job.get("cancelled"))
+        if not job:
+            return False
+        ev = job.get("cancel_event")
+        return bool(job.get("cancelled") or (ev is not None and ev.is_set()))
+
+
+def _get_job_cancel_event(job_id: str) -> Optional[threading.Event]:
+    with _scrape_jobs_lock:
+        job = _scrape_jobs.get(job_id)
+        return job.get("cancel_event") if job else None
 
 
 def _prune_old_jobs(max_age_seconds: int = 7200) -> None:
@@ -76,7 +86,12 @@ from security.license_validator import load_or_initialize_license
 from security.crypto_vault import get_crypto_vault
 from core.agents.localization_engine import LocalizationEngine
 from core.hygiene.zero_bounce_shield import get_hygiene_shield
-from core.agents.scraper_agent import DeepScraperAgent, SearchDiscoveryAgent
+from core.agents.scraper_agent import (
+    DeepScraperAgent,
+    SearchDiscoveryAgent,
+    SerperAPIError,
+    MissingSerperApiKeyError,
+)
 from core.outreach.dedup_engine import is_historically_seen, register_domain_seen
 from core.outreach.mx_verifier import verify_mx_record
 from database.deduplication_shield import get_dedup_shield
@@ -2028,10 +2043,18 @@ async def _run_scrape_job(
             except Exception as _dedup_err:
                 logger.debug(f"[HUNT:{job_id}] Dedup check error: {_dedup_err}")
 
+            known_meta = discovery_agent.discovered_metadata.get(domain_part) if hasattr(discovery_agent, "discovered_metadata") else None
             async with crawl_sem:
                 if _cancelled() or len(verified_leads) >= limit:
                     return
-                lead = await scraper.scrape_url(url=clean_url, country=country, city=city_override, niche=niche, is_cancelled=_cancelled)
+                lead = await scraper.scrape_url(
+                    url=clean_url,
+                    country=country,
+                    city=city_override,
+                    niche=niche,
+                    is_cancelled=_cancelled,
+                    known_metadata=known_meta,
+                )
 
             if _cancelled():
                 return
@@ -2046,8 +2069,8 @@ async def _run_scrape_job(
 
                 total_emails_extracted += len(lead.all_emails)
 
-                # Multi-Email Extraction: Queue up to 3 distinct valid emails per organization
-                candidate_emails = lead.all_emails[:3]
+                # Multi-Email Extraction: Queue up to 4 distinct valid emails per organization (including legal@, sales@, info@, etc.)
+                candidate_emails = lead.all_emails[:4]
                 saved_any_for_company = False
 
                 for scraped_em in candidate_emails:
@@ -2120,6 +2143,8 @@ async def _run_scrape_job(
                                     register_domain_seen(lead.domain, target_email, pres.get("lead_id"), _reg_conn, owner_username=owner)
                             except Exception:
                                 pass
+                            if len(verified_leads) >= limit:
+                                break
                         else:
                             rejected_leads.append({
                                 "domain": lead.domain, "email": target_email,
@@ -2203,15 +2228,35 @@ async def _run_scrape_job(
                 needed_discovery = max((limit - len(verified_leads)) * 3, 15)
                 logger.info(f"[HUNT:{job_id}] Discovering with queries: {next_queries[:2]} (target {needed_discovery} domains)")
                 print(f"[HUNT:{job_id}] 🔍 DISCOVERY queries_run={queries_run} target={needed_discovery} sample={str(next_queries[0])[:80]}", flush=True)
-                discovered = await discovery_agent.discover_candidate_urls(
-                    queries=next_queries,
-                    limit=needed_discovery,
-                    country=country,
-                    city=city_override,
-                    niche=niche,
-                    excluded_domains=_existing_domains,
-                    is_cancelled=_cancelled,
-                )
+                try:
+                    discovered = await discovery_agent.discover_candidate_urls(
+                        queries=next_queries,
+                        limit=needed_discovery,
+                        country=country,
+                        city=city_override,
+                        niche=niche,
+                        excluded_domains=_existing_domains,
+                        is_cancelled=_cancelled,
+                    )
+                except (MissingSerperApiKeyError, SerperAPIError) as serper_err:
+                    err_msg = str(serper_err)
+                    logger.error(f"[HUNT:{job_id}] Serper API discovery error: {err_msg}")
+                    print(f"[HUNT:{job_id}] ❌ SERPER ERROR: {err_msg}", flush=True)
+                    err_result = {
+                        "status": "ERROR",
+                        "target": {"country": country, "niche": niche, "city": city_override, "region": region},
+                        "scraped_count": len(scraped_leads_summary),
+                        "verified_count": len(verified_leads),
+                        "leads_preserved_count": len(verified_leads),
+                        "leads_rejected_count": len(rejected_leads),
+                        "scraped_leads": scraped_leads_summary,
+                        "verified_leads": verified_leads,
+                        "rejected_leads": rejected_leads,
+                        "error": err_msg,
+                        "message": f"Serper API Discovery Error: {err_msg}",
+                    }
+                    _update_job(job_id, status="ERROR", completed_at=datetime.now(timezone.utc).isoformat(), error=err_msg, result=err_result)
+                    return
                 new_candidates = [u for u in discovered if u.lower() not in seen_candidate_urls]
                 for u in new_candidates:
                     seen_candidate_urls.add(u.lower())
@@ -2307,6 +2352,24 @@ async def _run_scrape_job(
         _prune_old_jobs()
         logger.info(f"[HUNT:{job_id}] Completed: verified={verified_count}, filtered={rejected_count}")
 
+    except (MissingSerperApiKeyError, SerperAPIError) as serper_exc:
+        err_msg = str(serper_exc)
+        logger.error(f"[HUNT:{job_id}] Serper API error: {err_msg}")
+        print(f"[HUNT:{job_id}] ❌ SERPER ERROR: {err_msg}", flush=True)
+        err_res = {
+            "status": "ERROR",
+            "target": {"country": country, "niche": niche, "city": city_override, "region": region},
+            "scraped_count": 0,
+            "verified_count": 0,
+            "leads_preserved_count": 0,
+            "leads_rejected_count": 0,
+            "scraped_leads": [],
+            "verified_leads": [],
+            "rejected_leads": [],
+            "error": err_msg,
+            "message": f"Serper API Error: {err_msg}",
+        }
+        _update_job(job_id, status="ERROR", completed_at=datetime.now(timezone.utc).isoformat(), error=err_msg, result=err_res)
     except Exception as exc:
         logger.error(f"[HUNT:{job_id}] Unhandled error: {exc}", exc_info=True)
         print(f"[HUNT:{job_id}] ❌ EXCEPTION: {exc}", flush=True)
@@ -2399,7 +2462,7 @@ def get_scrape_job_status(job_id: str, current_user: Dict[str, Any] = Depends(ge
 
 @router.post("/scrape/cancel/{job_id}")
 def cancel_scrape_job(job_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Signal a running Hunt & Verify background job to abort cleanly."""
+    """Signal a running Hunt & Verify background job to abort cleanly and immediately."""
     job = _get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Scrape job '{job_id}' not found.")
@@ -2407,8 +2470,18 @@ def cancel_scrape_job(job_id: str, current_user: Dict[str, Any] = Depends(get_cu
         raise HTTPException(status_code=403, detail="Access denied: job belongs to another operator.")
     if job.get("status") not in ("RUNNING",):
         return {"success": False, "message": f"Job is already in '{job.get('status')}' state — nothing to cancel."}
-    _update_job(job_id, cancelled=True)
-    return {"success": True, "job_id": job_id, "message": "Cancellation signal sent. The crawl will stop cleanly after the current URL."}
+
+    with _scrape_jobs_lock:
+        raw_job = _scrape_jobs.get(job_id)
+        if raw_job:
+            raw_job["cancelled"] = True
+            raw_job["status"] = "CANCELLED"
+            raw_job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            ev = raw_job.get("cancel_event")
+            if ev is not None:
+                ev.set()
+
+    return {"success": True, "job_id": job_id, "message": "Cancellation signal sent. Hunt stopped immediately."}
 
 
 # -------------------------------------------------------------
