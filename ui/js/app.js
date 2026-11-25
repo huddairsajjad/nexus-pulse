@@ -1498,6 +1498,26 @@ function doPost(e) {
             try {
               statusData = await statusResp.json();
             } catch (pErr) {
+              if (!statusResp.ok) {
+                clearInterval(pollTimer);
+                scrapePollTimerRef.current = null;
+                setActiveScrapeJobId(null);
+                isHuntingRef.current = false;
+                setIsHunting(false);
+                setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
+                setAlertBanner({ type: "danger", message: `Scrape status check failed (HTTP ${statusResp.status}).` });
+              }
+              return;
+            }
+
+            if (!statusResp.ok) {
+              clearInterval(pollTimer);
+              scrapePollTimerRef.current = null;
+              setActiveScrapeJobId(null);
+              isHuntingRef.current = false;
+              setIsHunting(false);
+              setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
+              setAlertBanner({ type: "danger", message: statusData.detail || `Scrape status error (HTTP ${statusResp.status}).` });
               return;
             }
 
@@ -1507,10 +1527,10 @@ function doPost(e) {
               setActiveScrapeJobId(null);
               isHuntingRef.current = false;
               setIsHunting(false);
-              setPulseState("RUNNING");
+              setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
               setIsHuntModalOpen(false);
 
-              const resObj = statusData.result || {};
+              const resObj = statusData.result || statusData || {};
               const scraped = resObj.scraped_leads || [];
               const verified = resObj.verified_leads || [];
               const fb = resObj.filter_breakdown;
@@ -1518,7 +1538,7 @@ function doPost(e) {
 
               setKanbanItems(prev => {
                 const existingIds = new Set(prev.map(i => i.id));
-                const newItems = [...scraped, ...verified].filter(i => !existingIds.has(i.id));
+                const newItems = [...scraped, ...verified].filter(i => i && i.id && !existingIds.has(i.id));
                 return [...newItems, ...prev];
               });
 
@@ -1537,7 +1557,8 @@ function doPost(e) {
               setPulseState(uniqueHotLeads.length > 0 ? "HOT_ALERT" : "RUNNING");
               setIsHuntModalOpen(false);
               fetchData();
-              const preservedCount = statusData.result?.leads_preserved_count || statusData.result?.verified_count || 0;
+              const resObj = statusData.result || statusData || {};
+              const preservedCount = resObj.leads_preserved_count || resObj.verified_count || 0;
               setAlertBanner({ type: "info", message: `Crawl stopped by operator. ${preservedCount} verified lead(s) preserved in pipeline.` });
             } else if (statusData.status === "ERROR" || statusData.status === "FAILED") {
               clearInterval(pollTimer);
@@ -3545,7 +3566,7 @@ function doPost(e) {
           {/* Quick Primary Actions */}
           <div className="pt-2 border-t border-[var(--border-subtle)] space-y-1.5">
             <button
-              onClick={() => { setIsHuntModalOpen(true); setHuntProgress(null); }}
+              onClick={() => { setIsHuntModalOpen(true); if (!isHuntingRef.current) setHuntProgress(null); }}
               className="btn btn-primary btn-sm w-full justify-center shadow-sm"
               title="Launch Targeted Lead Hunt"
             >
@@ -5873,25 +5894,40 @@ function doPost(e) {
 
                 <div>
                   <div className="flex items-center justify-between mb-1.5">
-                    <label className="np-label mb-0">Scraping Limit Counter</label>
-                    <span className="badge badge-accent font-bold">
-                      {huntMaxResults} Leads
-                    </span>
+                    <label className="np-label mb-0">Scraping Limit Counter (1–100)</label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min="1"
+                        max="100"
+                        value={huntMaxResults}
+                        onChange={(e) => {
+                          const v = parseInt(e.target.value, 10);
+                          if (!isNaN(v)) setHuntMaxResults(Math.max(1, Math.min(100, v)));
+                        }}
+                        className="np-input text-xs font-bold w-16 py-0.5 px-2 text-center"
+                        disabled={isHunting}
+                        aria-label="Exact lead count"
+                      />
+                      <span className="badge badge-accent font-bold">
+                        {huntMaxResults} Leads
+                      </span>
+                    </div>
                   </div>
 
                   <input
                     type="range"
-                    min="5"
+                    min="1"
                     max="100"
-                    step="5"
+                    step="1"
                     value={huntMaxResults}
-                    onChange={(e) => setHuntMaxResults(parseInt(e.target.value, 10))}
+                    onChange={(e) => setHuntMaxResults(Math.max(1, Math.min(100, parseInt(e.target.value, 10) || 1)))}
                     className="w-full"
                     disabled={isHunting}
                   />
 
                   <div className="flex justify-between text-[11px] text-theme-muted mt-1">
-                    <span>5</span>
+                    <span>1</span>
                     <span>25</span>
                     <span>50</span>
                     <span>75</span>
@@ -5916,7 +5952,12 @@ function doPost(e) {
                 {isHunting && (
                   <div className="np-alert np-alert-info">
                     <span className="w-2 h-2 rounded-full bg-[var(--accent)] animate-ping" />
-                    <span>Executing targeted crawl for {huntNiche} in {isCustomCity ? huntCustomCity : huntCity}, {huntCountry}...</span>
+                    <span>
+                      Executing targeted crawl for {huntNiche} in {isCustomCity ? huntCustomCity : huntCity}, {huntCountry}
+                      {huntProgress && typeof huntProgress.clean_count === "number"
+                        ? ` (${huntProgress.clean_count}/${huntProgress.target_lead_count || huntMaxResults} verified)...`
+                        : "..."}
+                    </span>
                   </div>
                 )}
 

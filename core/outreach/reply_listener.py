@@ -245,12 +245,19 @@ class IMAPReplyListener:
         except Exception:
             pass  # Non-fatal startup cleanup
 
-    def is_suppressed(self, email_or_domain: str) -> bool:
-        """Checks if entity exists in global suppression table or DNC list."""
+    def is_suppressed(
+        self,
+        email_or_domain: str,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None,
+    ) -> bool:
+        """Checks if entity exists in suppression table or DNC list, scoped to user workspace when given."""
         if not email_or_domain:
             return False
         clean = email_or_domain.strip().lower()
         domain = clean.split("@")[-1] if "@" in clean else clean
+        owner = (owner_username or "").strip().lower()
+        op_id = (operator_id or "").strip()
 
         # Never treat root public email providers as suppressed
         if "@" not in clean and clean in PUBLIC_EMAIL_DOMAINS:
@@ -264,33 +271,53 @@ class IMAPReplyListener:
         is_pub = is_public_email_domain(domain)
 
         with self.db.get_connection() as conn:
+            if owner or op_id:
+                sup_scope = "AND (lower(owner_username) = ? OR operator_id = ? OR owner_username = '' OR owner_username IS NULL)"
+                sup_params = [owner, op_id]
+                dnc_scope = "AND (lower(owner_username) = ? OR owner_username = '' OR owner_username IS NULL)"
+                dnc_params = [owner]
+            else:
+                sup_scope = ""
+                sup_params = []
+                dnc_scope = ""
+                dnc_params = []
+
             if is_pub:
                 # For public webmail (e.g. gmail.com), ONLY check exact email
-                row = conn.execute("""
-                    SELECT id FROM suppressed_entities WHERE lower(entity) = ?
-                """, (clean,)).fetchone()
+                row = conn.execute(
+                    f"SELECT id FROM suppressed_entities WHERE lower(entity) = ? {sup_scope}",
+                    [clean] + sup_params,
+                ).fetchone()
                 if row:
                     return True
 
-                dnc_row = conn.execute("""
-                    SELECT id FROM dnc_blacklist WHERE lower(entity) = ?
-                """, (clean,)).fetchone()
+                dnc_row = conn.execute(
+                    f"SELECT id FROM dnc_blacklist WHERE lower(entity) = ? {dnc_scope}",
+                    [clean] + dnc_params,
+                ).fetchone()
                 return dnc_row is not None
             else:
-                row = conn.execute("""
-                    SELECT id FROM suppressed_entities WHERE lower(entity) = ? OR lower(entity) = ?
-                """, (clean, domain)).fetchone()
+                row = conn.execute(
+                    f"SELECT id FROM suppressed_entities WHERE (lower(entity) = ? OR lower(entity) = ?) {sup_scope}",
+                    [clean, domain] + sup_params,
+                ).fetchone()
                 if row:
                     return True
 
-                dnc_row = conn.execute("""
-                    SELECT id FROM dnc_blacklist WHERE lower(entity) = ? OR lower(entity) = ?
-                """, (clean, domain)).fetchone()
+                dnc_row = conn.execute(
+                    f"SELECT id FROM dnc_blacklist WHERE (lower(entity) = ? OR lower(entity) = ?) {dnc_scope}",
+                    [clean, domain] + dnc_params,
+                ).fetchone()
                 return dnc_row is not None
 
-    def is_blacklisted(self, email_or_domain: str) -> bool:
+    def is_blacklisted(
+        self,
+        email_or_domain: str,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None,
+    ) -> bool:
         """Alias for is_suppressed to check blacklisted / suppressed recipients."""
-        return self.is_suppressed(email_or_domain)
+        return self.is_suppressed(email_or_domain, operator_id=operator_id, owner_username=owner_username)
 
     def _do_suppress(
         self,
@@ -321,12 +348,19 @@ class IMAPReplyListener:
             VALUES (?, ?, ?, ?)
         """, (clean, entity_type, reason, owner))
 
-        # 3. Update deduplication registry
-        conn.execute("""
-            UPDATE dedup_registry
-            SET status = 'BLACKLISTED', last_processed_at = CURRENT_TIMESTAMP
-            WHERE normalized_key = ?
-        """, (clean,))
+        # 3. Update deduplication registry scoped by owner if provided
+        if owner:
+            conn.execute("""
+                UPDATE dedup_registry
+                SET status = 'BLACKLISTED', last_processed_at = CURRENT_TIMESTAMP
+                WHERE normalized_key = ? AND lower(owner_username) = ?
+            """, (clean, owner))
+        else:
+            conn.execute("""
+                UPDATE dedup_registry
+                SET status = 'BLACKLISTED', last_processed_at = CURRENT_TIMESTAMP
+                WHERE normalized_key = ?
+            """, (clean,))
 
         # 4. Terminate followup sequences (exact for public domains, wildcard for custom corporate domains)
         if is_pub or "@" in clean:

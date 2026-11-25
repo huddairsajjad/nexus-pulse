@@ -1866,7 +1866,49 @@ _ADJACENT_REGIONS: Dict[str, List[str]] = {
     "hong kong": ["Shenzhen", "Guangzhou", "Macau"],
     "karachi": ["Lahore", "Islamabad", "Rawalpindi", "Faisalabad"],
     "lahore": ["Karachi", "Islamabad", "Faisalabad", "Multan"],
-    "islamabad": ["Rawalpindi", "Lahore", "Peshawar"],
+    "faisalabad": ["Lahore", "Karachi", "Islamabad", "Multan"],
+    "islamabad": ["Rawalpindi", "Lahore", "Faisalabad", "Peshawar"],
+    "austin": ["Dallas", "Houston", "San Antonio", "New York"],
+    "houston": ["Dallas", "Austin", "San Antonio", "Chicago"],
+    "dallas": ["Austin", "Houston", "San Antonio", "Denver"],
+}
+
+_COUNTRY_DEFAULT_CITIES: Dict[str, List[str]] = {
+    "pakistan": ["Lahore", "Karachi", "Islamabad", "Faisalabad", "Multan"],
+    "united arab emirates": ["Dubai", "Abu Dhabi", "Sharjah", "Ajman"],
+    "uae": ["Dubai", "Abu Dhabi", "Sharjah", "Ajman"],
+    "united kingdom": ["London", "Manchester", "Birmingham", "Leeds", "Bristol"],
+    "uk": ["London", "Manchester", "Birmingham", "Leeds", "Bristol"],
+    "united states": ["New York", "Austin", "Chicago", "Los Angeles", "Houston"],
+    "us": ["New York", "Austin", "Chicago", "Los Angeles", "Houston"],
+    "usa": ["New York", "Austin", "Chicago", "Los Angeles", "Houston"],
+    "germany": ["Berlin", "Munich", "Hamburg", "Frankfurt", "Cologne"],
+    "france": ["Paris", "Lyon", "Marseille", "Bordeaux"],
+    "spain": ["Madrid", "Barcelona", "Valencia", "Seville"],
+    "italy": ["Milan", "Rome", "Turin", "Bologna"],
+    "canada": ["Toronto", "Vancouver", "Montreal", "Calgary"],
+    "australia": ["Sydney", "Melbourne", "Brisbane", "Perth"],
+    "saudi arabia": ["Riyadh", "Jeddah", "Dammam"],
+    "singapore": ["Singapore"],
+}
+
+_COUNTRY_DEFAULT_REGION: Dict[str, str] = {
+    "pakistan": "Asia",
+    "united arab emirates": "Middle East",
+    "uae": "Middle East",
+    "saudi arabia": "Middle East",
+    "united kingdom": "Europe",
+    "uk": "Europe",
+    "germany": "Europe",
+    "france": "Europe",
+    "spain": "Europe",
+    "italy": "Europe",
+    "united states": "North America",
+    "us": "North America",
+    "usa": "North America",
+    "canada": "North America",
+    "australia": "APAC",
+    "singapore": "APAC",
 }
 
 
@@ -1892,7 +1934,10 @@ def _get_adjacent_regions(city: str, country: str) -> List[str]:
             return v
     try:
         prof = LocalizationEngine.resolve_country_profile(country)
-        other_cities = [c for c in prof.major_cities if c.lower() != key]
+        cities = prof.get("major_cities") if isinstance(prof, dict) else getattr(prof, "major_cities", None)
+        if not cities:
+            cities = _COUNTRY_DEFAULT_CITIES.get(country.strip().lower(), [])
+        other_cities = [c for c in cities if c.lower() != key]
         if other_cities:
             return other_cities
     except Exception:
@@ -1928,14 +1973,22 @@ async def _run_scrape_job(
     country = req.country.strip()
     niche = req.niche.strip()
     country_prof = LocalizationEngine.resolve_country_profile(country)
+    prof_cities = (
+        country_prof.get("major_cities") if isinstance(country_prof, dict) else getattr(country_prof, "major_cities", None)
+    ) or _COUNTRY_DEFAULT_CITIES.get(country.lower(), [])
+    prof_region = (
+        country_prof.get("region") if isinstance(country_prof, dict) else getattr(country_prof, "region", None)
+    ) or _COUNTRY_DEFAULT_REGION.get(country.lower(), "Global")
+
     city_override = (req.city or "").strip()
     if not city_override:
-        city_override = country_prof.major_cities[0] if country_prof.major_cities else "Capital"
+        city_override = prof_cities[0] if prof_cities else "Capital"
     region = (getattr(req, "region", None) or "").strip()
     if not region:
-        region = country_prof.region or "Global"
+        region = prof_region or "Global"
 
-    limit = max(1, min(req.max_results or 20, 100))
+    raw_limit = 20 if req.max_results is None else int(req.max_results)
+    limit = max(1, min(raw_limit, 100))
     owner = (owner_username or "").strip().lower()
     op_id = (op_id or "").strip()
 
@@ -1953,11 +2006,12 @@ async def _run_scrape_job(
     _existing_domains: set = set()
     try:
         with db.get_connection() as _pre_conn:
-            _d_rows = _pre_conn.execute("""
-                SELECT normalized_key FROM dedup_registry
-                WHERE entity_type='domain' AND (lower(owner_username) = ? OR operator_id = ?)
-            """, (owner, op_id)).fetchall()
-            _existing_domains = {r[0].strip().lower() for r in _d_rows if r[0]}
+            if owner:
+                _d_rows = _pre_conn.execute("""
+                    SELECT normalized_key FROM dedup_registry
+                    WHERE entity_type='domain' AND lower(owner_username) = ?
+                """, (owner,)).fetchall()
+                _existing_domains = {r[0].strip().lower() for r in _d_rows if r[0]}
             _q_rows = _pre_conn.execute("""
                 SELECT DISTINCT lower(substr(recipient, instr(recipient,'@')+1)) FROM outreach_queue
                 WHERE status != 'BOUNCED' AND (lower(owner_username) = ? OR operator_id = ?)
@@ -1972,7 +2026,7 @@ async def _run_scrape_job(
 
     try:
         start_time = time.time()
-        timeout_budget = 160.0  # Safe execution budget
+        timeout_budget = max(160.0, min(240.0, 45.0 + limit * 2.0))
 
         # Combine explicit seed/target URLs if provided
         initial_seeds = [u.strip() for u in (req.target_urls or []) if u.strip()]
@@ -1981,6 +2035,7 @@ async def _run_scrape_job(
 
         candidate_domains_queue: List[str] = list(initial_seeds)
         seen_candidate_urls: set = {u.lower() for u in initial_seeds}
+        tried_domains: set = set(_existing_domains)
 
         queries_run = 0
         total_domains_found = len(candidate_domains_queue)
@@ -1992,11 +2047,12 @@ async def _run_scrape_job(
         scraped_leads_summary = []
         verified_leads = []
         rejected_leads = []
+        touched_partition_dirs: set = set()
 
-        discovery_agent = SearchDiscoveryAgent(timeout_seconds=min(float(cfg.get("crawler.request_timeout_seconds", 12.0)), 5.0))
-        scraper = DeepScraperAgent(timeout_seconds=5.0)
+        discovery_agent = SearchDiscoveryAgent(timeout_seconds=min(float(cfg.get("crawler.request_timeout_seconds", 12.0)), 6.0))
+        scraper = DeepScraperAgent(timeout_seconds=5.5)
 
-        crawl_sem = asyncio.Semaphore(6)
+        crawl_sem = asyncio.Semaphore(8)
         db_lock = asyncio.Lock()
 
         # Build progressive query batches
@@ -2021,6 +2077,7 @@ async def _run_scrape_job(
                 return
             domain_part = clean_url.split("/")[2] if "//" in clean_url else clean_url.split("/")[0]
             domain_part = domain_part.replace("www.", "").split(":")[0].lower()
+            tried_domains.add(domain_part)
 
             is_bl, bl_reason = blacklist_mgr.is_domain_blacklisted(domain_part)
             if is_bl:
@@ -2028,7 +2085,7 @@ async def _run_scrape_job(
                     rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "BLACKLIST_BLOCKED", "details": bl_reason})
                 return
 
-            if reply_listener.is_suppressed(domain_part, operator_id=op_id):
+            if reply_listener.is_suppressed(domain_part, operator_id=op_id, owner_username=owner):
                 async with db_lock:
                     rejected_leads.append({"domain": domain_part, "url": clean_url, "reason": "SUPPRESSION_BLOCKED", "details": "Domain in suppression list"})
                 return
@@ -2083,8 +2140,10 @@ async def _run_scrape_job(
 
                     em_domain = target_email.split("@")[-1]
 
-                    # MX verification on the target email domain
-                    mx_result = verify_mx_record(em_domain, timeout=4)
+                    # Non-blocking MX verification on the target email domain
+                    mx_result = await asyncio.to_thread(verify_mx_record, em_domain, 3)
+                    if _cancelled():
+                        break
                     if not mx_result.get("deliverable", True):
                         rejected_leads.append({
                             "domain": domain_part, "email": target_email,
@@ -2102,14 +2161,25 @@ async def _run_scrape_job(
                         })
                         continue
 
-                    # Clone lead specific to this email contact
+                    # Clone lead specific to this email contact (distinct lead.id per contact)
                     contact_lead = lead.model_copy(deep=True)
+                    contact_lead.id = None
                     contact_lead.primary_email = target_email
                     contact_lead.primary_email_tier = scraped_em.tier
                     contact_lead.priority_score = max(scraped_em.priority_score, lead.priority_score)
 
+                    pres = await asyncio.to_thread(
+                        orchestrator.process_and_preserve_lead,
+                        contact_lead,
+                        operator_id=op_id,
+                        owner_username=owner,
+                        dedup_by_email_only=True,
+                        defer_export=True,
+                    )
+                    if pres.get("partition_dir"):
+                        touched_partition_dirs.add(pres["partition_dir"])
                     lead_summary = {
-                        "id": contact_lead.id or f"{contact_lead.domain}_{target_email}",
+                        "id": pres.get("lead_id") or f"{contact_lead.domain}_{target_email}",
                         "domain": contact_lead.domain,
                         "company_name": contact_lead.company_name,
                         "primary_email": target_email,
@@ -2120,7 +2190,6 @@ async def _run_scrape_job(
                     }
                     scraped_leads_summary.append(lead_summary)
 
-                    pres = orchestrator.process_and_preserve_lead(contact_lead, operator_id=op_id, owner_username=owner)
                     if pres.get("success"):
                         q_res = gate.queue_outreach(
                             lead_id=pres["lead_id"],
@@ -2175,7 +2244,7 @@ async def _run_scrape_job(
             # If queue has candidates, crawl a batch concurrently
             if candidate_domains_queue:
                 batch_chunk = []
-                while candidate_domains_queue and len(batch_chunk) < 6:
+                while candidate_domains_queue and len(batch_chunk) < 8:
                     cand = candidate_domains_queue.pop(0)
                     batch_chunk.append(cand)
 
@@ -2225,17 +2294,19 @@ async def _run_scrape_job(
 
             if next_queries:
                 queries_run += len(next_queries)
-                needed_discovery = max((limit - len(verified_leads)) * 3, 15)
-                logger.info(f"[HUNT:{job_id}] Discovering with queries: {next_queries[:2]} (target {needed_discovery} domains)")
-                print(f"[HUNT:{job_id}] 🔍 DISCOVERY queries_run={queries_run} target={needed_discovery} sample={str(next_queries[0])[:80]}", flush=True)
+                remaining_quota = max(1, limit - len(verified_leads))
+                # Pass bounded lead quota per wave (discover_candidate_urls scales to ~3x domains internally)
+                wave_lead_target = min(remaining_quota, 35)
+                logger.info(f"[HUNT:{job_id}] Discovering with queries: {next_queries[:2]} (wave lead target {wave_lead_target})")
+                print(f"[HUNT:{job_id}] 🔍 DISCOVERY queries_run={queries_run} wave_target={wave_lead_target} sample={str(next_queries[0])[:80]}", flush=True)
                 try:
                     discovered = await discovery_agent.discover_candidate_urls(
                         queries=next_queries,
-                        limit=needed_discovery,
+                        limit=wave_lead_target,
                         country=country,
                         city=city_override,
                         niche=niche,
-                        excluded_domains=_existing_domains,
+                        excluded_domains=tried_domains,
                         is_cancelled=_cancelled,
                     )
                 except (MissingSerperApiKeyError, SerperAPIError) as serper_err:
@@ -2268,6 +2339,13 @@ async def _run_scrape_job(
                 # If discovery returned 0 candidates on this batch and queue empty, continue to next query
                 if not candidate_domains_queue and not query_batches and synonym_idx >= len(niche_synonyms) and adj_idx >= len(adjacent_cities):
                     break
+
+        # Flush CSV/XLSX partition exports once for all touched partitions
+        for _pdir in touched_partition_dirs:
+            try:
+                await asyncio.to_thread(orchestrator.vault.sync_partition_exports, _pdir)
+            except Exception as _exp_err:
+                logger.warning(f"[HUNT:{job_id}] Partition spreadsheet sync warning for {_pdir}: {_exp_err}")
 
         if _cancelled():
             logger.info(f"[HUNT:{job_id}] Cancelled by operator — stopping crawl cleanly and preserving {len(verified_leads)} leads.")
@@ -2446,7 +2524,7 @@ def get_scrape_job_status(job_id: str, current_user: Dict[str, Any] = Depends(ge
     # Tenant isolation: operators can only see their own jobs
     if current_user.get("role") != "admin" and job.get("operator_id") != current_user["id"]:
         raise HTTPException(status_code=403, detail="Access denied: job belongs to another operator.")
-    # Return full result when complete; lightweight status otherwise
+    # Return full result when complete; live progress while running
     response = {
         "job_id": job_id,
         "status": job.get("status"),
@@ -2454,8 +2532,10 @@ def get_scrape_job_status(job_id: str, current_user: Dict[str, Any] = Depends(ge
         "completed_at": job.get("completed_at"),
         "cancelled": job.get("cancelled", False),
         "error": job.get("error"),
+        "progress": job.get("progress"),
     }
     if job.get("result"):
+        response["result"] = job["result"]
         response.update(job["result"])
     return response
 

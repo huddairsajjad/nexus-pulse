@@ -46,38 +46,43 @@ class DeduplicationShield:
         domain: str,
         email: str,
         company_name: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        check_domain: bool = True,
+        check_company: bool = True,
     ) -> Tuple[bool, str]:
         """
-        Checks if domain, email, or company has already been processed.
+        Checks if domain, email, or company has already been processed for this user.
+        Set check_domain=False, check_company=False for multi-email extraction on a single domain.
         Returns: (is_duplicate: bool, reason: str)
         """
         clean_domain = _normalize_domain(domain)
         clean_email = _normalize_email(email)
         owner = (owner_username or "").strip().lower()
 
-        owner_filter = "AND (lower(owner_username) = ? OR owner_username = '')" if owner else ""
+        owner_filter = "AND lower(owner_username) = ?" if owner else ""
         owner_params = [owner] if owner else []
 
         with self.db.get_connection() as conn:
-            # 1. Check Domain
-            row = conn.execute(
-                f"SELECT status, last_processed_at FROM dedup_registry WHERE entity_type = 'domain' AND normalized_key = ? {owner_filter}",
-                [clean_domain] + owner_params
-            ).fetchone()
-            if row:
-                return True, f"Domain '{clean_domain}' already processed (Status: {row['status']}, Date: {row['last_processed_at']})"
+            # 1. Check Domain (skipped when saving additional contacts for the same newly discovered domain)
+            if check_domain and clean_domain:
+                row = conn.execute(
+                    f"SELECT status, last_processed_at FROM dedup_registry WHERE entity_type = 'domain' AND normalized_key = ? {owner_filter}",
+                    [clean_domain] + owner_params
+                ).fetchone()
+                if row:
+                    return True, f"Domain '{clean_domain}' already processed (Status: {row['status']}, Date: {row['last_processed_at']})"
 
             # 2. Check Email
-            row = conn.execute(
-                f"SELECT status, last_processed_at FROM dedup_registry WHERE entity_type = 'email' AND normalized_key = ? {owner_filter}",
-                [clean_email] + owner_params
-            ).fetchone()
-            if row:
-                return True, f"Email '{clean_email}' already processed (Status: {row['status']}, Date: {row['last_processed_at']})"
+            if clean_email:
+                row = conn.execute(
+                    f"SELECT status, last_processed_at FROM dedup_registry WHERE entity_type = 'email' AND normalized_key = ? {owner_filter}",
+                    [clean_email] + owner_params
+                ).fetchone()
+                if row:
+                    return True, f"Email '{clean_email}' already processed (Status: {row['status']}, Date: {row['last_processed_at']})"
 
             # 3. Check Company Name if provided
-            if company_name and len(company_name.strip()) >= 3:
+            if check_company and company_name and len(company_name.strip()) >= 3:
                 clean_comp = _normalize_company(company_name)
                 if len(clean_comp) >= 3:
                     row = conn.execute(
@@ -89,9 +94,15 @@ class DeduplicationShield:
 
         return False, "NEW_ENTITY"
 
-    def register_lead(self, lead: Lead, status: str = "VERIFIED", owner_username: Optional[str] = None) -> None:
+    def register_lead(
+        self,
+        lead: Lead,
+        status: str = "VERIFIED",
+        owner_username: Optional[str] = None,
+        register_secondary_emails: bool = True,
+    ) -> None:
         """
-        Registers lead entities (domain, all emails, company) into dedup registry.
+        Registers lead entities (domain, primary email, optionally secondary emails, company) into dedup registry.
         """
         clean_domain = _normalize_domain(lead.domain or lead.website_url)
         clean_email = _normalize_email(lead.primary_email)
@@ -104,11 +115,12 @@ class DeduplicationShield:
             ("email", clean_email, compute_sha256(clean_email))
         ]
 
-        # Register secondary emails as well to prevent cross-contact duplicates
-        for sec_email in lead.all_emails:
-            clean_sec = _normalize_email(sec_email.email)
-            if clean_sec != clean_email:
-                entities.append(("email", clean_sec, compute_sha256(clean_sec)))
+        # Register secondary emails when indexing a single-email lead record
+        if register_secondary_emails:
+            for sec_email in lead.all_emails:
+                clean_sec = _normalize_email(sec_email.email)
+                if clean_sec != clean_email:
+                    entities.append(("email", clean_sec, compute_sha256(clean_sec)))
 
         if len(clean_comp) >= 3:
             entities.append(("company", clean_comp, compute_sha256(clean_comp)))

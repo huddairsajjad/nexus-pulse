@@ -80,39 +80,40 @@ class MongoDatabaseEngine:
             self._initialize_connection()
 
     def _ensure_unique_indexes(self):
-        """Enforces MongoDB unique indexes on domain and primary_email."""
+        """Enforces per-tenant MongoDB unique index on (primary_email, owner_username) for multi-email and user isolation."""
         if self.db is None:
             return
 
         try:
-            # 1. Unique index on domain
+            for legacy_idx in ("idx_leads_domain_unique", "idx_leads_email_unique"):
+                try:
+                    self.db.leads.drop_index(legacy_idx)
+                except Exception:
+                    pass
+
+            # Composite unique index per tenant & email (allows multi-email per domain + cross-tenant independence)
             self.db.leads.create_index(
-                [("domain", pymongo.ASCENDING)],
+                [("primary_email", pymongo.ASCENDING), ("owner_username", pymongo.ASCENDING)],
                 unique=True,
-                name="idx_leads_domain_unique"
+                name="idx_leads_email_owner_unique"
             )
-            # 2. Unique index on primary_email
-            self.db.leads.create_index(
-                [("primary_email", pymongo.ASCENDING)],
-                unique=True,
-                name="idx_leads_email_unique"
-            )
-            # Index on operator_id for fast tenant queries
+            self.db.leads.create_index([("domain", pymongo.ASCENDING)])
             self.db.leads.create_index([("operator_id", pymongo.ASCENDING)])
+            self.db.leads.create_index([("owner_username", pymongo.ASCENDING)])
             self.db.leads.create_index([("unsubscribed", pymongo.ASCENDING)])
 
             # Users collection unique index on email & username
             self.db.users.create_index([("username", pymongo.ASCENDING)], unique=True)
             self.db.users.create_index([("email", pymongo.ASCENDING)], unique=True, sparse=True)
 
-            logger.info("[MONGO] Enforced unique indexes on leads(domain, primary_email).")
+            logger.info("[MONGO] Enforced per-user unique index on leads(primary_email, owner_username).")
         except Exception as ex:
             logger.warning(f"[MONGO] Index creation notice: {ex}")
 
     def insert_lead(self, lead_dict: Dict[str, Any]) -> Dict[str, Any]:
         """
         Inserts lead into MongoDB collection.
-        Raises DuplicateKeyError or ValueError if domain or primary_email already exists.
+        Raises DuplicateKeyError or ValueError if primary_email already exists for this owner.
         """
         self._ensure_connected()
         if self.db is None:
@@ -121,6 +122,7 @@ class MongoDatabaseEngine:
         clean_doc = dict(lead_dict)
         clean_doc.setdefault("created_at", datetime.now(timezone.utc).isoformat())
         clean_doc.setdefault("unsubscribed", False)
+        clean_doc["owner_username"] = str(clean_doc.get("owner_username") or "").strip().lower()
         if "domain" in clean_doc:
             clean_doc["domain"] = clean_doc["domain"].strip().lower()
         if "primary_email" in clean_doc:
@@ -141,14 +143,21 @@ class MongoDatabaseEngine:
             logger.error(f"[MONGO] Lead insert error: {ex}")
             raise
 
-    def is_duplicate(self, domain: Optional[str] = None, email: Optional[str] = None) -> bool:
-        """Checks if a domain or email already exists in MongoDB leads collection."""
+    def is_duplicate(
+        self,
+        domain: Optional[str] = None,
+        email: Optional[str] = None,
+        owner_username: Optional[str] = None,
+        operator_id: Optional[str] = None,
+        check_domain: bool = True,
+    ) -> bool:
+        """Checks if a domain or email already exists in MongoDB leads collection for this user."""
         self._ensure_connected()
         if self.db is None:
             return False
 
         query = []
-        if domain:
+        if check_domain and domain:
             query.append({"domain": domain.strip().lower()})
         if email:
             query.append({"primary_email": email.strip().lower()})
@@ -156,7 +165,18 @@ class MongoDatabaseEngine:
         if not query:
             return False
 
-        found = self.db.leads.find_one({"$or": query})
+        owner = (owner_username or "").strip().lower()
+        op_id = (operator_id or "").strip()
+
+        if owner or op_id:
+            owner_clauses = []
+            if owner:
+                owner_clauses.append({"owner_username": owner})
+            if op_id:
+                owner_clauses.append({"operator_id": op_id})
+            found = self.db.leads.find_one({"$and": [{"$or": query}, {"$or": owner_clauses}]})
+        else:
+            found = self.db.leads.find_one({"$or": query})
         return found is not None
 
     def find_lead(self, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:

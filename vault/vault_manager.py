@@ -97,14 +97,46 @@ class CategoryVaultManager:
             "Scraped At": lead.scraped_at
         }
 
+    def sync_partition_exports(
+        self,
+        part_dir: Any,
+        existing_leads: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """Synchronizes CSV and Excel exports once for a partition directory from its leads.json."""
+        p_dir = Path(part_dir)
+        json_file = p_dir / "leads.json"
+        csv_file = p_dir / "leads.csv"
+        xlsx_file = p_dir / "leads.xlsx"
+
+        leads_data = existing_leads
+        if leads_data is None and json_file.exists():
+            try:
+                with open(json_file, "r", encoding="utf-8") as f:
+                    leads_data = json.load(f)
+            except Exception:
+                leads_data = []
+        if not leads_data:
+            return
+
+        flat_records = [self._lead_to_flat_dict(Lead(**l)) for l in leads_data]
+        df = pd.DataFrame(flat_records)
+        df.to_csv(csv_file, index=False, encoding="utf-8-sig")
+
+        try:
+            df.to_excel(xlsx_file, index=False, engine="openpyxl")
+        except Exception:
+            pass
+
     def store_lead(
         self,
         lead: Lead,
         operator_id: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        sync_spreadsheets: bool = True,
     ) -> Dict[str, str]:
         """
         Stores lead into encrypted SQLite vault and appends to partitioned files.
+        Set sync_spreadsheets=False in tight batch loops and call sync_partition_exports() once after batch.
         Maintains tenant operator_id and owner_username isolation.
         """
         lead_dict = lead.model_dump()
@@ -161,15 +193,8 @@ class CategoryVaultManager:
         with open(json_file, "w", encoding="utf-8") as f:
             json.dump(existing_leads, f, indent=2, ensure_ascii=False)
 
-        # Update partition CSV & Excel via DataFrame
-        flat_records = [self._lead_to_flat_dict(Lead(**l)) for l in existing_leads]
-        df = pd.DataFrame(flat_records)
-        df.to_csv(csv_file, index=False, encoding="utf-8-sig")
-
-        try:
-            df.to_excel(xlsx_file, index=False, engine="openpyxl")
-        except Exception:
-            pass
+        if sync_spreadsheets:
+            self.sync_partition_exports(part_dir, existing_leads=existing_leads)
 
         return {
             "partition_dir": str(part_dir),

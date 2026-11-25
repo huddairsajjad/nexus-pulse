@@ -81,15 +81,17 @@ class NexusPulseOrchestrator:
         self,
         raw_lead: Lead,
         operator_id: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        dedup_by_email_only: bool = False,
+        defer_export: bool = False,
     ) -> Dict[str, Any]:
         """
         Takes a raw scraped Lead, applies Blacklist and Suppression checks,
         drops junk domains (wixpress.com, sentry-next.wixpress.com, sentry.io) and invalid prefixes,
-        applies Deduplication Shield, runs Zero-Bounce Hygiene Shield,
-        and archives to Category Vault with tenant operator_id and owner_username.
+        applies Deduplication Shield (per user; email-only when multi-email extracting per domain),
+        runs Zero-Bounce Hygiene Shield, and archives to Category Vault with tenant operator_id and owner_username.
         """
-        owner = (owner_username or "").strip()
+        owner = (owner_username or "").strip().lower()
         op_id = (operator_id or "").strip()
 
         # 0. Junk Domain & System Prefix Hygiene Drop
@@ -146,8 +148,11 @@ class NexusPulseOrchestrator:
                     "primary_email": raw_lead.primary_email
                 }
 
-        # 3. Suppression & DNC Opt-Out Check
-        if self.reply_listener.is_suppressed(raw_lead.primary_email) or self.reply_listener.is_suppressed(raw_lead.domain):
+        # 3. Suppression & DNC Opt-Out Check (scoped per user when provided)
+        if (
+            self.reply_listener.is_suppressed(raw_lead.primary_email, operator_id=op_id, owner_username=owner)
+            or self.reply_listener.is_suppressed(raw_lead.domain, operator_id=op_id, owner_username=owner)
+        ):
             return {
                 "success": False,
                 "reason": "SUPPRESSION_BLOCKED",
@@ -156,11 +161,17 @@ class NexusPulseOrchestrator:
                 "primary_email": raw_lead.primary_email
             }
 
-        # 3. Deduplication Shield & MongoDB Unique Index Check
+        # 3b. Deduplication Shield & MongoDB Unique Index Check (per user; email-only when multi-email loop)
         try:
             from database.mongo_engine import get_mongo_engine
             mongo = get_mongo_engine()
-            if mongo.is_duplicate(domain=raw_lead.domain, email=raw_lead.primary_email):
+            if mongo.is_duplicate(
+                domain=raw_lead.domain,
+                email=raw_lead.primary_email,
+                owner_username=owner,
+                operator_id=op_id,
+                check_domain=not dedup_by_email_only,
+            ):
                 return {
                     "success": False,
                     "reason": "DEDUPLICATION_BLOCKED",
@@ -174,7 +185,10 @@ class NexusPulseOrchestrator:
         is_dup, dup_reason = self.dedup.is_entity_duplicate(
             domain=raw_lead.domain,
             email=raw_lead.primary_email,
-            company_name=raw_lead.company_name
+            company_name=raw_lead.company_name,
+            owner_username=owner,
+            check_domain=not dedup_by_email_only,
+            check_company=not dedup_by_email_only,
         )
 
         if is_dup:
@@ -190,18 +204,19 @@ class NexusPulseOrchestrator:
         hygiene_report = self.hygiene.validate_lead_email(raw_lead.primary_email)
         raw_lead.hygiene_report = hygiene_report
 
-        # If primary email fails syntax or has no MX, try secondary emails from scrapelist
+        # If primary email fails syntax or has no MX, try secondary emails only when not in explicit per-email loop
         if hygiene_report.status in (HygieneStatus.SYNTAX_INVALID, HygieneStatus.DOMAIN_NO_MX, HygieneStatus.SMTP_REJECTED):
             fallback_found = False
-            for sec_candidate in raw_lead.all_emails[1:]:
-                alt_report = self.hygiene.validate_lead_email(sec_candidate.email)
-                if alt_report.status in (HygieneStatus.VERIFIED, HygieneStatus.SMTP_INDETERMINATE):
-                    raw_lead.primary_email = sec_candidate.email
-                    raw_lead.primary_email_tier = sec_candidate.tier
-                    raw_lead.priority_score = sec_candidate.priority_score
-                    raw_lead.hygiene_report = alt_report
-                    fallback_found = True
-                    break
+            if not dedup_by_email_only:
+                for sec_candidate in raw_lead.all_emails[1:]:
+                    alt_report = self.hygiene.validate_lead_email(sec_candidate.email)
+                    if alt_report.status in (HygieneStatus.VERIFIED, HygieneStatus.SMTP_INDETERMINATE):
+                        raw_lead.primary_email = sec_candidate.email
+                        raw_lead.primary_email_tier = sec_candidate.tier
+                        raw_lead.priority_score = sec_candidate.priority_score
+                        raw_lead.hygiene_report = alt_report
+                        fallback_found = True
+                        break
 
             if not fallback_found:
                 return {
@@ -212,11 +227,21 @@ class NexusPulseOrchestrator:
                     "lead_domain": raw_lead.domain
                 }
 
-        # 5. Register in Deduplication Shield
-        self.dedup.register_lead(raw_lead, status="VERIFIED")
+        # 5. Register in Deduplication Shield scoped to owner
+        self.dedup.register_lead(
+            raw_lead,
+            status="VERIFIED",
+            owner_username=owner,
+            register_secondary_emails=not dedup_by_email_only,
+        )
 
-        # 6. Store in Category Vault & Synchronize Partitions (JSON, CSV, Excel)
-        store_res = self.vault.store_lead(raw_lead, operator_id=op_id, owner_username=owner)
+        # 6. Store in Category Vault (optionally deferring heavy CSV/XLSX regen to batch end)
+        store_res = self.vault.store_lead(
+            raw_lead,
+            operator_id=op_id,
+            owner_username=owner,
+            sync_spreadsheets=not defer_export,
+        )
 
         # 7. Mirror lead to MongoDB with unique constraint indexing
         try:
@@ -262,11 +287,12 @@ class NexusPulseOrchestrator:
         city: Optional[str] = None,
         niche: Optional[str] = None,
         sample_targets: Optional[List[Dict[str, str]]] = None,
-        operator_id: Optional[str] = None
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes a targeted search and processing run using localized queries.
-        Preserves tenant data isolation via operator_id.
+        Preserves tenant data isolation via operator_id and owner_username.
         """
         c_country = country or self.config.target_country
         c_city = city or self.config.target_city
@@ -293,14 +319,14 @@ class NexusPulseOrchestrator:
                     lead = None
 
                 if lead:
-                    result = self.process_and_preserve_lead(lead, operator_id=operator_id)
+                    result = self.process_and_preserve_lead(lead, operator_id=operator_id, owner_username=owner_username)
                     if result["success"]:
                         processed_leads.append(result)
                     else:
                         rejected_leads.append(result)
 
         # Trigger consolidated multi-format backup export
-        backup_res = self.vault.export_global_snapshot_backups(operator_id=operator_id)
+        backup_res = self.vault.export_global_snapshot_backups(operator_id=operator_id, owner_username=owner_username)
 
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),

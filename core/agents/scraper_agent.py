@@ -354,10 +354,87 @@ class SearchDiscoveryAgent:
       - Zero-Seed Policy: 100% real leads from live web sources; zero dummy/mock data.
     """
 
-    def __init__(self, timeout_seconds: float = 7.0, serper_api_key: Optional[str] = None):
+    def __init__(
+        self,
+        timeout_seconds: float = 7.0,
+        serper_api_key: Optional[str] = None,
+        query_mode: Optional[str] = None,
+    ):
         self.timeout = timeout_seconds
         self._api_key = serper_api_key
+        self._configured_query_mode = query_mode
+        self._free_tier_fallback_active = False
         self.discovered_metadata: Dict[str, Dict[str, Any]] = {}
+        self._executed_places_queries: Set[Tuple[str, str]] = set()
+        self._executed_search_pages: Set[Tuple[str, str, int]] = set()
+
+    @property
+    def query_mode(self) -> str:
+        """
+        Reads SERPER_QUERY_MODE from constructor, environment, or .env.
+        Allowed values: 'auto' (default), 'simple', 'advanced'.
+        """
+        if self._configured_query_mode and self._configured_query_mode.strip():
+            mode = self._configured_query_mode.strip().lower()
+        else:
+            try:
+                load_dotenv(PROJECT_ROOT / ".env", override=False)
+            except Exception:
+                pass
+            mode = os.environ.get("SERPER_QUERY_MODE", "auto").strip().lower()
+        if mode not in ("auto", "simple", "advanced"):
+            mode = "auto"
+        return mode
+
+    @property
+    def is_simple_mode(self) -> bool:
+        """True if explicitly configured for simple queries or auto-fallback is active."""
+        return self.query_mode == "simple" or (self.query_mode == "auto" and self._free_tier_fallback_active)
+
+    @classmethod
+    def to_simple_query(cls, query: str) -> str:
+        """
+        Converts an advanced search query into a clean, simple search query
+        for Serper.dev free-tier accounts without boolean operators or syntax restrictions.
+        Strips quotes, parentheses, OR/AND operators, site:/inurl:/mailto: prefixes, and special symbols.
+        """
+        if not query:
+            return ""
+        q = str(query)
+        # Strip operators like site:..., inurl:..., intitle:..., filetype:..., mailto:...
+        q = re.sub(r'(?:^|\s)[+-]?(?:site|inurl|intitle|filetype|mailto):[^\s\)]+', ' ', q, flags=re.IGNORECASE)
+        q = re.sub(r'\b(?:site|inurl|intitle|filetype|mailto):[^\s\)]+', '', q, flags=re.IGNORECASE)
+        # Strip standalone "mailto:"
+        q = re.sub(r'["\']?mailto:?["\']?', '', q, flags=re.IGNORECASE)
+        # Convert prefix@ patterns like "info@" or "contact@" cleanly without gluing words
+        q = re.sub(r'([a-zA-Z0-9._+-]+)@(?=[\s"\'\)]|$)', r'\1 email ', q)
+        # Convert standalone "@" or (@) to " email "
+        q = re.sub(r'["\']?@["\']?', ' email ', q)
+        # Strip boolean keywords OR, AND, NOT
+        q = re.sub(r'\b(?:OR|AND|NOT)\b', ' ', q, flags=re.IGNORECASE)
+        # Strip quotes, curly quotes, parentheses, brackets, and wildcards
+        q = re.sub(r'["\'\u201c\u201d\u2018\u2019\(\)\[\]\{\}\*]', ' ', q)
+        # Strip colons, semicolons, pipe symbols, slashes
+        q = re.sub(r'[:;\|/\\~^]', ' ', q)
+        # Strip leading search inclusion/exclusion +/- operators on standalone tokens
+        q = re.sub(r'(?:^|\s)[+-]+(?=[a-zA-Z0-9])', ' ', q)
+        # Collapse multiple spaces
+        q = " ".join(q.split())
+        return q.strip()
+
+    @staticmethod
+    def is_free_tier_error(resp_status: int, resp_text: str) -> bool:
+        """Detects whether an HTTP 400 response from Serper indicates free-tier query pattern restrictions."""
+        if resp_status != 400:
+            return False
+        txt = resp_text.lower()
+        if "free" in txt and ("account" in txt or "plan" in txt or "tier" in txt):
+            return True
+        if "query pattern" in txt or "pattern not allowed" in txt:
+            return True
+        if "not allowed for free" in txt:
+            return True
+        return False
 
     def get_api_key(self) -> str:
         """Reads SERPER_API_KEY from environment or .env without hardcoding."""
@@ -483,6 +560,14 @@ class SearchDiscoveryAgent:
             f"{n} {c} tenders projects",
             f"{n} commercial {c} contact",
             f"{n} suppliers in {c} {co}",
+            f"commercial {n} companies in {c}",
+            f"{n} group {c} official",
+            f"{n} corporate office {c} {co}",
+            f"{n} headquarters {c}",
+            f"{n} specialists {c} contact",
+            f"{n} commercial engineering {c}",
+            f"{n} developers in {c} {co}",
+            f"{n} solutions {c} email",
         ]
 
     # ------------------------------------------------------------------
@@ -505,12 +590,18 @@ class SearchDiscoveryAgent:
             "X-API-KEY": key,
             "Content-Type": "application/json",
         }
+
+        # Apply simple query mode if configured or fallen back
+        effective_query = self.to_simple_query(query) if self.is_simple_mode else query.strip()
+        if not effective_query:
+            effective_query = query.strip()
+
         payload = {
-            "q": query.strip(),
+            "q": effective_query,
             "gl": gl,
             "hl": hl,
         }
-        logger.info(f"[SERPER:PLACES] Requesting: '{query}' (gl={gl}, hl={hl})")
+        logger.info(f"[SERPER:PLACES] Requesting: '{effective_query}' (gl={gl}, hl={hl}, mode={self.query_mode})")
         try:
             resp = await client.post(
                 "https://google.serper.dev/places",
@@ -528,6 +619,22 @@ class SearchDiscoveryAgent:
             raise SerperAPIError("Serper.dev API error (403): Forbidden. Check account permissions.")
         if resp.status_code == 429:
             raise SerperAPIError("Serper.dev API error (429): Quota exceeded or rate limited on Serper.dev.")
+
+        # Automatic fallback on free-tier 400 restriction
+        if resp.status_code == 400:
+            resp_text = resp.text
+            if self.is_free_tier_error(resp.status_code, resp_text) and self.query_mode in ("auto", "simple") and not self._free_tier_fallback_active:
+                logger.warning(
+                    f"[SERPER:PLACES:FALLBACK] Serper free-tier query restriction on '{effective_query}'. "
+                    f"Auto-switching to clean simple query mode."
+                )
+                self._free_tier_fallback_active = True
+                fallback_query = self.to_simple_query(effective_query)
+                if fallback_query and fallback_query != effective_query:
+                    logger.info(f"[SERPER:PLACES:FALLBACK] Retrying places with clean simple query: '{fallback_query}'")
+                    return await self.query_serper_places(fallback_query, country, client, is_cancelled=is_cancelled)
+            raise SerperAPIError(f"Serper.dev API error (400): {resp_text}")
+
         if resp.status_code >= 400:
             raise SerperAPIError(f"Serper.dev API error ({resp.status_code}): {resp.text}")
 
@@ -537,7 +644,7 @@ class SearchDiscoveryAgent:
             raise SerperAPIError(f"Serper.dev places response JSON parse error: {parse_err}") from parse_err
 
         places = data.get("places", [])
-        logger.info(f"[SERPER:PLACES] Found {len(places)} listings for '{query}'")
+        logger.info(f"[SERPER:PLACES] Found {len(places)} listings for '{effective_query}'")
         return places
 
     # ------------------------------------------------------------------
@@ -562,14 +669,20 @@ class SearchDiscoveryAgent:
             "X-API-KEY": key,
             "Content-Type": "application/json",
         }
+
+        # Apply simple query mode if configured or fallen back
+        effective_query = self.to_simple_query(query) if self.is_simple_mode else query.strip()
+        if not effective_query:
+            effective_query = query.strip()
+
         payload = {
-            "q": query.strip(),
+            "q": effective_query,
             "gl": gl,
             "hl": hl,
             "num": num,
             "page": page,
         }
-        logger.info(f"[SERPER:SEARCH] Requesting: '{query}' (page={page}, gl={gl}, hl={hl})")
+        logger.info(f"[SERPER:SEARCH] Requesting: '{effective_query}' (page={page}, gl={gl}, hl={hl}, mode={self.query_mode})")
         try:
             resp = await client.post(
                 "https://google.serper.dev/search",
@@ -587,6 +700,24 @@ class SearchDiscoveryAgent:
             raise SerperAPIError("Serper.dev API error (403): Forbidden. Check account permissions.")
         if resp.status_code == 429:
             raise SerperAPIError("Serper.dev API error (429): Quota exceeded or rate limited on Serper.dev.")
+
+        # Automatic fallback on free-tier 400 restriction
+        if resp.status_code == 400:
+            resp_text = resp.text
+            if self.is_free_tier_error(resp.status_code, resp_text) and self.query_mode in ("auto", "simple") and not self._free_tier_fallback_active:
+                logger.warning(
+                    f"[SERPER:SEARCH:FALLBACK] Serper free-tier query restriction on '{effective_query}'. "
+                    f"Auto-switching to clean simple query mode."
+                )
+                self._free_tier_fallback_active = True
+                fallback_query = self.to_simple_query(effective_query)
+                if fallback_query and fallback_query != effective_query:
+                    logger.info(f"[SERPER:SEARCH:FALLBACK] Retrying search with clean simple query: '{fallback_query}' (page={page})")
+                    return await self.query_serper_search(
+                        fallback_query, country, page=page, client=client, num=num, is_cancelled=is_cancelled
+                    )
+            raise SerperAPIError(f"Serper.dev API error (400): {resp_text}")
+
         if resp.status_code >= 400:
             raise SerperAPIError(f"Serper.dev API error ({resp.status_code}): {resp.text}")
 
@@ -617,7 +748,7 @@ class SearchDiscoveryAgent:
                     "address": pl.get("address", ""),
                     "source": "serper_places"
                 })
-        logger.info(f"[SERPER:SEARCH] Found {len(items)} candidate links for '{query}' (page={page})")
+        logger.info(f"[SERPER:SEARCH] Found {len(items)} candidate links for '{effective_query}' (page={page})")
         return items
 
     # ------------------------------------------------------------------
@@ -649,8 +780,19 @@ class SearchDiscoveryAgent:
         seen_domains: Set[str] = set()
         excluded: Set[str] = {d.strip().lower() for d in (excluded_domains or set()) if d}
 
-        # Need sufficient unique candidate domains so downstream crawl delivers requested limit
-        needed_domains = max(limit * 3, 20)
+        # Dynamic domain quota & pagination scaling for arbitrary counts 1 to 100+
+        if limit <= 5:
+            needed_domains = max(limit * 3, 5)
+            max_pages = 2
+        elif limit <= 25:
+            needed_domains = max(limit * 3, 20)
+            max_pages = 4
+        elif limit <= 50:
+            needed_domains = max(limit * 3, 50)
+            max_pages = 6
+        else:
+            needed_domains = max(limit * 3, 100)
+            max_pages = 8
 
         def _register_candidate(raw_url: str, title: str = "", phone: str = "", address: str = "", source: str = "") -> bool:
             if not raw_url:
@@ -675,7 +817,13 @@ class SearchDiscoveryAgent:
 
         logger.info(
             f"[SERPER:DISCOVERY] Starting Serper lead discovery | niche='{niche}' | city='{city}' "
-            f"| country='{country}' | target_domains={needed_domains} | excluded={len(excluded)}"
+            f"| country='{country}' | target_domains={needed_domains} | excluded={len(excluded)} | mode={self.query_mode}"
+        )
+
+        gl_key = resolve_serper_gl(country)
+        is_constr = any(
+            k in niche.lower()
+            for k in ("construction", "contractor", "roofing", "mep", "building", "civil", "infrastructure", "plumbing", "electrical")
         )
 
         async with httpx.AsyncClient(
@@ -685,18 +833,38 @@ class SearchDiscoveryAgent:
             verify=False,
         ) as client:
             # 1. Serper Places API: Real local commercial businesses
-            places_queries = [
-                f"{niche} in {city} {country}",
-                f"{niche} companies in {city}",
-                f"{niche} contractors in {city}",
-                f"{niche} firms in {city}",
-            ]
+            if is_constr:
+                places_queries = [
+                    f"{niche} in {city} {country}",
+                    f"{niche} companies in {city}",
+                    f"{niche} contractors in {city}",
+                    f"{niche} firms in {city}",
+                ]
+            else:
+                places_queries = [
+                    f"{niche} in {city} {country}",
+                    f"{niche} companies in {city}",
+                    f"{niche} services in {city}",
+                    f"{niche} firms in {city}",
+                ]
+            if needed_domains > 25:
+                places_queries.extend([
+                    f"{niche} specialists in {city}",
+                    f"commercial {niche} in {city}",
+                    f"{niche} suppliers in {city}",
+                    f"best {niche} in {city}",
+                ])
+
             for pq in places_queries:
                 if is_cancelled and is_cancelled():
                     logger.info("[SERPER:DISCOVERY] Cancellation observed during places discovery.")
                     break
                 if len(discovered_urls) >= needed_domains:
                     break
+                pq_norm = (gl_key, pq.strip().lower())
+                if pq_norm in self._executed_places_queries:
+                    continue
+                self._executed_places_queries.add(pq_norm)
                 try:
                     places = await self.query_serper_places(pq, country, client, is_cancelled=is_cancelled)
                     for pl in places:
@@ -725,17 +893,7 @@ class SearchDiscoveryAgent:
                     if q_str and q_str not in search_query_list:
                         search_query_list.append(q_str)
 
-            built_queries = [
-                f"{niche} in {city} {country}",
-                f"{niche} companies {city} {country}",
-                f"{niche} contractors {city} official website",
-                f"best {niche} in {city}",
-                f"{niche} firms {city} email contact",
-                f"{niche} services in {city}",
-                f"{niche} {city} tenders projects",
-                f"{niche} commercial {city} contact",
-                f"{niche} suppliers in {city}",
-            ]
+            built_queries = self.build_query_variations(niche, city, country)
             for bq in built_queries:
                 if bq not in search_query_list:
                     search_query_list.append(bq)
@@ -747,11 +905,15 @@ class SearchDiscoveryAgent:
                 if len(discovered_urls) >= needed_domains:
                     break
 
-                for page in (1, 2, 3):
+                for page in range(1, max_pages + 1):
                     if is_cancelled and is_cancelled():
                         break
                     if len(discovered_urls) >= needed_domains:
                         break
+                    sq_norm = (gl_key, sq.strip().lower(), page)
+                    if sq_norm in self._executed_search_pages:
+                        continue
+                    self._executed_search_pages.add(sq_norm)
                     try:
                         search_items = await self.query_serper_search(
                             sq, country, page=page, client=client, num=20, is_cancelled=is_cancelled
