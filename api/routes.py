@@ -1108,19 +1108,39 @@ def dispatch_approved_item(
 ):
     """
     Dispatches approved outreach item using an enrolled mailbox.
-    Supports bypass_window for immediate manual dispatch outside regional business hours.
+    Wraps execution in try/finally so the current user's engine status always
+    resets cleanly from DISPATCHING back to RUNNING.
     """
     gate = get_approval_gate()
+    worker = get_dispatcher_worker()
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
+    dispatched_count = 0
+    dispatch_res: Optional[Dict[str, Any]] = None
+    worker.begin_tenant_dispatch(operator_id=op_id, owner_username=owner_u)
     try:
         res = gate.dispatch_approved_outreach(queue_id, operator_id=op_id, owner_username=owner_u, bypass_window=bool(bypass_window))
+        dispatch_res = res
         if not res.get("success"):
             err_msg = res.get("message") or res.get("reason") or "Dispatch failed."
             raise HTTPException(status_code=400, detail=err_msg)
+        dispatched_count = 1
         return res
     except (ValueError, PermissionError) as e:
+        dispatch_res = {"success": False, "error": str(e)}
         raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        dispatch_res = {"success": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Dispatch failed: {str(e)}")
+    finally:
+        worker.end_tenant_dispatch(
+            operator_id=op_id,
+            owner_username=owner_u,
+            dispatched_count=dispatched_count,
+            last_result=dispatch_res,
+        )
 
 
 @router.post("/outreach/dispatch-now")
@@ -1130,38 +1150,65 @@ def dispatch_now_trigger(
 ):
     """
     Manual / Weekend Override Trigger:
-    Forces immediate queue dispatch across all eligible leads, bypassing regional window restrictions.
-    Scoped strictly to the user's tenant leads and enrolled mailboxes.
+    Forces immediate queue dispatch across eligible leads strictly for the current user's tenant.
+    Wraps dispatch execution in try/finally so the user's engine status always resets cleanly
+    from DISPATCHING back to RUNNING even on error or timeout.
     """
     gate = get_approval_gate()
+    worker = get_dispatcher_worker()
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
     effective_bypass = True if req is None or req.bypass_window is None else bool(req.bypass_window)
     limit = req.limit if req else None
+    dispatched_count = 0
+    dispatch_res: Optional[Dict[str, Any]] = None
 
-    if req and req.queue_id:
-        try:
-            res = gate.dispatch_approved_outreach(req.queue_id, operator_id=op_id, owner_username=owner_u, bypass_window=effective_bypass)
-            if not res.get("success"):
-                err_msg = res.get("message") or res.get("reason") or "Dispatch failed."
-                raise HTTPException(status_code=400, detail=err_msg)
-            return {
-                "success": True,
-                "dispatched_count": 1,
-                "items": [res],
-                "bypass_window": effective_bypass
-            }
-        except (ValueError, PermissionError) as e:
-            raise HTTPException(status_code=400, detail=str(e))
+    worker.begin_tenant_dispatch(operator_id=op_id, owner_username=owner_u)
+    try:
+        if req and req.queue_id:
+            try:
+                res = gate.dispatch_approved_outreach(req.queue_id, operator_id=op_id, owner_username=owner_u, bypass_window=effective_bypass)
+                dispatch_res = res
+                if not res.get("success"):
+                    err_msg = res.get("message") or res.get("reason") or "Dispatch failed."
+                    raise HTTPException(status_code=400, detail=err_msg)
+                dispatched_count = 1
+                return {
+                    "success": True,
+                    "dispatched_count": 1,
+                    "items": [res],
+                    "bypass_window": effective_bypass
+                }
+            except (ValueError, PermissionError) as e:
+                dispatch_res = {"success": False, "error": str(e)}
+                raise HTTPException(status_code=400, detail=str(e))
 
-    return gate.dispatch_ready_queue(bypass_window=effective_bypass, operator_id=op_id, owner_username=owner_u, limit=limit)
+        res = gate.dispatch_ready_queue(bypass_window=effective_bypass, operator_id=op_id, owner_username=owner_u, limit=limit)
+        dispatch_res = res
+        dispatched_count = int(res.get("dispatched_count", 0))
+        return res
+    except HTTPException:
+        raise
+    except Exception as e:
+        dispatch_res = {"success": False, "error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Dispatch failed: {str(e)}")
+    finally:
+        worker.end_tenant_dispatch(
+            operator_id=op_id,
+            owner_username=owner_u,
+            dispatched_count=dispatched_count,
+            last_result=dispatch_res,
+        )
 
 
 @router.get("/dispatcher/status")
 def get_dispatcher_status(current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Provides live telemetry and status of the background dispatch worker."""
+    """Provides live telemetry and status of the dispatch worker strictly scoped to the current user."""
     worker = get_dispatcher_worker()
-    return worker.get_telemetry()
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
+    is_admin = current_user.get("role") == "admin"
+    return worker.get_telemetry(operator_id=op_id, owner_username=owner_u, is_admin=is_admin)
 
 
 @router.post("/dispatcher/toggle-bypass")
@@ -1169,13 +1216,15 @@ def toggle_dispatcher_bypass(
     req: ToggleBypassRequest,
     admin_user: Dict[str, Any] = Depends(require_admin)
 ):
-    """Enables or disables 24/7 bypass window mode for the automated background worker."""
+    """Enables or disables 24/7 bypass window mode scoped to the current user's workspace."""
     worker = get_dispatcher_worker()
-    worker.set_bypass_window(req.bypass_window)
+    op_id = admin_user["id"]
+    owner_u = (admin_user.get("username") or "").strip().lower()
+    effective_val = worker.set_bypass_window(req.bypass_window, operator_id=op_id, owner_username=owner_u)
     return {
         "success": True,
-        "bypass_window": worker.bypass_window,
-        "message": f"Dispatch engine bypass window set to: {worker.bypass_window}"
+        "bypass_window": effective_val,
+        "message": f"Dispatch engine bypass window set to: {effective_val}"
     }
 
 
@@ -1184,10 +1233,12 @@ async def trigger_dispatcher_run_now(
     req: Optional[DispatchNowRequest] = None,
     admin_user: Dict[str, Any] = Depends(require_admin)
 ):
-    """Triggers an immediate background dispatcher execution cycle."""
+    """Triggers an immediate dispatcher execution cycle strictly scoped to the current user's workspace."""
     worker = get_dispatcher_worker()
+    op_id = admin_user["id"]
+    owner_u = (admin_user.get("username") or "").strip().lower()
     bypass = True if req is None or req.bypass_window is None else bool(req.bypass_window)
-    res = await worker.execute_cycle(bypass_window=bypass)
+    res = await worker.execute_cycle(bypass_window=bypass, operator_id=op_id, owner_username=owner_u)
     return res
 
 
@@ -1508,10 +1559,19 @@ def send_hot_reply(req: DispatchHotReplyRequest, current_user: Dict[str, Any] = 
 
 @router.post("/outreach/lead-status")
 def update_outreach_lead_status(req: UpdateLeadStatusRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
-    """Advances or updates the status of an outreach queue item in the Kanban CRM."""
+    """Advances or updates the status of an outreach queue item in the Kanban CRM, strictly scoped per user."""
     db = get_db_engine()
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     new_status = req.status.upper().strip()
     with db.get_connection() as conn:
+        row = conn.execute("SELECT id, operator_id, owner_username FROM outreach_queue WHERE id = ?", (req.queue_id,)).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Queue item not found.")
+        row_owner = (row["owner_username"] or "").strip().lower()
+        row_op = (row["operator_id"] or "").strip()
+        if (row_owner or row_op) and row_owner != owner_u and row_op != op_id:
+            raise HTTPException(status_code=403, detail="Access denied: You cannot update outreach for another workspace.")
         conn.execute("UPDATE outreach_queue SET status = ? WHERE id = ?", (new_status, req.queue_id))
         conn.commit()
     return {"success": True, "queue_id": req.queue_id, "status": new_status}

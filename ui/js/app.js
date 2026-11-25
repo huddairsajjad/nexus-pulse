@@ -658,6 +658,8 @@ function NexusPulseApp() {
   const [approvalNiche, setApprovalNiche] = useState("Commercial Construction");
   const [approvalSubject, setApprovalSubject] = useState("");
   const [approvalBody, setApprovalBody] = useState("");
+  const [isApprovingOutreach, setIsApprovingOutreach] = useState(false);
+  const [approvalModalError, setApprovalModalError] = useState("");
 
   const [selectedHotLead, setSelectedHotLead] = useState(null);
   const [hotLeadReplyBody, setHotLeadReplyBody] = useState("");
@@ -1635,6 +1637,7 @@ function doPost(e) {
   };
 
   const handleOpenApprovalModal = (item) => {
+    setApprovalModalError("");
     setSelectedApproval(item);
     setApprovalRecipient(item.recipient || item.primary_email || "");
     setApprovalCompanyName(item.company_name || "");
@@ -1683,7 +1686,19 @@ function doPost(e) {
     }
   };
 
-  const handleApproveOutreach = async (queueId, customSubject, customBody, customRecipient, customCompanyName) => {
+  const handleApproveOutreach = async (
+    queueId,
+    customSubject,
+    customBody,
+    customRecipient,
+    customCompanyName,
+    options = {}
+  ) => {
+    const { closeModal = true, suppressSuccessBanner = false } = options;
+    const finalRecipient = customRecipient !== undefined ? customRecipient : approvalRecipient;
+    const finalCompany = customCompanyName !== undefined ? customCompanyName : approvalCompanyName;
+    setApprovalModalError("");
+    setIsApprovingOutreach(true);
     try {
       const resp = await fetch(`${API_BASE}/api/outreach/approve`, {
         method: "POST",
@@ -1693,29 +1708,46 @@ function doPost(e) {
           approver: user.username,
           edited_subject: customSubject,
           edited_body: customBody,
-          edited_recipient: customRecipient || approvalRecipient,
-          edited_company_name: customCompanyName || approvalCompanyName
+          edited_recipient: finalRecipient,
+          edited_company_name: finalCompany
         })
       });
-      const data = await resp.json();
-      if (resp.ok) {
-        setSelectedApproval(null);
-        setAlertBanner({
-          type: "success",
-          message: `Outreach item authorized for ${customRecipient || approvalRecipient || "recipient"}! Persisted to database.`
-        });
-        fetchData();
+      let data = {};
+      try {
+        data = await resp.json();
+      } catch (parseErr) {}
+
+      if (resp.ok && data.success !== false) {
+        if (closeModal) {
+          setSelectedApproval(null);
+        }
+        if (!suppressSuccessBanner) {
+          setAlertBanner({
+            type: "success",
+            message: `Outreach item authorized for ${finalRecipient || "recipient"}! Persisted to database.`
+          });
+        }
+        await fetchData();
+        return true;
       } else {
+        const errMsg = data.detail || data.message || "Approval failed.";
+        setApprovalModalError(errMsg);
         setAlertBanner({
           type: "danger",
-          message: data.detail || "Approval failed."
+          message: errMsg
         });
+        return false;
       }
     } catch (e) {
+      const errMsg = "Error approving outreach.";
+      setApprovalModalError(errMsg);
       setAlertBanner({
         type: "danger",
-        message: "Error approving outreach."
+        message: errMsg
       });
+      return false;
+    } finally {
+      setIsApprovingOutreach(false);
     }
   };
 
@@ -1812,6 +1844,8 @@ function doPost(e) {
   const handleDispatchQueueNow = async (bypassWindow = true, specificQueueId = null) => {
     setIsDispatchingNow(true);
     setPulseState("DISPATCHING");
+    let dispatchOk = false;
+    let data = {};
     try {
       const resp = await fetch(`${API_BASE}/api/outreach/dispatch-now`, {
         method: "POST",
@@ -1824,21 +1858,24 @@ function doPost(e) {
           queue_id: specificQueueId
         })
       });
-      const data = await resp.json();
+      try {
+        data = await resp.json();
+      } catch (parseErr) {}
+
       if (resp.ok && data.success) {
+        dispatchOk = true;
         if (data.dispatched_count === 0 && data.errors && data.errors.length > 0) {
+          dispatchOk = false;
           const firstErr = data.errors[0];
           setAlertBanner({
             type: "danger",
             message: `⚠️ Dispatch Blocked: ${firstErr.message || firstErr.reason || "Unable to dispatch leads."}`
           });
-          setPulseState("RUNNING");
         } else if (data.dispatched_count === 0 && data.scheduled_count === 0) {
           setAlertBanner({
             type: "info",
             message: "No authorized leads currently waiting in queue to be dispatched."
           });
-          setPulseState("RUNNING");
         } else {
           setAlertBanner({
             type: "success",
@@ -1852,18 +1889,22 @@ function doPost(e) {
           type: "danger",
           message: `Dispatch failed: ${errMsg}`
         });
-        setPulseState("RUNNING");
         await fetchData();
       }
+      return { success: dispatchOk, data };
     } catch (err) {
       setAlertBanner({
         type: "danger",
         message: "Error executing dispatch trigger."
       });
-      setPulseState("RUNNING");
+      return { success: false, data: { error: err?.message || "Network error" } };
     } finally {
       setIsDispatchingNow(false);
-      setPulseState("RUNNING");
+      setPulseState(
+        uniqueHotLeads.length > 0
+          ? "HOT_ALERT"
+          : (isHuntingRef.current ? "HUNTING" : "RUNNING")
+      );
     }
   };
 
@@ -3700,7 +3741,7 @@ function doPost(e) {
         {alertBanner && (
           <div className={`px-4 py-2 text-xs font-medium border-b flex items-center justify-between ${
             alertBanner.type === "success" ? "bg-[var(--success-muted)] text-[var(--success)] border-[var(--success)]" :
-            alertBanner.type === "error" ? "bg-[var(--danger-muted)] text-[var(--danger)] border-[var(--danger)]" :
+            (alertBanner.type === "error" || alertBanner.type === "danger") ? "bg-[var(--danger-muted)] text-[var(--danger)] border-[var(--danger)]" :
             "bg-[var(--accent-muted)] text-[var(--accent)] border-[var(--accent)]"
           }`}>
             <span>{alertBanner.message}</span>
@@ -4198,9 +4239,19 @@ function doPost(e) {
                             {user.role === "admin" && (
                               <button
                                 onClick={async () => {
-                                  await handleApproveOutreach(item.id, item.subject, item.message_body, item.recipient, item.company_name);
-                                  await handleDispatchQueueNow(true, item.id);
+                                  const ok = await handleApproveOutreach(
+                                    item.id,
+                                    item.subject,
+                                    item.message_body,
+                                    item.recipient,
+                                    item.company_name,
+                                    { closeModal: false, suppressSuccessBanner: true }
+                                  );
+                                  if (ok) {
+                                    await handleDispatchQueueNow(true, item.id);
+                                  }
                                 }}
+                                disabled={isApprovingOutreach || isDispatchingNow}
                                 className="btn btn-primary btn-sm"
                                 title="Authorize and dispatch immediately outside business hours"
                               >
@@ -6005,18 +6056,23 @@ function doPost(e) {
       {/* MODAL: HUMAN APPROVAL GATE REVIEW */}
       {selectedApproval && (
         <div className="np-modal-backdrop">
-          <div className="np-modal max-w-xl">
+          <div className="np-modal max-w-2xl w-full mx-4">
             <div className="np-modal-header">
               <div>
                 <h3 className="font-bold text-sm text-theme-primary">
-                  Review & Authorize Outreach: {selectedApproval.company_name}
+                  Review & Authorize Outreach: {approvalCompanyName || selectedApproval.company_name}
                 </h3>
                 <p className="text-xs text-theme-secondary mt-0.5">
                   Scheduled for dynamic 9:00 AM - 5:00 PM local recipient timezone.
                 </p>
               </div>
               <button
-                onClick={() => setSelectedApproval(null)}
+                type="button"
+                disabled={isApprovingOutreach || isDispatchingNow}
+                onClick={() => {
+                  setApprovalModalError("");
+                  setSelectedApproval(null);
+                }}
                 className="text-theme-secondary hover:text-theme-primary font-bold"
               >
                 ✕
@@ -6024,6 +6080,12 @@ function doPost(e) {
             </div>
 
             <div className="np-modal-body space-y-3">
+              {approvalModalError && (
+                <div className="np-alert np-alert-error text-xs">
+                  <span>⚠️ {approvalModalError}</span>
+                </div>
+              )}
+
               <div>
                 <label className="np-label">Campaign Niche & Template Switcher</label>
                 <select
@@ -6080,8 +6142,10 @@ function doPost(e) {
               </div>
             </div>
 
-            <div className="np-modal-footer flex items-center justify-between">
+            <div className="np-modal-footer flex flex-wrap items-center justify-between gap-2">
               <button
+                type="button"
+                disabled={isApprovingOutreach || isDispatchingNow}
                 onClick={() => handleDeleteQueueItem(selectedApproval.id, approvalRecipient)}
                 className="btn btn-danger btn-sm flex items-center gap-1"
                 title="Permanently remove this lead from the gate"
@@ -6089,9 +6153,14 @@ function doPost(e) {
                 <span>🗑️ Delete Lead</span>
               </button>
 
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center justify-end gap-2">
                 <button
-                  onClick={() => setSelectedApproval(null)}
+                  type="button"
+                  disabled={isApprovingOutreach || isDispatchingNow}
+                  onClick={() => {
+                    setApprovalModalError("");
+                    setSelectedApproval(null);
+                  }}
                   className="btn btn-ghost btn-sm"
                 >
                   Cancel
@@ -6099,20 +6168,48 @@ function doPost(e) {
                 {user ? (
                   <>
                     <button
-                      onClick={() => handleApproveOutreach(selectedApproval.id, approvalSubject, approvalBody, approvalRecipient, approvalCompanyName)}
+                      type="button"
+                      disabled={isApprovingOutreach || isDispatchingNow}
+                      onClick={async () => {
+                        const ok = await handleApproveOutreach(
+                          selectedApproval.id,
+                          approvalSubject,
+                          approvalBody,
+                          approvalRecipient,
+                          approvalCompanyName,
+                          { closeModal: true }
+                        );
+                        if (ok) {
+                          setSelectedApproval(null);
+                          await fetchData();
+                        }
+                      }}
                       className="btn btn-warning btn-sm"
                     >
-                      Authorize & Schedule (9-5 Window)
+                      {isApprovingOutreach && !isDispatchingNow ? "Saving..." : "Authorize & Schedule (9-5 Window)"}
                     </button>
                     <button
+                      type="button"
+                      disabled={isApprovingOutreach || isDispatchingNow}
                       onClick={async () => {
-                        await handleApproveOutreach(selectedApproval.id, approvalSubject, approvalBody, approvalRecipient, approvalCompanyName);
-                        await handleDispatchQueueNow(true, selectedApproval.id);
+                        const targetQueueId = selectedApproval.id;
+                        const ok = await handleApproveOutreach(
+                          targetQueueId,
+                          approvalSubject,
+                          approvalBody,
+                          approvalRecipient,
+                          approvalCompanyName,
+                          { closeModal: false, suppressSuccessBanner: true }
+                        );
+                        if (!ok) return;
+                        await handleDispatchQueueNow(true, targetQueueId);
+                        setSelectedApproval(null);
+                        await fetchData();
                       }}
                       className="btn btn-primary btn-sm flex items-center gap-1"
                       title="Authorize and immediately dispatch outside business hours or on weekends"
                     >
-                      <span>⚡ Authorize & Dispatch Now</span>
+                      <span>{isDispatchingNow ? "⚡ Dispatching..." : "⚡ Authorize & Dispatch Now"}</span>
                     </button>
                   </>
                 ) : null}

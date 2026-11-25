@@ -68,15 +68,82 @@ class InboxRotator:
                 return dict(row)
             return None
 
-    def record_email_dispatched(self, mailbox_id_or_email: str) -> None:
-        """Increments sent_today count for the used mailbox."""
-        with self.db.get_connection() as conn:
-            conn.execute("""
-                UPDATE mailbox_rotator
-                SET sent_today = sent_today + 1
-                WHERE id = ? OR email_address = ?
-            """, (mailbox_id_or_email, mailbox_id_or_email))
-            conn.commit()
+    def record_email_dispatched(
+        self,
+        mailbox_id_or_email: str,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None,
+        conn=None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Increments sent_today count for the used mailbox (SQLite + MongoDB),
+        strictly scoped to the current user/tenant when provided.
+        """
+        owner = (owner_username or "").strip().lower()
+        op_id = (operator_id or "").strip()
+        updated_mb: Optional[Dict[str, Any]] = None
+
+        def _do_update(active_conn) -> Optional[Dict[str, Any]]:
+            self._reset_quotas_if_new_day(active_conn)
+            if owner or op_id:
+                active_conn.execute("""
+                    UPDATE mailbox_rotator
+                    SET sent_today = sent_today + 1
+                    WHERE (id = ? OR lower(email_address) = lower(?))
+                      AND (
+                          lower(owner_username) = ?
+                          OR operator_id = ?
+                          OR ((owner_username IS NULL OR owner_username = '') AND (operator_id IS NULL OR operator_id = ''))
+                      )
+                """, (mailbox_id_or_email, mailbox_id_or_email, owner, op_id))
+                row = active_conn.execute("""
+                    SELECT id, email_address, sent_today, daily_limit, operator_id, owner_username
+                    FROM mailbox_rotator
+                    WHERE (id = ? OR lower(email_address) = lower(?))
+                      AND (
+                          lower(owner_username) = ?
+                          OR operator_id = ?
+                          OR ((owner_username IS NULL OR owner_username = '') AND (operator_id IS NULL OR operator_id = ''))
+                      )
+                    LIMIT 1
+                """, (mailbox_id_or_email, mailbox_id_or_email, owner, op_id)).fetchone()
+            else:
+                active_conn.execute("""
+                    UPDATE mailbox_rotator
+                    SET sent_today = sent_today + 1
+                    WHERE id = ? OR lower(email_address) = lower(?)
+                """, (mailbox_id_or_email, mailbox_id_or_email))
+                row = active_conn.execute("""
+                    SELECT id, email_address, sent_today, daily_limit, operator_id, owner_username
+                    FROM mailbox_rotator
+                    WHERE id = ? OR lower(email_address) = lower(?)
+                    LIMIT 1
+                """, (mailbox_id_or_email, mailbox_id_or_email)).fetchone()
+            return dict(row) if row else None
+
+        if conn is not None:
+            updated_mb = _do_update(conn)
+        else:
+            with self.db.get_connection() as owned_conn:
+                updated_mb = _do_update(owned_conn)
+                owned_conn.commit()
+
+        if updated_mb:
+            try:
+                from database.mongo_engine import get_mongo_engine
+                mongo = get_mongo_engine()
+                mongo.increment_mailbox_sent_today(
+                    mailbox_id=updated_mb["id"],
+                    email_address=updated_mb["email_address"],
+                    owner_username=owner or (updated_mb.get("owner_username") or "").strip().lower(),
+                    operator_id=op_id or (updated_mb.get("operator_id") or "").strip(),
+                    sent_today=updated_mb["sent_today"],
+                    daily_limit=updated_mb["daily_limit"],
+                )
+            except Exception:
+                pass
+
+        return updated_mb
 
     def get_all_mailboxes_status(
         self,
