@@ -84,6 +84,7 @@ class NexusPulseOrchestrator:
         owner_username: Optional[str] = None,
         dedup_by_email_only: bool = False,
         defer_export: bool = False,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Takes a raw scraped Lead, applies Blacklist and Suppression checks,
@@ -235,15 +236,18 @@ class NexusPulseOrchestrator:
             register_secondary_emails=not dedup_by_email_only,
         )
 
+        t_id = (tenant_id or op_id or owner or "").strip()
+
         # 6. Store in Category Vault (optionally deferring heavy CSV/XLSX regen to batch end)
         store_res = self.vault.store_lead(
             raw_lead,
             operator_id=op_id,
             owner_username=owner,
             sync_spreadsheets=not defer_export,
+            tenant_id=t_id,
         )
 
-        # 7. Mirror lead to MongoDB with unique constraint indexing
+        # 7. Mirror lead to MongoDB with unique constraint indexing and strict tenant_id isolation
         try:
             from database.mongo_engine import get_mongo_engine
             mongo = get_mongo_engine()
@@ -259,6 +263,7 @@ class NexusPulseOrchestrator:
                 "priority_score": raw_lead.priority_score,
                 "operator_id": op_id,
                 "owner_username": owner,
+                "tenant_id": t_id,
                 "unsubscribed": False
             })
         except Exception:
@@ -289,10 +294,11 @@ class NexusPulseOrchestrator:
         sample_targets: Optional[List[Dict[str, str]]] = None,
         operator_id: Optional[str] = None,
         owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Executes a targeted search and processing run using localized queries.
-        Preserves tenant data isolation via operator_id and owner_username.
+        Preserves tenant data isolation via operator_id, owner_username, and tenant_id.
         """
         c_country = country or self.config.target_country
         c_city = city or self.config.target_city
@@ -319,7 +325,12 @@ class NexusPulseOrchestrator:
                     lead = None
 
                 if lead:
-                    result = self.process_and_preserve_lead(lead, operator_id=operator_id, owner_username=owner_username)
+                    result = self.process_and_preserve_lead(
+                        lead,
+                        operator_id=operator_id,
+                        owner_username=owner_username,
+                        tenant_id=tenant_id
+                    )
                     if result["success"]:
                         processed_leads.append(result)
                     else:

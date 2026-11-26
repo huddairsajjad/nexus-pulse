@@ -143,6 +143,9 @@ def get_current_user(
     # Ensure 'id' is mapped from 'sub'
     if "sub" in payload and "id" not in payload:
         payload["id"] = payload["sub"]
+    # Ensure 'tenant_id' is always present in current_user for strict multi-tenant isolation
+    if "tenant_id" not in payload or not payload["tenant_id"]:
+        payload["tenant_id"] = payload.get("id") or payload.get("sub") or payload.get("username")
     return payload
 
 
@@ -668,15 +671,17 @@ def delete_blacklist_rule(rule_id: str, admin_user: Dict[str, Any] = Depends(req
 def list_service_templates(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Lists proposal templates belonging to the current tenant."""
     mgr = get_template_manager()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"] if current_user.get("role") == "operator" else None
     owner_u = (current_user.get("username") or "").strip().lower()
-    return mgr.get_templates(operator_id=op_id, owner_username=owner_u)
+    return mgr.get_templates(operator_id=op_id, owner_username=owner_u, tenant_id=tenant_id)
 
 
 @router.post("/templates")
 def create_service_template(req: TemplateCreateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Composes and stores a new custom service proposal template."""
     mgr = get_template_manager()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
     try:
@@ -687,7 +692,8 @@ def create_service_template(req: TemplateCreateRequest, current_user: Dict[str, 
             subject_template=req.subject_template,
             body_template=req.body_template,
             is_default=req.is_default or False,
-            owner_username=owner_u
+            owner_username=owner_u,
+            tenant_id=tenant_id
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -697,6 +703,7 @@ def create_service_template(req: TemplateCreateRequest, current_user: Dict[str, 
 def update_service_template(template_id: str, req: TemplateUpdateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Updates an existing custom proposal template."""
     mgr = get_template_manager()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"] if current_user.get("role") == "operator" else None
     owner_u = (current_user.get("username") or "").strip().lower()
     try:
@@ -708,7 +715,8 @@ def update_service_template(template_id: str, req: TemplateUpdateRequest, curren
             subject_template=req.subject_template,
             body_template=req.body_template,
             is_default=req.is_default,
-            owner_username=owner_u
+            owner_username=owner_u,
+            tenant_id=tenant_id
         )
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -718,10 +726,11 @@ def update_service_template(template_id: str, req: TemplateUpdateRequest, curren
 def delete_service_template(template_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Deletes a custom proposal template."""
     mgr = get_template_manager()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"] if current_user.get("role") == "operator" else None
     owner_u = (current_user.get("username") or "").strip().lower()
     try:
-        deleted = mgr.delete_template(template_id, operator_id=op_id, owner_username=owner_u)
+        deleted = mgr.delete_template(template_id, operator_id=op_id, owner_username=owner_u, tenant_id=tenant_id)
         if not deleted:
             raise HTTPException(status_code=404, detail="Template not found.")
         return {"success": True, "deleted_template_id": template_id}
@@ -924,6 +933,7 @@ def get_kanban_leads(
     db = get_db_engine()
     owner_u = (current_user.get("username") or "").strip().lower()
     op_id = current_user["id"]
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     is_admin = current_user.get("role") == "admin"
 
     with db.get_connection() as conn:
@@ -934,11 +944,12 @@ def get_kanban_leads(
                        approved_by, sent_at, mailbox_used, operator_id, owner_username,
                        opened_at, bounced_at, bounce_reason, replied_at, reply_snippet, created_at,
                        COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
-                       COALESCE(industry_niche, 'Commercial Construction') as niche
+                       COALESCE(industry_niche, 'Commercial Construction') as niche,
+                       COALESCE(tenant_id, operator_id) as tenant_id
                 FROM outreach_queue
-                WHERE (operator_id = ? OR lower(owner_username) = ?)
+                WHERE (tenant_id = ? OR operator_id = ? OR lower(owner_username) = ?)
                 ORDER BY created_at DESC
-            """, (operator_id, operator_id.lower())).fetchall()
+            """, (operator_id, operator_id, operator_id.lower())).fetchall()
         elif is_admin:
             rows = conn.execute("""
                 SELECT id, lead_id, channel, recipient, company_name, subject,
@@ -946,11 +957,12 @@ def get_kanban_leads(
                        approved_by, sent_at, mailbox_used, operator_id, owner_username,
                        opened_at, bounced_at, bounce_reason, replied_at, reply_snippet, created_at,
                        COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
-                       COALESCE(industry_niche, 'Commercial Construction') as niche
+                       COALESCE(industry_niche, 'Commercial Construction') as niche,
+                       COALESCE(tenant_id, operator_id) as tenant_id
                 FROM outreach_queue
-                WHERE (lower(owner_username) = ? OR operator_id = ? OR owner_username = '' OR owner_username IS NULL)
+                WHERE (tenant_id = ? OR lower(owner_username) = ? OR operator_id = ? OR owner_username = '' OR owner_username IS NULL)
                 ORDER BY created_at DESC
-            """, (owner_u, op_id)).fetchall()
+            """, (tenant_id, owner_u, op_id)).fetchall()
         else:
             rows = conn.execute("""
                 SELECT id, lead_id, channel, recipient, company_name, subject,
@@ -958,11 +970,12 @@ def get_kanban_leads(
                        approved_by, sent_at, mailbox_used, operator_id, owner_username,
                        opened_at, bounced_at, bounce_reason, replied_at, reply_snippet, created_at,
                        COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
-                       COALESCE(industry_niche, 'Commercial Construction') as niche
+                       COALESCE(industry_niche, 'Commercial Construction') as niche,
+                       COALESCE(tenant_id, operator_id) as tenant_id
                 FROM outreach_queue
-                WHERE (lower(owner_username) = ? OR operator_id = ?)
+                WHERE (tenant_id = ? OR lower(owner_username) = ? OR operator_id = ?)
                 ORDER BY created_at DESC
-            """, (owner_u, op_id)).fetchall()
+            """, (tenant_id, owner_u, op_id)).fetchall()
 
         items = [dict(r) for r in rows]
 
@@ -1009,15 +1022,17 @@ def get_kanban_leads(
 def get_pending_outreach_approvals(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Lists items held in the mandatory approval gate for this tenant."""
     gate = get_approval_gate()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
-    return gate.get_pending_approvals(operator_id=op_id, owner_username=owner_u)
+    return gate.get_pending_approvals(operator_id=op_id, owner_username=owner_u, tenant_id=tenant_id)
 
 
 @router.post("/outreach/approve")
 def approve_outreach_item(req: ApproveOutreachRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Authorizes outreach item. Strictly scoped per user workspace."""
     gate = get_approval_gate()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
     approver_name = req.approver or current_user.get("username", "operator")
@@ -1030,7 +1045,8 @@ def approve_outreach_item(req: ApproveOutreachRequest, current_user: Dict[str, A
             edited_recipient=req.edited_recipient,
             edited_company_name=req.edited_company_name,
             operator_id=op_id,
-            owner_username=owner_u
+            owner_username=owner_u,
+            tenant_id=tenant_id
         )
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1041,10 +1057,11 @@ def approve_outreach_item(req: ApproveOutreachRequest, current_user: Dict[str, A
 def delete_outreach_item(queue_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Permanently deletes a single lead item from the Approval Gate queue in 1 click."""
     gate = get_approval_gate()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
     try:
-        return gate.delete_queue_item(queue_id, operator_id=op_id, owner_username=owner_u)
+        return gate.delete_queue_item(queue_id, operator_id=op_id, owner_username=owner_u, tenant_id=tenant_id)
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1056,10 +1073,11 @@ def unblock_outreach_item(req: UnblockLeadRequest, current_user: Dict[str, Any] 
     and restoring it to PENDING_APPROVAL in the Human Approval Gate.
     """
     gate = get_approval_gate()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
     try:
-        return gate.unblock_lead(req.queue_id, operator_id=op_id, owner_username=owner_u)
+        return gate.unblock_lead(req.queue_id, operator_id=op_id, owner_username=owner_u, tenant_id=tenant_id)
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1072,30 +1090,33 @@ def purge_unapproved_gate(current_user: Dict[str, Any] = Depends(get_current_use
     Wipes all pending/unapproved leads held in the Approval Gate in 1 click strictly for this user.
     """
     gate = get_approval_gate()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
-    return gate.purge_unapproved_items(operator_id=op_id, owner_username=owner_u)
+    return gate.purge_unapproved_items(operator_id=op_id, owner_username=owner_u, tenant_id=tenant_id)
 
 
 @router.post("/outreach/batch-approve")
 def batch_approve_outreach(req: BatchApproveRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Batch approves all pending outreach items held in the gate for this tenant."""
     gate = get_approval_gate()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
     approver_name = req.approver or current_user.get("username", "operator")
-    return gate.batch_approve_all(approver=approver_name, operator_id=op_id, owner_username=owner_u)
+    return gate.batch_approve_all(approver=approver_name, operator_id=op_id, owner_username=owner_u, tenant_id=tenant_id)
 
 
 @router.post("/outreach/reject")
 def reject_outreach_item(req: RejectOutreachRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Rejects outreach item held in the gate."""
     gate = get_approval_gate()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
     approver_name = req.approver or current_user.get("username", "operator")
     try:
-        return gate.reject_outreach_item(req.queue_id, approver=approver_name, operator_id=op_id, owner_username=owner_u)
+        return gate.reject_outreach_item(req.queue_id, approver=approver_name, operator_id=op_id, owner_username=owner_u, tenant_id=tenant_id)
     except (ValueError, PermissionError) as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1113,13 +1134,14 @@ def dispatch_approved_item(
     """
     gate = get_approval_gate()
     worker = get_dispatcher_worker()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
     dispatched_count = 0
     dispatch_res: Optional[Dict[str, Any]] = None
     worker.begin_tenant_dispatch(operator_id=op_id, owner_username=owner_u)
     try:
-        res = gate.dispatch_approved_outreach(queue_id, operator_id=op_id, owner_username=owner_u, bypass_window=bool(bypass_window))
+        res = gate.dispatch_approved_outreach(queue_id, operator_id=op_id, owner_username=owner_u, bypass_window=bool(bypass_window), tenant_id=tenant_id)
         dispatch_res = res
         if not res.get("success"):
             err_msg = res.get("message") or res.get("reason") or "Dispatch failed."
@@ -1293,15 +1315,17 @@ def get_target_timezone_preview(
 def list_enrolled_mailboxes(current_user: Dict[str, Any] = Depends(get_current_user)):
     """Returns sending mailboxes. Strictly scoped per user workspace."""
     rotator = get_inbox_rotator()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     target_op = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
-    return rotator.get_all_mailboxes_status(operator_id=target_op, owner_username=owner_u)
+    return rotator.get_all_mailboxes_status(operator_id=target_op, owner_username=owner_u, tenant_id=tenant_id)
 
 
 @router.post("/mailboxes")
 def enroll_mailbox(req: MailboxCreateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Enrolls an active SMTP profile with per-mailbox daily sending cap and optional webhook relay."""
     rotator = get_inbox_rotator()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
     if req.webhook_url and req.webhook_url.strip():
@@ -1324,7 +1348,8 @@ def enroll_mailbox(req: MailboxCreateRequest, current_user: Dict[str, Any] = Dep
             imap_port=req.imap_port or 993,
             imap_username=req.imap_username or req.email_address,
             imap_password=req.imap_password or "",
-            webhook_url=req.webhook_url or ""
+            webhook_url=req.webhook_url or "",
+            tenant_id=tenant_id
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1334,26 +1359,33 @@ def enroll_mailbox(req: MailboxCreateRequest, current_user: Dict[str, Any] = Dep
 def update_mailbox(mailbox_id: str, req: MailboxUpdateRequest, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Updates configuration for an enrolled mailbox."""
     db = get_db_engine()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     owner_u = (current_user.get("username") or "").strip().lower()
     with db.get_connection() as conn:
-        existing = conn.execute("SELECT id, operator_id, owner_username FROM mailbox_rotator WHERE id = ?", (mailbox_id,)).fetchone()
+        existing = conn.execute("SELECT id, operator_id, owner_username, COALESCE(tenant_id, operator_id) as tenant_id FROM mailbox_rotator WHERE id = ?", (mailbox_id,)).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="Mailbox not found.")
 
         ex_owner = (existing["owner_username"] or "").strip().lower()
-        if current_user.get("role") != "admin" and existing["operator_id"] != current_user["id"] and ex_owner != owner_u:
+        ex_tenant = (existing["tenant_id"] or existing["operator_id"] or "").strip()
+        if current_user.get("role") != "admin" and existing["operator_id"] != current_user["id"] and ex_owner != owner_u and ex_tenant != tenant_id:
             raise HTTPException(status_code=403, detail="Forbidden: You can only edit your own mailboxes.")
 
         fields = []
         values = []
+        mongo_updates = {}
         if req.email_address is not None:
             fields.append("email_address = ?"); values.append(req.email_address.strip())
+            mongo_updates["email_address"] = req.email_address.strip()
         if req.display_name is not None:
             fields.append("display_name = ?"); values.append(req.display_name.strip())
+            mongo_updates["display_name"] = req.display_name.strip()
         if req.domain is not None:
             fields.append("domain = ?"); values.append(req.domain.strip())
+            mongo_updates["domain"] = req.domain.strip()
         if req.daily_limit is not None:
             fields.append("daily_limit = ?"); values.append(req.daily_limit)
+            mongo_updates["daily_limit"] = req.daily_limit
         if req.smtp_host is not None:
             fields.append("smtp_host = ?"); values.append(req.smtp_host.strip())
         if req.smtp_port is not None:
@@ -1375,6 +1407,7 @@ def update_mailbox(mailbox_id: str, req: MailboxUpdateRequest, current_user: Dic
             if wh_val and not wh_val.startswith("https://"):
                 raise HTTPException(status_code=400, detail="Webhook URL must be a valid HTTPS endpoint (starting with https://).")
             fields.append("webhook_url = ?"); values.append(wh_val)
+            mongo_updates["webhook_url"] = wh_val
 
         if not fields:
             raise HTTPException(status_code=400, detail="No fields provided to update.")
@@ -1383,6 +1416,14 @@ def update_mailbox(mailbox_id: str, req: MailboxUpdateRequest, current_user: Dic
         conn.execute(f"UPDATE mailbox_rotator SET {', '.join(fields)} WHERE id = ?", values)
         conn.commit()
 
+    if mongo_updates:
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            mongo.db["mailboxes"].update_one({"id": mailbox_id}, {"$set": mongo_updates})
+        except Exception:
+            pass
+
     return {"success": True, "id": mailbox_id, "message": "Mailbox updated successfully."}
 
 
@@ -1390,18 +1431,27 @@ def update_mailbox(mailbox_id: str, req: MailboxUpdateRequest, current_user: Dic
 def delete_mailbox(mailbox_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """Deletes an enrolled mailbox."""
     db = get_db_engine()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     owner_u = (current_user.get("username") or "").strip().lower()
     with db.get_connection() as conn:
-        existing = conn.execute("SELECT id, operator_id, owner_username, email_address FROM mailbox_rotator WHERE id = ?", (mailbox_id,)).fetchone()
+        existing = conn.execute("SELECT id, operator_id, owner_username, email_address, COALESCE(tenant_id, operator_id) as tenant_id FROM mailbox_rotator WHERE id = ?", (mailbox_id,)).fetchone()
         if not existing:
             raise HTTPException(status_code=404, detail="Mailbox not found.")
 
         ex_owner = (existing["owner_username"] or "").strip().lower()
-        if current_user.get("role") != "admin" and existing["operator_id"] != current_user["id"] and ex_owner != owner_u:
+        ex_tenant = (existing["tenant_id"] or existing["operator_id"] or "").strip()
+        if current_user.get("role") != "admin" and existing["operator_id"] != current_user["id"] and ex_owner != owner_u and ex_tenant != tenant_id:
             raise HTTPException(status_code=403, detail="Forbidden: You can only delete your own mailboxes.")
 
         conn.execute("DELETE FROM mailbox_rotator WHERE id = ?", (mailbox_id,))
         conn.commit()
+
+    try:
+        from database.mongo_engine import get_mongo_engine
+        mongo = get_mongo_engine()
+        mongo.db["mailboxes"].delete_one({"id": mailbox_id})
+    except Exception:
+        pass
 
     return {"success": True, "deleted_id": mailbox_id, "email": existing["email_address"]}
 
@@ -2014,6 +2064,7 @@ async def _run_scrape_job(
     req: "ScrapeRequest",
     op_id: str,
     owner_username: Optional[str] = None,
+    tenant_id: Optional[str] = None,
 ) -> None:
     """
     Async background worker that runs the full Hunt & Verify pipeline.
@@ -2029,6 +2080,7 @@ async def _run_scrape_job(
     gate = get_approval_gate()
     blacklist_mgr = get_blacklist_manager()
     reply_listener = get_reply_listener()
+    t_id = (tenant_id or op_id or "").strip()
 
     country = req.country.strip()
     niche = req.niche.strip()
@@ -2235,6 +2287,7 @@ async def _run_scrape_job(
                         owner_username=owner,
                         dedup_by_email_only=True,
                         defer_export=True,
+                        tenant_id=t_id
                     )
                     if pres.get("partition_dir"):
                         touched_partition_dirs.add(pres["partition_dir"])
@@ -2261,7 +2314,8 @@ async def _run_scrape_job(
                             tech_stack=pres.get("tech_stack"),
                             operator_id=op_id,
                             owner_username=owner,
-                            city=city_override
+                            city=city_override,
+                            tenant_id=t_id
                         )
                         if q_res.get("queue_id"):
                             verified_leads.append(pres)
@@ -2527,9 +2581,10 @@ async def launch_scrape_pipeline(
     """
     op_id = current_user["id"]
     owner_username = (current_user.get("username") or "").strip().lower()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     job_id = str(uuid.uuid4())
     _register_job(job_id, op_id)
-    background_tasks.add_task(_run_scrape_job, job_id, req, op_id, owner_username)
+    background_tasks.add_task(_run_scrape_job, job_id, req, op_id, owner_username, tenant_id)
     return {
         "status": "STARTED",
         "job_id": job_id,
@@ -2547,9 +2602,10 @@ def run_full_pipeline_run(sample_targets: Optional[List[Dict[str, str]]] = None,
     orchestrator = NexusPulseOrchestrator()
     op_id = current_user["id"]
     owner_username = (current_user.get("username") or "").strip().lower()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     targets = sample_targets or []
 
-    pipeline_res = orchestrator.execute_targeted_pipeline(sample_targets=targets, operator_id=op_id, owner_username=owner_username)
+    pipeline_res = orchestrator.execute_targeted_pipeline(sample_targets=targets, operator_id=op_id, owner_username=owner_username, tenant_id=tenant_id)
 
     # Queue preserved leads into Human Approval Gate
     gate = get_approval_gate()
@@ -2564,7 +2620,8 @@ def run_full_pipeline_run(sample_targets: Optional[List[Dict[str, str]]] = None,
             channel="EMAIL",
             tech_stack=lead_info.get("tech_stack"),
             operator_id=op_id,
-            owner_username=owner_username
+            owner_username=owner_username,
+            tenant_id=tenant_id
         )
         queued_in_gate.append(q_item)
 

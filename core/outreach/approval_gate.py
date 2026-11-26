@@ -134,16 +134,18 @@ class HumanApprovalGate:
         custom_body: Optional[str] = None,
         operator_id: Optional[str] = None,
         city: str = "",
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Places a lead into the mandatory Human Approval Gate (status: PENDING_APPROVAL).
         Computes regional working hours and renders custom or matched template copy.
-        Strictly isolated per operator_id and owner_username.
+        Strictly isolated per operator_id, owner_username, and tenant_id.
         """
         domain = recipient.split("@")[-1] if "@" in recipient else None
         owner = (owner_username or "").strip().lower()
         op_id = (operator_id or "").strip()
+        t_id_val = (tenant_id or operator_id or "").strip()
 
         # 0. Drop junk domains & invalid system prefixes
         if domain and LeadValidationFilter.is_junk_domain(domain):
@@ -241,7 +243,7 @@ class HumanApprovalGate:
             body = rendered["body"]
 
         # Automatically map lead to matching available mailbox for this user
-        mb = self.rotator.get_next_available_mailbox(operator_id=operator_id, owner_username=owner)
+        mb = self.rotator.get_next_available_mailbox(operator_id=operator_id, owner_username=owner, tenant_id=t_id_val)
         mailbox_assigned = mb["email_address"] if mb else None
 
         with self.db.get_connection() as conn:
@@ -249,14 +251,45 @@ class HumanApprovalGate:
                 INSERT INTO outreach_queue (
                     id, lead_id, channel, recipient, company_name, subject, message_body,
                     status, target_country, target_timezone, scheduled_for, operator_id,
-                    owner_username, tracking_id, mailbox_used, industry_niche
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?, ?, ?, ?, ?, ?, ?)
+                    owner_username, tracking_id, mailbox_used, industry_niche, tenant_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PENDING_APPROVAL', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 queue_id, lead_id, channel, recipient, company_name, subject, body,
                 country, tz_info["timezone_code"], scheduled_for, operator_id,
-                owner, tracking_id, mailbox_assigned, niche
+                owner, tracking_id, mailbox_assigned, niche, t_id_val
             ))
             conn.commit()
+
+        # Persist into MongoDB outreach collection across container restarts
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            mongo.db["outreach"].update_one(
+                {"id": queue_id},
+                {"$set": {
+                    "id": queue_id,
+                    "lead_id": lead_id,
+                    "channel": channel,
+                    "recipient": recipient,
+                    "company_name": company_name,
+                    "subject": subject,
+                    "message_body": body,
+                    "status": "PENDING_APPROVAL",
+                    "target_country": country,
+                    "target_timezone": tz_info["timezone_code"],
+                    "scheduled_for": scheduled_for,
+                    "operator_id": operator_id,
+                    "owner_username": owner,
+                    "tenant_id": t_id_val,
+                    "tracking_id": tracking_id,
+                    "mailbox_used": mailbox_assigned,
+                    "industry_niche": niche,
+                    "created_at": datetime.now(timezone.utc).isoformat()
+                }},
+                upsert=True
+            )
+        except Exception:
+            pass
 
         return {
             "queue_id": queue_id,
@@ -270,30 +303,36 @@ class HumanApprovalGate:
             "scheduled_for": scheduled_for,
             "operator_id": operator_id,
             "owner_username": owner,
+            "tenant_id": t_id_val,
             "hold_message": "Item held in Human Approval Gate. Requires manual human authorization before dispatch."
         }
 
     @staticmethod
     def _assert_tenant_access(
         row_dict: Dict[str, Any],
-        operator_id: Optional[str],
-        owner_username: Optional[str],
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None,
         action_label: str = "modify outreach",
+        tenant_id: Optional[str] = None,
     ) -> None:
         """
         Enforces strict per-tenant isolation: when caller identity is provided and the
-        record carries an owner/operator binding, requires a matching tenant identity.
+        record carries an owner/operator/tenant binding, requires a matching tenant identity.
         """
+        t_id = (tenant_id or "").strip()
         op_id = (operator_id or "").strip()
         owner = (owner_username or "").strip().lower()
+        row_tenant = (row_dict.get("tenant_id") or "").strip()
         row_owner = (row_dict.get("owner_username") or "").strip().lower()
         row_op = (row_dict.get("operator_id") or "").strip()
 
-        if (owner or op_id) and (row_owner or row_op):
+        if (t_id or owner or op_id) and (row_tenant or row_owner or row_op):
+            tenant_match = bool(t_id and row_tenant and row_tenant == t_id)
             owner_match = bool(owner and row_owner and row_owner == owner)
             op_match = bool(op_id and row_op and row_op == op_id)
-            if not (owner_match or op_match):
-                raise PermissionError(f"Access denied: You cannot {action_label} for another workspace.")
+            cross_match = bool((t_id and (row_op == t_id or row_owner == t_id)) or (op_id and row_tenant == op_id))
+            if not (tenant_match or owner_match or op_match or cross_match):
+                raise PermissionError(f"Access denied: You cannot {action_label} for another workspace or tenant.")
 
     def approve_outreach_item(
         self,
@@ -305,6 +344,7 @@ class HumanApprovalGate:
         edited_company_name: Optional[str] = None,
         operator_id: Optional[str] = None,
         owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Manually authorizes an outreach item.
@@ -314,6 +354,7 @@ class HumanApprovalGate:
         """
         op_id = (operator_id or "").strip()
         owner = (owner_username or "").strip().lower()
+        t_id = (tenant_id or "").strip()
 
         with self.db.get_connection() as conn:
             raw_row = conn.execute("SELECT * FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
@@ -321,7 +362,7 @@ class HumanApprovalGate:
                 raise ValueError(f"Outreach queue item '{queue_id}' not found.")
 
             row = dict(raw_row)
-            self._assert_tenant_access(row, op_id, owner, action_label="approve outreach")
+            self._assert_tenant_access(row, op_id, owner, action_label="approve outreach", tenant_id=t_id)
 
             if row["status"] not in ("PENDING_APPROVAL", "REJECTED", "APPROVED", "SCHEDULED", "FAILED"):
                 return {"success": False, "message": f"Item is already in status: {row['status']}"}
@@ -427,25 +468,36 @@ class HumanApprovalGate:
         self,
         queue_id: str,
         operator_id: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Permanently deletes an individual lead from the outreach queue in 1 click."""
         op_id = (operator_id or "").strip()
         owner = (owner_username or "").strip().lower()
+        t_id = (tenant_id or "").strip()
         with self.db.get_connection() as conn:
-            row = conn.execute("SELECT id, operator_id, owner_username, recipient, company_name FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
+            row = conn.execute("SELECT id, operator_id, owner_username, recipient, company_name, tenant_id FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
             if not row:
                 raise ValueError(f"Queue item '{queue_id}' not found.")
             row_dict = dict(row)
-            self._assert_tenant_access(row_dict, op_id, owner, action_label="delete outreach")
+            self._assert_tenant_access(row_dict, op_id, owner, action_label="delete outreach", tenant_id=t_id)
             conn.execute("DELETE FROM outreach_queue WHERE id = ?", (queue_id,))
             conn.commit()
-            return {"success": True, "deleted_id": queue_id, "recipient": row["recipient"]}
+
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            mongo.db["outreach"].delete_one({"id": queue_id})
+        except Exception:
+            pass
+
+        return {"success": True, "deleted_id": queue_id, "recipient": row_dict["recipient"]}
 
     def purge_unapproved_items(
         self,
         operator_id: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Bulk Purge ('Clear Unapproved Gate'):
@@ -453,8 +505,14 @@ class HumanApprovalGate:
         """
         op_id = (operator_id or "").strip()
         owner = (owner_username or "").strip().lower()
+        t_id = (tenant_id or "").strip()
         with self.db.get_connection() as conn:
-            if owner or op_id:
+            if t_id:
+                cur = conn.execute("""
+                    DELETE FROM outreach_queue
+                    WHERE status = 'PENDING_APPROVAL' AND (tenant_id = ? OR lower(owner_username) = ? OR operator_id = ?)
+                """, (t_id, owner or t_id, op_id or t_id))
+            elif owner or op_id:
                 cur = conn.execute("""
                     DELETE FROM outreach_queue
                     WHERE status = 'PENDING_APPROVAL' AND (lower(owner_username) = ? OR operator_id = ?)
@@ -462,19 +520,46 @@ class HumanApprovalGate:
             else:
                 cur = conn.execute("DELETE FROM outreach_queue WHERE status = 'PENDING_APPROVAL'")
             conn.commit()
-            return {"success": True, "purged_count": cur.rowcount}
+            purged = cur.rowcount
+
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            m_or = []
+            if t_id:
+                m_or.append({"tenant_id": t_id})
+            if owner:
+                m_or.append({"owner_username": owner})
+            if op_id:
+                m_or.append({"operator_id": op_id})
+            if m_or:
+                mongo.db["outreach"].delete_many({"status": "PENDING_APPROVAL", "$or": m_or})
+            else:
+                mongo.db["outreach"].delete_many({"status": "PENDING_APPROVAL"})
+        except Exception:
+            pass
+
+        return {"success": True, "purged_count": purged}
 
     def batch_approve_all(
         self,
         approver: str = "operator",
         operator_id: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Approves all currently pending items in the gate strictly for the current user's workspace."""
         op_id = (operator_id or "").strip()
         owner = (owner_username or "").strip().lower()
+        t_id = (tenant_id or "").strip()
         with self.db.get_connection() as conn:
-            if owner or op_id:
+            if t_id:
+                cur = conn.execute("""
+                    UPDATE outreach_queue
+                    SET status = 'APPROVED', approved_by = ?, approved_at = CURRENT_TIMESTAMP
+                    WHERE status = 'PENDING_APPROVAL' AND (tenant_id = ? OR lower(owner_username) = ? OR operator_id = ?)
+                """, (approver, t_id, owner or t_id, op_id or t_id))
+            elif owner or op_id:
                 cur = conn.execute("""
                     UPDATE outreach_queue
                     SET status = 'APPROVED', approved_by = ?, approved_at = CURRENT_TIMESTAMP
@@ -488,24 +573,46 @@ class HumanApprovalGate:
                 """, (approver,))
 
             conn.commit()
-            return {"success": True, "items_approved": cur.rowcount, "approved_by": approver}
+            approved_count = cur.rowcount
+
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            m_or = []
+            if t_id:
+                m_or.append({"tenant_id": t_id})
+            if owner:
+                m_or.append({"owner_username": owner})
+            if op_id:
+                m_or.append({"operator_id": op_id})
+            if m_or:
+                mongo.db["outreach"].update_many(
+                    {"status": "PENDING_APPROVAL", "$or": m_or},
+                    {"$set": {"status": "APPROVED", "approved_by": approver}}
+                )
+        except Exception:
+            pass
+
+        return {"success": True, "items_approved": approved_count, "approved_by": approver}
 
     def reject_outreach_item(
         self,
         queue_id: str,
         approver: str = "operator",
         operator_id: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Rejects outreach item, preventing dispatch."""
         op_id = (operator_id or "").strip()
         owner = (owner_username or "").strip().lower()
+        t_id = (tenant_id or "").strip()
         with self.db.get_connection() as conn:
-            row = conn.execute("SELECT operator_id, owner_username FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
+            row = conn.execute("SELECT id, operator_id, owner_username, tenant_id FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
             if not row:
                 raise ValueError(f"Item '{queue_id}' not found.")
             row_dict = dict(row)
-            self._assert_tenant_access(row_dict, op_id, owner, action_label="reject outreach")
+            self._assert_tenant_access(row_dict, op_id, owner, action_label="reject outreach", tenant_id=t_id)
 
             conn.execute("""
                 UPDATE outreach_queue
@@ -513,14 +620,26 @@ class HumanApprovalGate:
                 WHERE id = ?
             """, (approver, queue_id))
             conn.commit()
-            return {"success": True, "queue_id": queue_id, "status": "REJECTED"}
+
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            mongo.db["outreach"].update_one(
+                {"id": queue_id},
+                {"$set": {"status": "REJECTED", "approved_by": approver}}
+            )
+        except Exception:
+            pass
+
+        return {"success": True, "queue_id": queue_id, "status": "REJECTED"}
 
     def dispatch_approved_outreach(
         self,
         queue_id: str,
         operator_id: Optional[str] = None,
         bypass_window: bool = True,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Dispatches an approved outreach item.
@@ -531,6 +650,7 @@ class HumanApprovalGate:
         """
         op_id = (operator_id or "").strip()
         owner = (owner_username or "").strip().lower()
+        t_id = (tenant_id or "").strip()
         with self.db.get_connection() as conn:
             row = conn.execute("SELECT * FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
             if not row:
@@ -543,7 +663,7 @@ class HumanApprovalGate:
 
             target_op = op_id or row_op
             target_owner = owner or row_owner
-            self._assert_tenant_access(row, op_id, owner, action_label="dispatch outreach")
+            self._assert_tenant_access(row, op_id, owner, action_label="dispatch outreach", tenant_id=t_id)
 
             if row["status"] not in ("APPROVED", "SCHEDULED", "FAILED"):
                 raise PermissionError(f"CANNOT DISPATCH: Item is in '{row['status']}' state. Manual approval required.")
@@ -1086,19 +1206,34 @@ class HumanApprovalGate:
     def get_pending_approvals(
         self,
         operator_id: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Lists items held in the approval gate, filtered strictly by tenant."""
         op_id = (operator_id or "").strip()
         owner = (owner_username or "").strip().lower()
+        t_id = (tenant_id or "").strip()
         with self.db.get_connection() as conn:
-            if owner or op_id:
+            if t_id:
                 rows = conn.execute("""
                     SELECT id, lead_id, channel, recipient, company_name, subject,
                            message_body, status, target_country, target_timezone,
                            scheduled_for, operator_id, owner_username, created_at,
                            COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
-                           COALESCE(industry_niche, 'Commercial Construction') as niche
+                           COALESCE(industry_niche, 'Commercial Construction') as niche,
+                           COALESCE(tenant_id, operator_id) as tenant_id
+                    FROM outreach_queue
+                    WHERE status = 'PENDING_APPROVAL' AND (tenant_id = ? OR lower(owner_username) = ? OR operator_id = ?)
+                    ORDER BY created_at DESC
+                """, (t_id, owner or t_id, op_id or t_id)).fetchall()
+            elif owner or op_id:
+                rows = conn.execute("""
+                    SELECT id, lead_id, channel, recipient, company_name, subject,
+                           message_body, status, target_country, target_timezone,
+                           scheduled_for, operator_id, owner_username, created_at,
+                           COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
+                           COALESCE(industry_niche, 'Commercial Construction') as niche,
+                           COALESCE(tenant_id, operator_id) as tenant_id
                     FROM outreach_queue
                     WHERE status = 'PENDING_APPROVAL' AND (lower(owner_username) = ? OR operator_id = ?)
                     ORDER BY created_at DESC
@@ -1109,7 +1244,8 @@ class HumanApprovalGate:
                            message_body, status, target_country, target_timezone,
                            scheduled_for, operator_id, owner_username, created_at,
                            COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
-                           COALESCE(industry_niche, 'Commercial Construction') as niche
+                           COALESCE(industry_niche, 'Commercial Construction') as niche,
+                           COALESCE(tenant_id, operator_id) as tenant_id
                     FROM outreach_queue
                     WHERE status = 'PENDING_APPROVAL'
                     ORDER BY created_at DESC
@@ -1119,20 +1255,36 @@ class HumanApprovalGate:
     def get_all_queue_items(
         self,
         operator_id: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Returns full queue items, filtered strictly by tenant."""
         op_id = (operator_id or "").strip()
         owner = (owner_username or "").strip().lower()
+        t_id = (tenant_id or "").strip()
         with self.db.get_connection() as conn:
-            if owner or op_id:
+            if t_id:
                 rows = conn.execute("""
                     SELECT id, lead_id, channel, recipient, company_name, subject,
                            message_body, status, target_country, scheduled_for,
                            approved_by, sent_at, mailbox_used, operator_id, owner_username,
                            opened_at, bounced_at, bounce_reason, created_at,
                            COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
-                           COALESCE(industry_niche, 'Commercial Construction') as niche
+                           COALESCE(industry_niche, 'Commercial Construction') as niche,
+                           COALESCE(tenant_id, operator_id) as tenant_id
+                    FROM outreach_queue
+                    WHERE (tenant_id = ? OR lower(owner_username) = ? OR operator_id = ?)
+                    ORDER BY created_at DESC
+                """, (t_id, owner or t_id, op_id or t_id)).fetchall()
+            elif owner or op_id:
+                rows = conn.execute("""
+                    SELECT id, lead_id, channel, recipient, company_name, subject,
+                           message_body, status, target_country, scheduled_for,
+                           approved_by, sent_at, mailbox_used, operator_id, owner_username,
+                           opened_at, bounced_at, bounce_reason, created_at,
+                           COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
+                           COALESCE(industry_niche, 'Commercial Construction') as niche,
+                           COALESCE(tenant_id, operator_id) as tenant_id
                     FROM outreach_queue
                     WHERE (lower(owner_username) = ? OR operator_id = ?)
                     ORDER BY created_at DESC
@@ -1144,7 +1296,8 @@ class HumanApprovalGate:
                            approved_by, sent_at, mailbox_used, operator_id, owner_username,
                            opened_at, bounced_at, bounce_reason, created_at,
                            COALESCE(industry_niche, 'Commercial Construction') as industry_niche,
-                           COALESCE(industry_niche, 'Commercial Construction') as niche
+                           COALESCE(industry_niche, 'Commercial Construction') as niche,
+                           COALESCE(tenant_id, operator_id) as tenant_id
                     FROM outreach_queue
                     ORDER BY created_at DESC
                 """).fetchall()
@@ -1155,6 +1308,7 @@ class HumanApprovalGate:
         queue_id: str,
         operator_id: Optional[str] = None,
         owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Unblocks a suppressed lead and restores it to PENDING_APPROVAL.
@@ -1163,13 +1317,14 @@ class HumanApprovalGate:
         """
         op_id = (operator_id or "").strip()
         owner = (owner_username or "").strip().lower()
+        t_id = (tenant_id or "").strip()
         with self.db.get_connection() as conn:
             row = conn.execute("SELECT * FROM outreach_queue WHERE id = ?", (queue_id,)).fetchone()
             if not row:
                 raise ValueError(f"Queue item '{queue_id}' not found.")
             row = dict(row)
 
-            self._assert_tenant_access(row, op_id, owner, action_label="unblock leads")
+            self._assert_tenant_access(row, op_id, owner, action_label="unblock leads", tenant_id=t_id)
 
             recipient = row["recipient"].strip().lower()
             target_owner = owner or (row.get("owner_username") or "").strip().lower()

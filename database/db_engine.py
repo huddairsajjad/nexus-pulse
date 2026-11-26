@@ -109,6 +109,11 @@ class DatabaseEngine:
                     conn.execute("ALTER TABLE dedup_registry ADD COLUMN owner_username TEXT DEFAULT '';")
                 except Exception:
                     pass
+            if "tenant_id" not in existing_dd_cols:
+                try:
+                    conn.execute("ALTER TABLE dedup_registry ADD COLUMN tenant_id TEXT DEFAULT '';")
+                except Exception:
+                    pass
             if "alias_group" not in existing_dd_cols:
                 try:
                     conn.execute("ALTER TABLE dedup_registry ADD COLUMN alias_group TEXT;")
@@ -228,6 +233,7 @@ class DatabaseEngine:
             existing_user_cols = {col["name"] for col in conn.execute("PRAGMA table_info(users)").fetchall()}
             migrations = [
                 ("email", "TEXT DEFAULT 'huddair@nexus-pulse.io'"),
+                ("tenant_id", "TEXT DEFAULT ''"),
                 ("is_active", "INTEGER NOT NULL DEFAULT 1"),
                 ("device_lock_id", "TEXT"),
                 ("device_lock_enabled", "INTEGER NOT NULL DEFAULT 1"),
@@ -253,18 +259,28 @@ class DatabaseEngine:
                 if col_name not in existing_user_cols:
                     conn.execute(f"ALTER TABLE users ADD COLUMN {col_name} {col_def};")
 
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id);")
+            try:
+                conn.execute("UPDATE users SET tenant_id = id WHERE (tenant_id IS NULL OR tenant_id = '') AND id IS NOT NULL;")
+            except Exception:
+                pass
+
             # Dynamic migration for vault_leads
             existing_vl_cols = {col["name"] for col in conn.execute("PRAGMA table_info(vault_leads)").fetchall()}
             if "operator_id" not in existing_vl_cols:
                 conn.execute("ALTER TABLE vault_leads ADD COLUMN operator_id TEXT;")
+            if "tenant_id" not in existing_vl_cols:
+                conn.execute("ALTER TABLE vault_leads ADD COLUMN tenant_id TEXT DEFAULT '';")
             if "unsubscribed" not in existing_vl_cols:
                 conn.execute("ALTER TABLE vault_leads ADD COLUMN unsubscribed INTEGER NOT NULL DEFAULT 0;")
             if "owner_username" not in existing_vl_cols:
                 conn.execute("ALTER TABLE vault_leads ADD COLUMN owner_username TEXT DEFAULT '';")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_operator ON vault_leads(operator_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_owner ON vault_leads(owner_username);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_vault_tenant ON vault_leads(tenant_id);")
             try:
                 conn.execute("UPDATE vault_leads SET owner_username = (SELECT username FROM users WHERE users.id = vault_leads.operator_id) WHERE (owner_username IS NULL OR owner_username = '') AND operator_id IS NOT NULL;")
+                conn.execute("UPDATE vault_leads SET tenant_id = COALESCE(NULLIF(operator_id, ''), NULLIF(owner_username, '')) WHERE (tenant_id IS NULL OR tenant_id = '');")
             except Exception:
                 pass
 
@@ -299,6 +315,7 @@ class DatabaseEngine:
             existing_oq_cols = {col["name"] for col in conn.execute("PRAGMA table_info(outreach_queue)").fetchall()}
             oq_migrations = [
                 ("operator_id", "TEXT"),
+                ("tenant_id", "TEXT DEFAULT ''"),
                 ("owner_username", "TEXT DEFAULT ''"),
                 ("tracking_id", "TEXT"),
                 ("opened_at", "TIMESTAMP"),
@@ -317,6 +334,7 @@ class DatabaseEngine:
 
             try:
                 conn.execute("UPDATE outreach_queue SET owner_username = (SELECT username FROM users WHERE users.id = outreach_queue.operator_id) WHERE (owner_username IS NULL OR owner_username = '') AND operator_id IS NOT NULL;")
+                conn.execute("UPDATE outreach_queue SET tenant_id = COALESCE(NULLIF(operator_id, ''), NULLIF(owner_username, '')) WHERE (tenant_id IS NULL OR tenant_id = '');")
             except Exception:
                 pass
 
@@ -324,6 +342,7 @@ class DatabaseEngine:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_lead ON outreach_queue(lead_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_operator ON outreach_queue(operator_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_owner ON outreach_queue(owner_username);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_tenant ON outreach_queue(tenant_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_msgid ON outreach_queue(message_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_queue_tracking ON outreach_queue(tracking_id);")
 
@@ -359,6 +378,7 @@ class DatabaseEngine:
                 ("smtp_username", "TEXT DEFAULT ''"),
                 ("smtp_password", "TEXT DEFAULT ''"),
                 ("operator_id", "TEXT"),
+                ("tenant_id", "TEXT DEFAULT ''"),
                 ("owner_username", "TEXT DEFAULT ''"),
                 ("imap_host", "TEXT DEFAULT ''"),
                 ("imap_port", "INTEGER DEFAULT 993"),
@@ -372,11 +392,13 @@ class DatabaseEngine:
 
             try:
                 conn.execute("UPDATE mailbox_rotator SET owner_username = (SELECT username FROM users WHERE users.id = mailbox_rotator.operator_id) WHERE (owner_username IS NULL OR owner_username = '') AND operator_id IS NOT NULL;")
+                conn.execute("UPDATE mailbox_rotator SET tenant_id = COALESCE(NULLIF(operator_id, ''), NULLIF(owner_username, '')) WHERE (tenant_id IS NULL OR tenant_id = '');")
             except Exception:
                 pass
 
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_operator ON mailbox_rotator(operator_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_owner ON mailbox_rotator(owner_username);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_mailbox_tenant ON mailbox_rotator(tenant_id);")
 
             # 7. Inbox Replies, AI Classification & Hot Lead Alerts
             conn.execute("""
@@ -400,14 +422,16 @@ class DatabaseEngine:
             existing_rep_cols = {col["name"] for col in conn.execute("PRAGMA table_info(inbox_replies)").fetchall()}
             if "operator_id" not in existing_rep_cols:
                 conn.execute("ALTER TABLE inbox_replies ADD COLUMN operator_id TEXT;")
+            if "tenant_id" not in existing_rep_cols:
+                conn.execute("ALTER TABLE inbox_replies ADD COLUMN tenant_id TEXT DEFAULT '';")
             if "owner_username" not in existing_rep_cols:
                 conn.execute("ALTER TABLE inbox_replies ADD COLUMN owner_username TEXT DEFAULT '';")
-            # Item 4: Message-ID deduplication column
             if "message_id" not in existing_rep_cols:
                 conn.execute("ALTER TABLE inbox_replies ADD COLUMN message_id TEXT;")
 
             try:
                 conn.execute("UPDATE inbox_replies SET owner_username = (SELECT username FROM users WHERE users.id = inbox_replies.operator_id) WHERE (owner_username IS NULL OR owner_username = '') AND operator_id IS NOT NULL;")
+                conn.execute("UPDATE inbox_replies SET tenant_id = COALESCE(NULLIF(operator_id, ''), NULLIF(owner_username, '')) WHERE (tenant_id IS NULL OR tenant_id = '');")
             except Exception:
                 pass
 
@@ -415,7 +439,7 @@ class DatabaseEngine:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_class ON inbox_replies(classification);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_operator ON inbox_replies(operator_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_owner ON inbox_replies(owner_username);")
-            # Unique index on message_id for fast dedup lookups (NULL values are excluded from uniqueness)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_replies_tenant ON inbox_replies(tenant_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_inbox_msgid ON inbox_replies(message_id);")
 
             # 8. Autonomous 7-Day Follow-Up Sequences
@@ -462,6 +486,15 @@ class DatabaseEngine:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON operator_sessions(user_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_created ON operator_sessions(created_at);")
 
+            existing_sess_cols = {col["name"] for col in conn.execute("PRAGMA table_info(operator_sessions)").fetchall()}
+            if "tenant_id" not in existing_sess_cols:
+                conn.execute("ALTER TABLE operator_sessions ADD COLUMN tenant_id TEXT DEFAULT '';")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_tenant ON operator_sessions(tenant_id);")
+            try:
+                conn.execute("UPDATE operator_sessions SET tenant_id = user_id WHERE (tenant_id IS NULL OR tenant_id = '');")
+            except Exception:
+                pass
+
             # -------------------------------------------------------------
             # SAAS MULTI-TENANCY & COMPLIANCE EXTENSIONS
             # -------------------------------------------------------------
@@ -483,12 +516,16 @@ class DatabaseEngine:
             existing_tpl_cols = {col["name"] for col in conn.execute("PRAGMA table_info(service_templates)").fetchall()}
             if "owner_username" not in existing_tpl_cols:
                 conn.execute("ALTER TABLE service_templates ADD COLUMN owner_username TEXT DEFAULT '';")
+            if "tenant_id" not in existing_tpl_cols:
+                conn.execute("ALTER TABLE service_templates ADD COLUMN tenant_id TEXT DEFAULT '';")
             try:
                 conn.execute("UPDATE service_templates SET owner_username = (SELECT username FROM users WHERE users.id = service_templates.operator_id) WHERE (owner_username IS NULL OR owner_username = '') AND operator_id IS NOT NULL;")
+                conn.execute("UPDATE service_templates SET tenant_id = COALESCE(NULLIF(operator_id, ''), NULLIF(owner_username, '')) WHERE (tenant_id IS NULL OR tenant_id = '');")
             except Exception:
                 pass
             conn.execute("CREATE INDEX IF NOT EXISTS idx_template_operator ON service_templates(operator_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_template_owner ON service_templates(owner_username);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_template_tenant ON service_templates(tenant_id);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_template_niche ON service_templates(niche);")
 
             # 12. Global & Per-User Suppressed Domains / Emails (Unsubscribes & Bounces)
@@ -506,12 +543,16 @@ class DatabaseEngine:
             existing_sup_cols = {col["name"] for col in conn.execute("PRAGMA table_info(suppressed_entities)").fetchall()}
             if "owner_username" not in existing_sup_cols:
                 conn.execute("ALTER TABLE suppressed_entities ADD COLUMN owner_username TEXT DEFAULT '';")
+            if "tenant_id" not in existing_sup_cols:
+                conn.execute("ALTER TABLE suppressed_entities ADD COLUMN tenant_id TEXT DEFAULT '';")
             try:
                 conn.execute("UPDATE suppressed_entities SET owner_username = (SELECT username FROM users WHERE users.id = suppressed_entities.operator_id) WHERE (owner_username IS NULL OR owner_username = '') AND operator_id IS NOT NULL;")
+                conn.execute("UPDATE suppressed_entities SET tenant_id = COALESCE(NULLIF(operator_id, ''), NULLIF(owner_username, '')) WHERE (tenant_id IS NULL OR tenant_id = '');")
             except Exception:
                 pass
             conn.execute("CREATE INDEX IF NOT EXISTS idx_suppressed_entity ON suppressed_entities(entity);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_suppressed_owner ON suppressed_entities(owner_username);")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_suppressed_tenant ON suppressed_entities(tenant_id);")
 
             # 9. Permanent DNC / GDPR Blacklist
             existing_dnc_cols = {col["name"] for col in conn.execute("PRAGMA table_info(dnc_blacklist)").fetchall()}

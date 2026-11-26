@@ -55,7 +55,38 @@ async def lifespan(app: FastAPI):
     print("  H.HUDDAIR'S NEXUS-PULSE [LEVEL 2 ENTERPRISE] - INITIALIZING ENGINE")
     print("=" * 68)
     
-    # 1. Hardware & Licensing Verification
+    # 0. Strict Production Requirement: Require MONGO_URI from environment
+    import os
+    mongo_uri = (os.getenv("MONGO_URI") or os.getenv("MONGODB_URI") or "").strip()
+    is_test_env = bool(
+        os.getenv("PYTEST_CURRENT_TEST") or
+        os.getenv("NEXUS_TEST_MODE") or
+        os.getenv("TESTING")
+    )
+    if not mongo_uri and not is_test_env:
+        err_msg = (
+            "FATAL STARTUP ERROR: 'MONGO_URI' environment variable is missing or empty. "
+            "Nexus-Pulse requires a persistent MongoDB connection string (os.getenv('MONGO_URI')) to boot in production. "
+            "Local SQLite and ephemeral storage fallbacks are disabled."
+        )
+        print("=" * 68)
+        print(f"  {err_msg}")
+        print("=" * 68)
+        raise RuntimeError(err_msg)
+
+    # 1. Connect directly to persistent MongoDB
+    try:
+        from database.mongo_engine import get_mongo_engine
+        mongo = get_mongo_engine()
+        if mongo and mongo.db is not None:
+            safe_target = mongo.uri.split("@")[-1] if mongo.uri and "@" in mongo.uri else "persistent"
+            print(f"  MongoDB Engine  : CONNECTED ({safe_target}/{mongo.db.name})")
+    except Exception as me:
+        if not is_test_env:
+            raise
+        print(f"  MongoDB test notice: {me}")
+
+    # 2. Hardware & Licensing Verification
     try:
         fp = generate_machine_fingerprint()
         hardware_id = fp.get("machine_id", "CLOUD-NODE")

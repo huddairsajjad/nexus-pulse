@@ -28,12 +28,14 @@ except ImportError:
 
 class MongoDatabaseEngine:
     """
-    MongoDB abstraction for Nexus-Pulse Lead persistence and unique deduplication.
-    Enforces strict unique indexes on domain and primary_email.
+    Direct MongoDB persistence engine for Nexus-Pulse Lead persistence and multi-tenant isolation.
+    Enforces strict unique indexes on (primary_email, tenant_id) and requires persistent MONGO_URI.
+    Collections persist across container restarts. Zero ephemeral or SQLite fallback in production.
     """
 
     def __init__(self, uri: Optional[str] = None):
-        self.uri = uri or os.environ.get("MONGO_URI") or os.environ.get("MONGODB_URI")
+        raw_uri = uri or os.environ.get("MONGO_URI") or os.environ.get("MONGODB_URI")
+        self.uri = raw_uri.strip() if raw_uri else None
         self.client = None
         self.db = None
         self.is_mock = False
@@ -41,32 +43,83 @@ class MongoDatabaseEngine:
         self._ensure_unique_indexes()
 
     def _initialize_connection(self):
-        """Initializes connection to live MongoDB or falls back to mongomock."""
-        if self.uri and pymongo:
-            try:
-                self.client = pymongo.MongoClient(
-                    self.uri,
-                    serverSelectionTimeoutMS=2000,
-                    connectTimeoutMS=2000
-                )
-                # Test connection
-                self.client.admin.command("ping")
-                db_name = self.uri.split("/")[-1].split("?")[0] or "nexus_pulse"
-                self.db = self.client[db_name]
-                self.is_mock = False
-                logger.info(f"[MONGO] Connected to live MongoDB at {self.uri.split('@')[-1]}")
-                return
-            except Exception as ex:
-                logger.warning(f"[MONGO] Live MongoDB connection unavailable ({ex}). Falling back to in-memory mongomock.")
+        """
+        Connects directly to live MongoDB using MONGO_URI.
+        If MONGO_URI is missing or empty, fails fast at startup with a clear error
+        instead of silently falling back to local SQLite or ephemeral storage.
+        Offline test mode (e.g. pytest) uses mongomock only when explicitly in testing.
+        """
+        is_test_env = bool(
+            os.getenv("PYTEST_CURRENT_TEST") or
+            os.getenv("NEXUS_TEST_MODE") or
+            os.getenv("TESTING") or
+            (self.uri == "mongomock")
+        )
 
-        # Fallback to mongomock
-        if mongomock:
-            self.client = mongomock.MongoClient()
-            self.db = self.client["nexus_pulse"]
-            self.is_mock = True
-            logger.info("[MONGO] Initialized in-memory mongomock database with full index support.")
-        else:
-            logger.warning("[MONGO] Neither live MongoDB nor mongomock available.")
+        # 1. If explicitly mongomock in test env or running tests without live MONGO_URI:
+        if self.uri == "mongomock" or (not self.uri and is_test_env):
+            if mongomock:
+                self.client = mongomock.MongoClient()
+                self.db = self.client["nexus_pulse"]
+                self.is_mock = True
+                logger.info("[MONGO] Running in isolated test mode with in-memory mongomock.")
+                return
+            else:
+                raise RuntimeError("Test environment requested mock MongoDB but mongomock is not installed.")
+
+        # 2. Production check: MONGO_URI is strictly required!
+        if not self.uri:
+            err_msg = (
+                "FATAL STARTUP ERROR: 'MONGO_URI' environment variable is missing or empty. "
+                "Nexus-Pulse requires a persistent MongoDB connection string (os.getenv('MONGO_URI')) to start. "
+                "Local SQLite and ephemeral storage fallbacks are disabled in production."
+            )
+            logger.critical(err_msg)
+            raise RuntimeError(err_msg)
+
+        # 3. Direct connection to live MongoDB
+        if not pymongo:
+            err_msg = "FATAL: 'pymongo' library is not installed. Live MongoDB connection cannot be established."
+            logger.critical(err_msg)
+            raise RuntimeError(err_msg)
+
+        try:
+            self.client = pymongo.MongoClient(
+                self.uri,
+                serverSelectionTimeoutMS=5000,
+                connectTimeoutMS=5000,
+                socketTimeoutMS=10000,
+                retryWrites=True
+            )
+            # Test connection with ping
+            self.client.admin.command("ping")
+
+            # Determine database name
+            try:
+                default_db = self.client.get_default_database()
+                self.db = default_db if default_db is not None else self.client["nexus_pulse"]
+            except Exception:
+                db_name = self.uri.split("/")[-1].split("?")[0].strip() or "nexus_pulse"
+                self.db = self.client[db_name]
+
+            self.is_mock = False
+            safe_target = self.uri.split("@")[-1] if "@" in self.uri else "cluster"
+            logger.info(f"[MONGO] Successfully connected directly to live persistent MongoDB ({safe_target}/{self.db.name})")
+        except Exception as ex:
+            if is_test_env and mongomock:
+                logger.warning(f"[MONGO TEST] Live MongoDB unavailable in test suite ({ex}). Using mongomock.")
+                self.client = mongomock.MongoClient()
+                self.db = self.client["nexus_pulse"]
+                self.is_mock = True
+                return
+
+            err_msg = (
+                f"FATAL STARTUP ERROR: Failed to connect directly to MongoDB via MONGO_URI: {ex}. "
+                "Please verify your connection string, credentials, network connectivity, and whitelist settings. "
+                "Ephemeral storage fallback is strictly disabled."
+            )
+            logger.critical(err_msg)
+            raise RuntimeError(err_msg) from ex
 
     def _ensure_connected(self):
         """Validates connection to MongoDB and auto-reconnects if disconnected."""
@@ -80,48 +133,71 @@ class MongoDatabaseEngine:
             self._initialize_connection()
 
     def _ensure_unique_indexes(self):
-        """Enforces per-tenant MongoDB unique index on (primary_email, owner_username) for multi-email and user isolation."""
+        """
+        Enforces indexes on collections including strict tenant_id indexing,
+        multi-tenant unique lead index (primary_email, tenant_id),
+        and user unique credentials.
+        Never drops or wipes collections so data persists across restarts.
+        """
         if self.db is None:
             return
 
         try:
+            # 1. Leads collection indexes
             for legacy_idx in ("idx_leads_domain_unique", "idx_leads_email_unique"):
                 try:
                     self.db.leads.drop_index(legacy_idx)
                 except Exception:
                     pass
 
-            # Composite unique index per tenant & email (allows multi-email per domain + cross-tenant independence)
+            # Multi-tenant unique index: email per tenant_id
             self.db.leads.create_index(
-                [("primary_email", pymongo.ASCENDING), ("owner_username", pymongo.ASCENDING)],
+                [("primary_email", pymongo.ASCENDING), ("tenant_id", pymongo.ASCENDING)],
                 unique=True,
-                name="idx_leads_email_owner_unique"
+                name="idx_leads_email_tenant_unique"
             )
-            self.db.leads.create_index([("domain", pymongo.ASCENDING)])
-            self.db.leads.create_index([("operator_id", pymongo.ASCENDING)])
-            self.db.leads.create_index([("owner_username", pymongo.ASCENDING)])
-            self.db.leads.create_index([("unsubscribed", pymongo.ASCENDING)])
+            self.db.leads.create_index([("tenant_id", pymongo.ASCENDING)], name="idx_leads_tenant_id")
+            self.db.leads.create_index([("operator_id", pymongo.ASCENDING)], name="idx_leads_operator_id")
+            self.db.leads.create_index([("owner_username", pymongo.ASCENDING)], name="idx_leads_owner_username")
+            self.db.leads.create_index([("domain", pymongo.ASCENDING)], name="idx_leads_domain")
+            self.db.leads.create_index([("status", pymongo.ASCENDING)], name="idx_leads_status")
+            self.db.leads.create_index([("unsubscribed", pymongo.ASCENDING)], name="idx_leads_unsubscribed")
 
-            # Users collection unique index on email & username
-            self.db.users.create_index([("username", pymongo.ASCENDING)], unique=True)
-            self.db.users.create_index([("email", pymongo.ASCENDING)], unique=True, sparse=True)
+            # 2. Users collection indexes
+            self.db.users.create_index([("username", pymongo.ASCENDING)], unique=True, name="idx_users_username_unique")
+            self.db.users.create_index([("email", pymongo.ASCENDING)], unique=True, sparse=True, name="idx_users_email_unique")
+            self.db.users.create_index([("id", pymongo.ASCENDING)], unique=True, sparse=True, name="idx_users_id_unique")
+            self.db.users.create_index([("tenant_id", pymongo.ASCENDING)], name="idx_users_tenant_id")
+            self.db.users.create_index([("role", pymongo.ASCENDING)], name="idx_users_role")
 
-            # Outreach & Mailboxes indexes for strict tenant isolation
-            self.db.outreach.create_index([("queue_id", pymongo.ASCENDING)])
-            self.db.outreach.create_index([("owner_username", pymongo.ASCENDING)])
-            self.db.outreach.create_index([("operator_id", pymongo.ASCENDING)])
-            self.db.mailboxes.create_index([("mailbox_id", pymongo.ASCENDING)])
-            self.db.mailboxes.create_index([("email_address", pymongo.ASCENDING)])
-            self.db.mailboxes.create_index([("owner_username", pymongo.ASCENDING)])
+            # 3. Outreach queue collection indexes
+            self.db.outreach.create_index([("queue_id", pymongo.ASCENDING)], name="idx_outreach_queue_id")
+            self.db.outreach.create_index([("tenant_id", pymongo.ASCENDING)], name="idx_outreach_tenant_id")
+            self.db.outreach.create_index([("operator_id", pymongo.ASCENDING)], name="idx_outreach_operator_id")
+            self.db.outreach.create_index([("owner_username", pymongo.ASCENDING)], name="idx_outreach_owner_username")
+            self.db.outreach.create_index([("status", pymongo.ASCENDING)], name="idx_outreach_status")
 
-            logger.info("[MONGO] Enforced per-user unique index on leads(primary_email, owner_username).")
+            # 4. Mailboxes collection indexes
+            self.db.mailboxes.create_index([("mailbox_id", pymongo.ASCENDING)], name="idx_mailboxes_id")
+            self.db.mailboxes.create_index([("email_address", pymongo.ASCENDING)], name="idx_mailboxes_email")
+            self.db.mailboxes.create_index([("tenant_id", pymongo.ASCENDING)], name="idx_mailboxes_tenant_id")
+            self.db.mailboxes.create_index([("operator_id", pymongo.ASCENDING)], name="idx_mailboxes_operator_id")
+            self.db.mailboxes.create_index([("owner_username", pymongo.ASCENDING)], name="idx_mailboxes_owner_username")
+
+            # 5. Service Templates & Logs indexes
+            self.db.service_templates.create_index([("tenant_id", pymongo.ASCENDING)], name="idx_templates_tenant_id")
+            self.db.service_templates.create_index([("id", pymongo.ASCENDING)], name="idx_templates_id")
+            self.db.logs.create_index([("tenant_id", pymongo.ASCENDING)], name="idx_logs_tenant_id")
+            self.db.dedup_registry.create_index([("tenant_id", pymongo.ASCENDING)], name="idx_dedup_tenant_id")
+
+            logger.info("[MONGO] Enforced per-tenant unique indexes and multi-tenant schema isolation.")
         except Exception as ex:
-            logger.warning(f"[MONGO] Index creation notice: {ex}")
+            logger.warning(f"[MONGO] Index setup notice: {ex}")
 
     def insert_lead(self, lead_dict: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Inserts lead into MongoDB collection.
-        Raises DuplicateKeyError or ValueError if primary_email already exists for this owner.
+        Inserts lead into MongoDB collection with strict tenant_id isolation.
+        Raises DuplicateKeyError or ValueError if primary_email already exists for this tenant.
         """
         self._ensure_connected()
         if self.db is None:
@@ -130,10 +206,14 @@ class MongoDatabaseEngine:
         clean_doc = dict(lead_dict)
         clean_doc.setdefault("created_at", datetime.now(timezone.utc).isoformat())
         clean_doc.setdefault("unsubscribed", False)
+        
+        # Enforce tenant_id across leads collection
+        raw_tenant = clean_doc.get("tenant_id") or clean_doc.get("operator_id") or clean_doc.get("owner_username") or ""
+        clean_doc["tenant_id"] = str(raw_tenant).strip()
         clean_doc["owner_username"] = str(clean_doc.get("owner_username") or "").strip().lower()
-        if "domain" in clean_doc:
+        if "domain" in clean_doc and clean_doc["domain"]:
             clean_doc["domain"] = clean_doc["domain"].strip().lower()
-        if "primary_email" in clean_doc:
+        if "primary_email" in clean_doc and clean_doc["primary_email"]:
             clean_doc["primary_email"] = clean_doc["primary_email"].strip().lower()
 
         try:
@@ -141,12 +221,13 @@ class MongoDatabaseEngine:
             return {
                 "success": True,
                 "inserted_id": str(res.inserted_id),
+                "tenant_id": clean_doc["tenant_id"],
                 "domain": clean_doc.get("domain"),
                 "primary_email": clean_doc.get("primary_email")
             }
         except pymongo.errors.DuplicateKeyError as dke:
-            logger.warning(f"[MONGO DEDUP] Blocked duplicate lead insertion: {dke}")
-            raise ValueError(f"DUPLICATE_LEAD: Lead domain or email already exists in MongoDB index ({clean_doc.get('domain')}, {clean_doc.get('primary_email')})")
+            logger.warning(f"[MONGO DEDUP] Blocked duplicate lead insertion for tenant '{clean_doc['tenant_id']}': {dke}")
+            raise ValueError(f"DUPLICATE_LEAD: Lead email already exists in MongoDB for this tenant ({clean_doc.get('primary_email')})")
         except Exception as ex:
             logger.error(f"[MONGO] Lead insert error: {ex}")
             raise
@@ -157,9 +238,10 @@ class MongoDatabaseEngine:
         email: Optional[str] = None,
         owner_username: Optional[str] = None,
         operator_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
         check_domain: bool = True,
     ) -> bool:
-        """Checks if a domain or email already exists in MongoDB leads collection for this user."""
+        """Checks if a domain or email already exists in MongoDB leads collection for this tenant."""
         self._ensure_connected()
         if self.db is None:
             return False
@@ -173,16 +255,9 @@ class MongoDatabaseEngine:
         if not query:
             return False
 
-        owner = (owner_username or "").strip().lower()
-        op_id = (operator_id or "").strip()
-
-        if owner or op_id:
-            owner_clauses = []
-            if owner:
-                owner_clauses.append({"owner_username": owner})
-            if op_id:
-                owner_clauses.append({"operator_id": op_id})
-            found = self.db.leads.find_one({"$and": [{"$or": query}, {"$or": owner_clauses}]})
+        tenant_filter = self._build_tenant_filter(owner_username=owner_username, operator_id=operator_id, tenant_id=tenant_id)
+        if tenant_filter:
+            found = self.db.leads.find_one({"$and": [{"$or": query}, tenant_filter]})
         else:
             found = self.db.leads.find_one({"$or": query})
         return found is not None
@@ -222,16 +297,29 @@ class MongoDatabaseEngine:
     def _build_tenant_filter(
         owner_username: Optional[str] = None,
         operator_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Builds a strict MongoDB tenant filter scoped to owner_username and/or operator_id."""
+        """Builds a strict MongoDB tenant filter scoped to tenant_id, owner_username and/or operator_id."""
+        t_id = (tenant_id or "").strip()
         owner = (owner_username or "").strip().lower()
         op_id = (operator_id or "").strip()
+
         clauses = []
-        if owner:
-            clauses.append({"owner_username": owner})
-        if op_id:
+        if t_id:
+            clauses.append({"tenant_id": t_id})
+        if op_id and op_id != t_id:
             clauses.append({"operator_id": op_id})
+        elif not t_id and op_id:
+            clauses.append({"operator_id": op_id})
+        if owner and owner != t_id and owner != op_id:
+            clauses.append({"owner_username": owner})
+        elif not t_id and not op_id and owner:
+            clauses.append({"owner_username": owner})
+
         if not clauses:
+            resolved = t_id or op_id or owner
+            if resolved:
+                return {"$or": [{"tenant_id": resolved}, {"operator_id": resolved}, {"owner_username": resolved.lower()}]}
             return {}
         if len(clauses) == 1:
             return clauses[0]
@@ -250,6 +338,7 @@ class MongoDatabaseEngine:
         operator_id: Optional[str] = None,
         approved_by: Optional[str] = None,
         status: str = "approved",
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Persists modified lead/outreach fields in MongoDB (leads & outreach collections),
@@ -264,7 +353,8 @@ class MongoDatabaseEngine:
         clean_new = (new_email or "").strip().lower()
         owner = (owner_username or "").strip().lower()
         op_id = (operator_id or "").strip()
-        tenant_filter = self._build_tenant_filter(owner, op_id)
+        t_id = (tenant_id or "").strip() or op_id or owner
+        tenant_filter = self._build_tenant_filter(owner_username=owner, operator_id=op_id, tenant_id=t_id)
 
         identity_clauses: List[Dict[str, Any]] = []
         if lead_id:
@@ -290,6 +380,8 @@ class MongoDatabaseEngine:
             base_fields["owner_username"] = owner
         if op_id:
             base_fields["operator_id"] = op_id
+        if t_id:
+            base_fields["tenant_id"] = t_id
 
         leads_modified = 0
         if identity_clauses:
@@ -303,7 +395,6 @@ class MongoDatabaseEngine:
                 res = self.db.leads.update_many(lead_filter, {"$set": lead_update})
                 leads_modified = res.modified_count
             except Exception as ex:
-                # If unique index on (primary_email, owner_username) collides on email edit, persist non-key fields
                 if pymongo and isinstance(ex, pymongo.errors.DuplicateKeyError):
                     lead_update.pop("primary_email", None)
                     res = self.db.leads.update_many(lead_filter, {"$set": lead_update})
@@ -320,6 +411,8 @@ class MongoDatabaseEngine:
             outreach_doc["lead_id"] = lead_id
         if clean_new:
             outreach_doc["primary_email"] = clean_new
+        if t_id:
+            outreach_doc["tenant_id"] = t_id
         try:
             self.db.outreach.update_one(outreach_filter, {"$set": outreach_doc}, upsert=True)
         except Exception as ex:
@@ -338,10 +431,11 @@ class MongoDatabaseEngine:
         delivery_method: str = "WEBHOOK",
         dispatched_at: Optional[str] = None,
         message_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Updates a specific user-owned lead's status to 'dispatched' in MongoDB
-        upon verified webhook/SMTP dispatch success.
+        upon verified webhook/SMTP dispatch success, strictly scoped to tenant.
         """
         self._ensure_connected()
         if self.db is None:
@@ -351,7 +445,8 @@ class MongoDatabaseEngine:
         clean_email = (recipient_email or "").strip().lower()
         owner = (owner_username or "").strip().lower()
         op_id = (operator_id or "").strip()
-        tenant_filter = self._build_tenant_filter(owner, op_id)
+        t_id = (tenant_id or "").strip() or op_id or owner
+        tenant_filter = self._build_tenant_filter(owner_username=owner, operator_id=op_id, tenant_id=t_id)
 
         dispatch_fields: Dict[str, Any] = {
             "status": "dispatched",
@@ -363,6 +458,8 @@ class MongoDatabaseEngine:
         }
         if message_id:
             dispatch_fields["message_id"] = message_id
+        if t_id:
+            dispatch_fields["tenant_id"] = t_id
 
         identity_clauses: List[Dict[str, Any]] = []
         if lead_id:
@@ -393,6 +490,8 @@ class MongoDatabaseEngine:
             outreach_update["owner_username"] = owner
         if op_id:
             outreach_update["operator_id"] = op_id
+        if t_id:
+            outreach_update["tenant_id"] = t_id
         try:
             self.db.outreach.update_one(outreach_filter, {"$set": outreach_update}, upsert=True)
         except Exception as ex:
@@ -408,9 +507,11 @@ class MongoDatabaseEngine:
         operator_id: Optional[str] = None,
         sent_today: Optional[int] = None,
         daily_limit: Optional[int] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Increments or syncs only the active user's mailbox daily sent counter (sent_today) in MongoDB.
+        Strictly scoped to tenant_id.
         """
         self._ensure_connected()
         if self.db is None:
@@ -420,7 +521,8 @@ class MongoDatabaseEngine:
         clean_email = (email_address or "").strip().lower()
         owner = (owner_username or "").strip().lower()
         op_id = (operator_id or "").strip()
-        tenant_filter = self._build_tenant_filter(owner, op_id)
+        t_id = (tenant_id or "").strip() or op_id or owner
+        tenant_filter = self._build_tenant_filter(owner_username=owner, operator_id=op_id, tenant_id=t_id)
 
         mb_clauses: List[Dict[str, Any]] = []
         if mailbox_id:
@@ -444,6 +546,8 @@ class MongoDatabaseEngine:
             set_fields["owner_username"] = owner
         if op_id:
             set_fields["operator_id"] = op_id
+        if t_id:
+            set_fields["tenant_id"] = t_id
         if daily_limit is not None:
             set_fields["daily_limit"] = int(daily_limit)
 
@@ -460,6 +564,128 @@ class MongoDatabaseEngine:
             return {"success": False, "error": str(ex)}
 
         return {"success": True, "sent_today": sent_today}
+
+    def find_user(self, query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Finds a single user document in MongoDB."""
+        self._ensure_connected()
+        if self.db is None:
+            return None
+        doc = self.db.users.find_one(query)
+        if doc:
+            doc = dict(doc)
+            doc.pop("_id", None)
+            return doc
+        return None
+
+    def upsert_user(self, user_doc: Dict[str, Any]) -> bool:
+        """Upserts a user document into MongoDB users collection."""
+        self._ensure_connected()
+        if self.db is None:
+            return False
+        clean = dict(user_doc)
+        clean.pop("_id", None)
+        username = clean.get("username", "").strip().lower()
+        if not username:
+            return False
+        clean["username"] = username
+        if not clean.get("tenant_id"):
+            clean["tenant_id"] = clean.get("id") or username
+        self.db.users.update_one({"username": username}, {"$set": clean}, upsert=True)
+        return True
+
+    def count_users(self, query: Optional[Dict[str, Any]] = None) -> int:
+        """Counts user documents in MongoDB."""
+        self._ensure_connected()
+        if self.db is None:
+            return 0
+        return self.db.users.count_documents(query or {})
+
+    def has_admin(self) -> bool:
+        """Checks if an administrator exists in MongoDB users collection."""
+        return self.count_users({"role": "admin"}) > 0
+
+    def list_users(self, tenant_id: Optional[str] = None, role: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Lists users with optional tenant_id and role filtering."""
+        self._ensure_connected()
+        if self.db is None:
+            return []
+        q: Dict[str, Any] = {}
+        if tenant_id:
+            q["tenant_id"] = str(tenant_id).strip()
+        if role:
+            q["role"] = role
+        cursor = self.db.users.find(q)
+        results = []
+        for doc in cursor:
+            d = dict(doc)
+            d.pop("_id", None)
+            results.append(d)
+        return results
+
+    def update_user(self, username_or_id: str, updates: Dict[str, Any]) -> bool:
+        """Updates fields on an existing user in MongoDB."""
+        self._ensure_connected()
+        if self.db is None:
+            return False
+        clean = dict(updates)
+        clean.pop("_id", None)
+        target = username_or_id.strip()
+        res = self.db.users.update_many(
+            {"$or": [{"username": target.lower()}, {"id": target}]},
+            {"$set": clean}
+        )
+        return res.modified_count > 0
+
+    def delete_user(self, user_id_or_username: str) -> bool:
+        """Deletes a user from MongoDB."""
+        self._ensure_connected()
+        if self.db is None:
+            return False
+        target = user_id_or_username.strip()
+        res = self.db.users.delete_many({"$or": [{"username": target.lower()}, {"id": target}]})
+        return res.deleted_count > 0
+
+    def find_leads(
+        self,
+        tenant_id: Optional[str] = None,
+        owner_username: Optional[str] = None,
+        operator_id: Optional[str] = None,
+        query: Optional[Dict[str, Any]] = None,
+        limit: int = 100,
+        skip: int = 0
+    ) -> List[Dict[str, Any]]:
+        """Finds leads strictly scoped to the tenant."""
+        self._ensure_connected()
+        if self.db is None:
+            return []
+        tenant_filter = self._build_tenant_filter(owner_username=owner_username, operator_id=operator_id, tenant_id=tenant_id)
+        final_query = dict(query or {})
+        if tenant_filter:
+            final_query = {"$and": [final_query, tenant_filter]} if final_query else tenant_filter
+        cursor = self.db.leads.find(final_query).skip(skip).limit(limit)
+        results = []
+        for doc in cursor:
+            d = dict(doc)
+            d.pop("_id", None)
+            results.append(d)
+        return results
+
+    def count_leads(
+        self,
+        tenant_id: Optional[str] = None,
+        owner_username: Optional[str] = None,
+        operator_id: Optional[str] = None,
+        query: Optional[Dict[str, Any]] = None
+    ) -> int:
+        """Counts leads strictly scoped to the tenant."""
+        self._ensure_connected()
+        if self.db is None:
+            return 0
+        tenant_filter = self._build_tenant_filter(owner_username=owner_username, operator_id=operator_id, tenant_id=tenant_id)
+        final_query = dict(query or {})
+        if tenant_filter:
+            final_query = {"$and": [final_query, tenant_filter]} if final_query else tenant_filter
+        return self.db.leads.count_documents(final_query)
 
     def purge_all(self) -> Dict[str, int]:
         """

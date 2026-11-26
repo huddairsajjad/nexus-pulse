@@ -133,16 +133,18 @@ class CategoryVaultManager:
         operator_id: Optional[str] = None,
         owner_username: Optional[str] = None,
         sync_spreadsheets: bool = True,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, str]:
         """
         Stores lead into encrypted SQLite vault and appends to partitioned files.
         Set sync_spreadsheets=False in tight batch loops and call sync_partition_exports() once after batch.
-        Maintains tenant operator_id and owner_username isolation.
+        Maintains tenant operator_id, owner_username and tenant_id isolation.
         """
         lead_dict = lead.model_dump()
         lead_id = lead.id or f"{_sanitize_path_segment(lead.domain)}_{_sanitize_path_segment(lead.primary_email)}"
         lead.id = lead_id
         owner = (owner_username or "").strip()
+        t_id = (tenant_id or operator_id or owner or "").strip()
 
         # 1. Encrypt and store in database
         encrypted_blob = self.crypto.encrypt_json(lead_dict)
@@ -150,19 +152,20 @@ class CategoryVaultManager:
             conn.execute("""
                 INSERT INTO vault_leads (
                     id, domain, primary_email, company_name, country,
-                    city, niche, quality_tag, priority_score, encrypted_payload, operator_id, owner_username
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    city, niche, quality_tag, priority_score, encrypted_payload, operator_id, owner_username, tenant_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     primary_email = excluded.primary_email,
                     quality_tag = excluded.quality_tag,
                     priority_score = excluded.priority_score,
                     encrypted_payload = excluded.encrypted_payload,
                     operator_id = COALESCE(excluded.operator_id, vault_leads.operator_id),
-                    owner_username = CASE WHEN excluded.owner_username != '' THEN excluded.owner_username ELSE vault_leads.owner_username END;
+                    owner_username = CASE WHEN excluded.owner_username != '' THEN excluded.owner_username ELSE vault_leads.owner_username END,
+                    tenant_id = CASE WHEN excluded.tenant_id != '' THEN excluded.tenant_id ELSE vault_leads.tenant_id END;
             """, (
                 lead.id, lead.domain, lead.primary_email, lead.company_name,
                 lead.target_country, lead.target_city, lead.industry_niche,
-                lead.quality_tag, lead.priority_score, encrypted_blob, operator_id, owner
+                lead.quality_tag, lead.priority_score, encrypted_blob, operator_id, owner, t_id
             ))
             conn.commit()
 

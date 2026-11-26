@@ -5,6 +5,7 @@ Rotates sending mailboxes across domains, enforcing daily caps (40-50 emails/day
 with multi-tenant isolation and automated switching between enrolled SMTP profiles.
 """
 
+import os
 import uuid
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
@@ -34,14 +35,15 @@ class InboxRotator:
     def get_next_available_mailbox(
         self,
         operator_id: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """
         Auto-switching load balancer:
         Selects the next active mailbox that has not exceeded its daily cap (e.g., 40-50).
         Automatically transitions to the next available SMTP profile once an inbox hits its cap,
         preventing workflow interruption.
-        Supports strict multi-tenant operator and user isolation.
+        Supports strict multi-tenant tenant_id, operator and user isolation.
         """
         with self.db.get_connection() as conn:
             self._reset_quotas_if_new_day(conn)
@@ -50,16 +52,18 @@ class InboxRotator:
                 SELECT id, email_address, display_name, domain, daily_limit, sent_today,
                        operator_id, owner_username, smtp_host, smtp_port, smtp_username, smtp_password,
                        imap_host, imap_port, imap_username, imap_password,
-                       COALESCE(webhook_url, '') as webhook_url
+                       COALESCE(webhook_url, '') as webhook_url,
+                       COALESCE(tenant_id, operator_id) as tenant_id
                 FROM mailbox_rotator
                 WHERE is_active = 1 AND sent_today < daily_limit
             """
             params: List[Any] = []
+            t_id = (tenant_id or "").strip()
             owner = (owner_username or "").strip().lower()
             op_id = (operator_id or "").strip()
-            if owner or op_id:
-                query += " AND (lower(owner_username) = ? OR operator_id = ?)"
-                params.extend([owner, op_id])
+            if t_id or owner or op_id:
+                query += " AND (tenant_id = ? OR lower(owner_username) = ? OR operator_id = ?)"
+                params.extend([t_id or op_id, owner or t_id, op_id or t_id])
 
             query += " ORDER BY sent_today ASC, email_address ASC LIMIT 1"
             row = conn.execute(query, params).fetchone()
@@ -148,11 +152,12 @@ class InboxRotator:
     def get_all_mailboxes_status(
         self,
         operator_id: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """
         Returns live statistics across enrolled sending inboxes.
-        Strictly filters by owner_username / operator_id for total multi-tenant isolation.
+        Strictly filters by tenant_id / owner_username / operator_id for total multi-tenant isolation.
         """
         with self.db.get_connection() as conn:
             self._reset_quotas_if_new_day(conn)
@@ -169,15 +174,17 @@ class InboxRotator:
                        COALESCE(imap_port, 993) as imap_port,
                        COALESCE(imap_username, '') as imap_username,
                        COALESCE(imap_password, '') as imap_password,
-                       COALESCE(webhook_url, '') as webhook_url
+                       COALESCE(webhook_url, '') as webhook_url,
+                       COALESCE(tenant_id, operator_id) as tenant_id
                 FROM mailbox_rotator
             """
             params: List[Any] = []
+            t_id = (tenant_id or "").strip()
             owner = (owner_username or "").strip().lower()
             op_id = (operator_id or "").strip()
-            if owner or op_id:
-                query += " WHERE (lower(owner_username) = ? OR operator_id = ?)"
-                params.extend([owner, op_id])
+            if t_id or owner or op_id:
+                query += " WHERE (tenant_id = ? OR lower(owner_username) = ? OR operator_id = ?)"
+                params.extend([t_id or op_id, owner or t_id, op_id or t_id])
 
             query += " ORDER BY domain ASC, email_address ASC"
             rows = conn.execute(query, params).fetchall()
@@ -199,9 +206,10 @@ class InboxRotator:
         imap_port: int = 993,
         imap_username: str = "",
         imap_password: str = "",
-        webhook_url: str = ""
+        webhook_url: str = "",
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Enrolls a new SMTP/IMAP mailbox profile bound to an operator and owner_username."""
+        """Enrolls a new SMTP/IMAP mailbox profile bound to tenant_id, operator and owner_username."""
         email = email_address.strip().lower()
         if not email or "@" not in email:
             raise ValueError("Valid email address is required.")
@@ -210,6 +218,7 @@ class InboxRotator:
         mb_id = str(uuid.uuid4())
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         owner = (owner_username or "").strip()
+        t_id = (tenant_id or operator_id or owner or "").strip()
 
         with self.db.get_connection() as conn:
             existing = conn.execute("SELECT id FROM mailbox_rotator WHERE lower(email_address) = ?", (email,)).fetchone()
@@ -219,22 +228,49 @@ class InboxRotator:
             conn.execute("""
                 INSERT INTO mailbox_rotator (
                     id, email_address, display_name, domain, daily_limit, sent_today,
-                    last_reset_date, is_active, operator_id, owner_username,
+                    last_reset_date, is_active, operator_id, owner_username, tenant_id,
                     smtp_host, smtp_port, smtp_username, smtp_password,
                     imap_host, imap_port, imap_username, imap_password,
                     webhook_url
-                ) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, 0, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 mb_id, email, display_name.strip(), dom, daily_limit, today_str,
-                operator_id, owner,
+                operator_id, owner, t_id,
                 smtp_host.strip(), smtp_port, smtp_username.strip(), smtp_password,
                 imap_host.strip(), imap_port, imap_username.strip(), imap_password,
                 webhook_url.strip()
             ))
             conn.commit()
 
+        # Persist to MongoDB mailboxes collection
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            if mongo and mongo.db is not None:
+                mongo.db.mailboxes.update_one(
+                    {"mailbox_id": mb_id},
+                    {"$set": {
+                        "mailbox_id": mb_id,
+                        "tenant_id": t_id,
+                        "email_address": email,
+                        "display_name": display_name.strip(),
+                        "domain": dom,
+                        "daily_limit": daily_limit,
+                        "sent_today": 0,
+                        "is_active": 1,
+                        "operator_id": operator_id,
+                        "owner_username": owner,
+                        "webhook_url": webhook_url.strip(),
+                        "created_at": datetime.now(timezone.utc).isoformat()
+                    }},
+                    upsert=True
+                )
+        except Exception:
+            pass
+
         return {
             "id": mb_id,
+            "tenant_id": t_id,
             "email_address": email,
             "display_name": display_name.strip(),
             "domain": dom,
@@ -246,6 +282,15 @@ class InboxRotator:
 
     def seed_test_mailboxes_for_tests(self, operator_id: Optional[str] = None) -> None:
         """Explicit fixture helper strictly for automated unit tests."""
+        is_test_env = bool(
+            os.getenv("PYTEST_CURRENT_TEST") or
+            os.getenv("NEXUS_TEST_MODE") or
+            os.getenv("TESTING")
+        )
+        if not is_test_env:
+            # Strictly prohibited in production to guarantee zero dummy data
+            return
+
         test_mailboxes = [
             ("test-alpha@outreach-test.io", "Test Sender Alpha", "outreach-test.io", 45),
             ("test-beta@outreach-test.io", "Test Sender Beta", "outreach-test.io", 45)

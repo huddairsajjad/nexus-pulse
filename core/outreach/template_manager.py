@@ -26,10 +26,12 @@ class TemplateManager:
     def get_templates(
         self,
         operator_id: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """Lists custom templates for an operator/user or global templates."""
+        """Lists custom templates for an operator/user or global templates with strict tenant_id isolation."""
         owner = (owner_username or "").strip().lower()
+        t_id = (tenant_id or "").strip()
         if not owner and operator_id:
             try:
                 with self.db.get_connection() as u_conn:
@@ -40,10 +42,18 @@ class TemplateManager:
                 pass
         op_id = (operator_id or "").strip()
         with self.db.get_connection() as conn:
-            if owner and op_id:
+            if t_id:
                 rows = conn.execute("""
                     SELECT id, operator_id, owner_username, title, niche, subject_template, body_template,
-                           is_default, created_at, updated_at
+                           is_default, created_at, updated_at, COALESCE(tenant_id, operator_id) as tenant_id
+                    FROM service_templates
+                    WHERE (tenant_id = ? OR lower(owner_username) = ? OR operator_id = ? OR operator_id = 'global')
+                    ORDER BY is_default DESC, title ASC
+                """, (t_id, owner or t_id, op_id or t_id)).fetchall()
+            elif owner and op_id:
+                rows = conn.execute("""
+                    SELECT id, operator_id, owner_username, title, niche, subject_template, body_template,
+                           is_default, created_at, updated_at, COALESCE(tenant_id, operator_id) as tenant_id
                     FROM service_templates
                     WHERE (lower(owner_username) = ? OR operator_id = ? OR operator_id = 'global')
                     ORDER BY is_default DESC, title ASC
@@ -51,7 +61,7 @@ class TemplateManager:
             elif owner:
                 rows = conn.execute("""
                     SELECT id, operator_id, owner_username, title, niche, subject_template, body_template,
-                           is_default, created_at, updated_at
+                           is_default, created_at, updated_at, COALESCE(tenant_id, operator_id) as tenant_id
                     FROM service_templates
                     WHERE (lower(owner_username) = ? OR operator_id = 'global')
                     ORDER BY is_default DESC, title ASC
@@ -59,7 +69,7 @@ class TemplateManager:
             elif op_id:
                 rows = conn.execute("""
                     SELECT id, operator_id, owner_username, title, niche, subject_template, body_template,
-                           is_default, created_at, updated_at
+                           is_default, created_at, updated_at, COALESCE(tenant_id, operator_id) as tenant_id
                     FROM service_templates
                     WHERE (operator_id = ? OR operator_id = 'global')
                     ORDER BY is_default DESC, title ASC
@@ -67,22 +77,40 @@ class TemplateManager:
             else:
                 rows = conn.execute("""
                     SELECT id, operator_id, owner_username, title, niche, subject_template, body_template,
-                           is_default, created_at, updated_at
+                           is_default, created_at, updated_at, COALESCE(tenant_id, operator_id) as tenant_id
                     FROM service_templates
                     ORDER BY operator_id ASC, is_default DESC, title ASC
                 """).fetchall()
             return [dict(r) for r in rows]
 
-    def get_template(self, template_id: str) -> Optional[Dict[str, Any]]:
-        """Retrieves a single template by ID."""
+    def get_template(self, template_id: str, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Retrieves a single template by ID, optionally verifying tenant_id."""
         with self.db.get_connection() as conn:
             row = conn.execute("""
                 SELECT id, operator_id, owner_username, title, niche, subject_template, body_template,
-                       is_default, created_at, updated_at
+                       is_default, created_at, updated_at, COALESCE(tenant_id, operator_id) as tenant_id
                 FROM service_templates
                 WHERE id = ?
             """, (template_id,)).fetchone()
-            return dict(row) if row else None
+            if row:
+                d = dict(row)
+                if tenant_id and d.get("tenant_id") and d["tenant_id"] not in (tenant_id, "global", "admin"):
+                    return None
+                return d
+
+        # Fallback to persistent MongoDB
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            doc = mongo.db["service_templates"].find_one({"id": template_id})
+            if doc:
+                doc.pop("_id", None)
+                if tenant_id and doc.get("tenant_id") and doc["tenant_id"] not in (tenant_id, "global", "admin"):
+                    return None
+                return doc
+        except Exception:
+            pass
+        return None
 
     def create_template(
         self,
@@ -92,14 +120,17 @@ class TemplateManager:
         subject_template: str,
         body_template: str,
         is_default: bool = False,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Creates a custom service proposal template."""
+        """Creates a custom service proposal template with strict tenant isolation and persistent storage."""
         clean_title = title.strip()
         clean_niche = niche.strip()
         clean_subj = subject_template.strip()
         clean_body = body_template.strip()
         owner = (owner_username or "").strip().lower()
+        t_id_val = (tenant_id or operator_id or "").strip()
+
         if not owner and operator_id:
             try:
                 with self.db.get_connection() as u_conn:
@@ -117,7 +148,13 @@ class TemplateManager:
 
         with self.db.get_connection() as conn:
             if is_default:
-                if owner:
+                if t_id_val:
+                    conn.execute("""
+                        UPDATE service_templates
+                        SET is_default = 0
+                        WHERE tenant_id = ? OR operator_id = ?
+                    """, (t_id_val, operator_id))
+                elif owner:
                     conn.execute("""
                         UPDATE service_templates
                         SET is_default = 0
@@ -133,18 +170,49 @@ class TemplateManager:
             conn.execute("""
                 INSERT INTO service_templates (
                     id, operator_id, owner_username, title, niche, subject_template, body_template,
-                    is_default, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    is_default, created_at, updated_at, tenant_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 t_id, operator_id, owner, clean_title, clean_niche, clean_subj, clean_body,
-                1 if is_default else 0, now_str, now_str
+                1 if is_default else 0, now_str, now_str, t_id_val
             ))
             conn.commit()
+
+        # Persist to MongoDB across container redeployments
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            if is_default:
+                mongo.db["service_templates"].update_many(
+                    {"tenant_id": t_id_val},
+                    {"$set": {"is_default": False}}
+                )
+            mongo_doc = {
+                "id": t_id,
+                "operator_id": operator_id,
+                "owner_username": owner,
+                "tenant_id": t_id_val,
+                "title": clean_title,
+                "niche": clean_niche,
+                "subject_template": clean_subj,
+                "body_template": clean_body,
+                "is_default": bool(is_default),
+                "created_at": now_str,
+                "updated_at": now_str
+            }
+            mongo.db["service_templates"].update_one(
+                {"id": t_id},
+                {"$set": mongo_doc},
+                upsert=True
+            )
+        except Exception:
+            pass
 
         return {
             "id": t_id,
             "operator_id": operator_id,
             "owner_username": owner,
+            "tenant_id": t_id_val,
             "title": clean_title,
             "niche": clean_niche,
             "subject_template": clean_subj,
@@ -162,10 +230,13 @@ class TemplateManager:
         subject_template: Optional[str] = None,
         body_template: Optional[str] = None,
         is_default: Optional[bool] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None
     ) -> Dict[str, Any]:
-        """Updates an existing proposal template."""
+        """Updates an existing proposal template with strict tenant isolation and persistent storage."""
         owner = (owner_username or "").strip().lower()
+        t_id_val = (tenant_id or "").strip()
+
         if not owner and operator_id:
             try:
                 with self.db.get_connection() as u_conn:
@@ -174,15 +245,20 @@ class TemplateManager:
                         owner = u_row[0].strip().lower()
             except Exception:
                 pass
+
         with self.db.get_connection() as conn:
-            existing = conn.execute("SELECT id, operator_id, owner_username FROM service_templates WHERE id = ?", (template_id,)).fetchone()
+            existing = conn.execute("SELECT id, operator_id, owner_username, tenant_id FROM service_templates WHERE id = ?", (template_id,)).fetchone()
             if not existing:
                 raise ValueError("Template not found.")
 
             ex_owner = (existing["owner_username"] or "").strip().lower()
             ex_op = (existing["operator_id"] or "").strip()
+            ex_tenant = (existing["tenant_id"] or ex_op).strip()
+
             if operator_id != "admin":
-                if owner and ex_owner and ex_owner != owner:
+                if t_id_val and ex_tenant and ex_tenant != t_id_val:
+                    raise PermissionError("Unauthorized to modify this template.")
+                elif owner and ex_owner and ex_owner != owner:
                     raise PermissionError("Unauthorized to modify this template.")
                 elif operator_id and ex_op and ex_op != operator_id:
                     raise PermissionError("Unauthorized to modify this template.")
@@ -199,7 +275,9 @@ class TemplateManager:
                 fields.append("body_template = ?"); values.append(body_template.strip())
             if is_default is not None:
                 if is_default:
-                    if owner:
+                    if t_id_val:
+                        conn.execute("UPDATE service_templates SET is_default = 0 WHERE tenant_id = ? OR operator_id = ?", (t_id_val, existing["operator_id"]))
+                    elif owner:
                         conn.execute("UPDATE service_templates SET is_default = 0 WHERE lower(owner_username) = ? OR operator_id = ?", (owner, existing["operator_id"]))
                     else:
                         conn.execute("UPDATE service_templates SET is_default = 0 WHERE operator_id = ?", (existing["operator_id"],))
@@ -212,16 +290,46 @@ class TemplateManager:
             conn.execute(f"UPDATE service_templates SET {', '.join(fields)} WHERE id = ?", values)
             conn.commit()
 
+        # Update in persistent MongoDB
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            m_set: Dict[str, Any] = {"updated_at": now_str}
+            if title is not None:
+                m_set["title"] = title.strip()
+            if niche is not None:
+                m_set["niche"] = niche.strip()
+            if subject_template is not None:
+                m_set["subject_template"] = subject_template.strip()
+            if body_template is not None:
+                m_set["body_template"] = body_template.strip()
+            if is_default is not None:
+                if is_default:
+                    mongo.db["service_templates"].update_many(
+                        {"tenant_id": ex_tenant or t_id_val},
+                        {"$set": {"is_default": False}}
+                    )
+                m_set["is_default"] = bool(is_default)
+            mongo.db["service_templates"].update_one(
+                {"id": template_id},
+                {"$set": m_set}
+            )
+        except Exception:
+            pass
+
         return {"id": template_id, "updated": True}
 
     def delete_template(
         self,
         template_id: str,
         operator_id: Optional[str] = None,
-        owner_username: Optional[str] = None
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None
     ) -> bool:
-        """Deletes a custom template."""
+        """Deletes a custom template with strict tenant isolation and persistent storage."""
         owner = (owner_username or "").strip().lower()
+        t_id_val = (tenant_id or "").strip()
+
         if not owner and operator_id:
             try:
                 with self.db.get_connection() as u_conn:
@@ -231,19 +339,32 @@ class TemplateManager:
             except Exception:
                 pass
         with self.db.get_connection() as conn:
-            existing = conn.execute("SELECT id, operator_id, owner_username FROM service_templates WHERE id = ?", (template_id,)).fetchone()
+            existing = conn.execute("SELECT id, operator_id, owner_username, tenant_id FROM service_templates WHERE id = ?", (template_id,)).fetchone()
             if not existing:
                 return False
             ex_owner = (existing["owner_username"] or "").strip().lower()
             ex_op = (existing["operator_id"] or "").strip()
+            ex_tenant = (existing["tenant_id"] or ex_op).strip()
+
             if operator_id != "admin":
-                if owner and ex_owner and ex_owner != owner:
+                if t_id_val and ex_tenant and ex_tenant != t_id_val:
+                    raise PermissionError("Unauthorized to delete this template.")
+                elif owner and ex_owner and ex_owner != owner:
                     raise PermissionError("Unauthorized to delete this template.")
                 elif operator_id and ex_op and ex_op != operator_id:
                     raise PermissionError("Unauthorized to delete this template.")
             conn.execute("DELETE FROM service_templates WHERE id = ?", (template_id,))
             conn.commit()
-            return True
+
+        # Delete from persistent MongoDB
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            mongo.db["service_templates"].delete_one({"id": template_id})
+        except Exception:
+            pass
+
+        return True
 
     def match_and_render_template(
         self,

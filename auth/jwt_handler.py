@@ -64,10 +64,11 @@ def create_access_token(
     role: str,
     full_name: str,
     device_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
     expires_in_seconds: int = _TOKEN_EXPIRY_SECONDS
 ) -> str:
     """
-    Creates an RFC 7519 compliant HMAC-SHA256 JWT token with device binding.
+    Creates an RFC 7519 compliant HMAC-SHA256 JWT token with device binding and tenant_id isolation.
     Format: <header_b64>.<payload_b64>.<signature_b64>
     """
     now = int(time.time())
@@ -78,6 +79,7 @@ def create_access_token(
         "role": role,
         "full_name": full_name,
         "device_id": device_id or "",
+        "tenant_id": tenant_id or user_id,
         "iat": now,
         "exp": now + expires_in_seconds
     }

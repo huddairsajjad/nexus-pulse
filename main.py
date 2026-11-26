@@ -55,6 +55,21 @@ from app import start_auxiliary_port_forwarder
 
 
 if __name__ == "__main__":
+    mongo_uri = (os.getenv("MONGO_URI") or os.getenv("MONGODB_URI") or "").strip()
+    is_test_env = bool(
+        os.getenv("PYTEST_CURRENT_TEST") or
+        os.getenv("NEXUS_TEST_MODE") or
+        os.getenv("TESTING")
+    )
+    if not mongo_uri and not is_test_env:
+        err_msg = (
+            "FATAL STARTUP ERROR: 'MONGO_URI' environment variable is missing or empty. "
+            "Nexus-Pulse requires a persistent MongoDB connection string (os.getenv('MONGO_URI')) to boot in production. "
+            "Local SQLite and ephemeral storage fallbacks are disabled."
+        )
+        print(f"[NEXUS-PULSE] {err_msg}", file=sys.stderr)
+        sys.exit(1)
+
     port = int(os.environ.get("PORT", 8080))
     host = os.environ.get("HOST", "0.0.0.0")
 
