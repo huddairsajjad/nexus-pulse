@@ -7,6 +7,7 @@ Auto-matches target category to the corresponding user-defined template.
 """
 
 import os
+import re
 import urllib.parse
 import uuid
 from datetime import datetime, timezone
@@ -16,12 +17,78 @@ from database.db_engine import get_db_engine
 
 class TemplateManager:
     """
-    Manages custom user service proposals and dynamic niche-based template matching.
+    Manages custom user service proposals, dynamic niche-based template matching,
+    and anti-spam deliverability sanitization.
     Guarantees no hardcoded message text is forced upon operators.
     """
 
     def __init__(self):
         self.db = get_db_engine()
+
+    def analyze_spam_triggers(self, subject: str, body: str) -> Dict[str, Any]:
+        """
+        Lightweight spam-trigger analyzer:
+        Detects high-risk spam words, excessive exclamation marks, and ALL-CAPS subjects
+        to maximize inbox deliverability for cold outreach.
+        """
+        warnings: List[str] = []
+        high_risk_words = [
+            "100% free", "make money", "guaranteed profit", "risk-free", "buy now",
+            "act now", "urgent response", "wire transfer", "no catch", "click here",
+            "double your income", "winner", "cash bonus", "congratulations", "pure profit",
+            "risk free", "free money", "earn $"
+        ]
+        sub_lower = (subject or "").lower()
+        body_lower = (body or "").lower()
+
+        found_triggers = [p for p in high_risk_words if p in sub_lower or p in body_lower]
+        if found_triggers:
+            warnings.append(f"High-risk spam words detected: {', '.join(found_triggers[:3])}")
+
+        if (subject or "").count("!") > 1:
+            warnings.append("Subject contains multiple exclamation marks (!). Reduces inbox placement.")
+        elif (subject or "").endswith("!"):
+            warnings.append("Subject ends with '!'. Recommended: Professional period or question mark.")
+
+        if (body or "").count("!") > 3:
+            warnings.append("Body contains excessive exclamation marks (>3). Use conversational tone.")
+
+        letters = [c for c in (subject or "") if c.isalpha()]
+        if len(letters) >= 8:
+            upper_count = sum(1 for c in letters if c.isupper())
+            if (upper_count / len(letters)) >= 0.6:
+                warnings.append("Subject line is in ALL-CAPS. Cold filters block heavily capitalized headers.")
+
+        score = max(0, 100 - (len(found_triggers) * 20) - (15 if (subject or "").count("!") > 1 else 0) - (25 if (len(letters) >= 8 and (upper_count / len(letters)) >= 0.6) else 0))
+
+        return {
+            "score": score,
+            "is_safe": len(warnings) == 0,
+            "warnings": warnings,
+            "triggers_found": found_triggers
+        }
+
+    def sanitize_content(self, subject: str, body: str) -> Dict[str, str]:
+        """
+        Auto-sanitizes high-risk formatting:
+        - Normalizes excessive exclamation marks
+        - Converts ALL-CAPS subjects (>60% uppercase) to Title Case
+        """
+        clean_subj = (subject or "").strip()
+        clean_body = (body or "").strip()
+
+        # Normalize multiple !
+        clean_subj = re.sub(r'!{2,}', '!', clean_subj)
+        clean_body = re.sub(r'!{2,}', '!', clean_body)
+
+        # Normalize ALL-CAPS subjects
+        letters = [c for c in clean_subj if c.isalpha()]
+        if len(letters) >= 8:
+            upper_count = sum(1 for c in letters if c.isupper())
+            if (upper_count / len(letters)) >= 0.6:
+                clean_subj = clean_subj.title()
+
+        return {"subject": clean_subj, "body": clean_body}
 
     def get_templates(
         self,
@@ -419,7 +486,7 @@ class TemplateManager:
             subject_tpl = row["subject_template"]
             body_tpl = row["body_template"]
         else:
-            # Fallback dynamic copy without hardcoded names
+            # Fallback dynamic copy without hardcoded names (Link-Free Plain-Text by default)
             subject_tpl = "Commercial Collaboration // {{company_name}} [{{country}}]"
             body_tpl = (
                 "Dear Estimating & Project Management Team at {{company_name}},\n\n"
@@ -429,7 +496,7 @@ class TemplateManager:
                 "Best regards,\n"
                 "Commercial Estimating Department\n\n"
                 "---\n"
-                "To opt-out from future communications: {{unsubscribe_link}}"
+                "To opt-out from future communications, reply 'STOP' to be removed immediately."
             )
 
         # Interpolate variables
@@ -440,7 +507,7 @@ class TemplateManager:
             "{{country}}": country or "Europe",
             "{{city}}": city or "Local",
             "{{tech_stack}}": stack_str,
-            "{{unsubscribe_link}}": unsub_link
+            "{{unsubscribe_link}}": "reply 'STOP' to be removed immediately"
         }
 
         subj = subject_tpl
@@ -449,11 +516,13 @@ class TemplateManager:
             subj = subj.replace(var, val)
             body = body.replace(var, val)
 
-        # Append unsubscribe link at bottom if not already in template
-        if "{{unsubscribe_link}}" not in body_tpl and unsub_link not in body:
-            body += f"\n\n---\nOpt-out: {unsub_link}"
+        # Ensure clean plain-text opt-out footer
+        if 'reply "stop"' not in body.lower() and "reply 'stop'" not in body.lower():
+            body += "\n\n---\nTo opt-out from future communications, reply 'STOP' to be removed immediately."
 
-        return {"subject": subj, "body": body}
+        # Sanitize spam triggers (normalize excessive '!' and ALL-CAPS subject)
+        sanitized = self.sanitize_content(subj, body)
+        return {"subject": sanitized["subject"], "body": sanitized["body"]}
 
 
 _global_template_manager = None

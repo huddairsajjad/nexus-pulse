@@ -450,6 +450,7 @@ class MongoDatabaseEngine:
 
         dispatch_fields: Dict[str, Any] = {
             "status": "dispatched",
+            "delivery_outcome": "confirmed",
             "dispatched_at": now_iso,
             "sent_at": now_iso,
             "mailbox_used": mailbox_used,
@@ -498,6 +499,51 @@ class MongoDatabaseEngine:
             logger.warning(f"[MONGO] mark_lead_dispatched outreach notice: {ex}")
 
         return {"success": True, "status": "dispatched"}
+
+    def record_bounce(
+        self,
+        queue_id: str,
+        recipient_email: str,
+        bounce_reason: str,
+        owner_username: Optional[str] = None,
+        operator_id: Optional[str] = None,
+        tenant_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Records bounce / delivery failure outcome in MongoDB outreach and leads."""
+        self._ensure_connected()
+        if self.db is None:
+            return {"success": False, "reason": "NO_MONGO_CONNECTION"}
+        now_iso = datetime.now(timezone.utc).isoformat()
+        clean_email = (recipient_email or "").strip().lower()
+        owner = (owner_username or "").strip().lower()
+        op_id = (operator_id or "").strip()
+        t_id = (tenant_id or "").strip() or op_id or owner
+        tenant_filter = self._build_tenant_filter(owner_username=owner, operator_id=op_id, tenant_id=t_id)
+
+        bounce_fields: Dict[str, Any] = {
+            "status": "BOUNCED",
+            "delivery_outcome": "bounced",
+            "bounced_at": now_iso,
+            "bounce_reason": bounce_reason,
+            "updated_at": now_iso
+        }
+        if t_id:
+            bounce_fields["tenant_id"] = t_id
+
+        outreach_filter: Dict[str, Any] = {"queue_id": queue_id}
+        if tenant_filter:
+            outreach_filter = {"$and": [outreach_filter, tenant_filter]}
+        try:
+            self.db.outreach.update_many(outreach_filter, {"$set": bounce_fields})
+            if clean_email:
+                l_filter: Dict[str, Any] = {"primary_email": clean_email}
+                if tenant_filter:
+                    l_filter = {"$and": [l_filter, tenant_filter]}
+                self.db.leads.update_many(l_filter, {"$set": bounce_fields})
+        except Exception as ex:
+            logger.warning(f"[MONGO] record_bounce notice: {ex}")
+
+        return {"success": True, "status": "BOUNCED"}
 
     def increment_mailbox_sent_today(
         self,
@@ -686,6 +732,195 @@ class MongoDatabaseEngine:
         if tenant_filter:
             final_query = {"$and": [final_query, tenant_filter]} if final_query else tenant_filter
         return self.db.leads.count_documents(final_query)
+
+    def log_audit_event(
+        self,
+        action: str,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None,
+        detail: Optional[str] = None,
+        device_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Records an immutable audit event in the MongoDB logs collection."""
+        self._ensure_connected()
+        if self.db is None:
+            return False
+        now_iso = datetime.now(timezone.utc).isoformat()
+        log_doc = {
+            "action": str(action).upper(),
+            "operator_id": str(operator_id or "").strip(),
+            "owner_username": str(owner_username or "").strip().lower(),
+            "tenant_id": str(tenant_id or operator_id or "").strip(),
+            "detail": str(detail or ""),
+            "device_id": str(device_id or ""),
+            "timestamp": now_iso,
+            "created_at": now_iso,
+        }
+        if metadata:
+            log_doc["metadata"] = metadata
+        try:
+            self.db.logs.insert_one(log_doc)
+            return True
+        except Exception as ex:
+            logger.warning(f"[MONGO] log_audit_event error: {ex}")
+            return False
+
+    def get_operator_daily_sends(
+        self,
+        operator_id: Optional[str] = None,
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> int:
+        """
+        Calculates real confirmed dispatches sent today (UTC) for this operator/tenant from MongoDB outreach.
+        """
+        self._ensure_connected()
+        if self.db is None:
+            return 0
+        today_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        tenant_filter = self._build_tenant_filter(owner_username=owner_username, operator_id=operator_id, tenant_id=tenant_id)
+        status_clause = {
+            "$or": [
+                {"status": {"$in": ["SENT", "DELIVERED", "sent", "delivered", "dispatched", "DISPATCHED", "REPLIED", "replied", "HOT_LEAD", "hot_lead"]}},
+                {"sent_at": {"$regex": f"^{today_prefix}"}},
+                {"dispatched_at": {"$regex": f"^{today_prefix}"}},
+            ]
+        }
+        date_clause = {
+            "$or": [
+                {"sent_at": {"$regex": f"^{today_prefix}"}},
+                {"dispatched_at": {"$regex": f"^{today_prefix}"}},
+                {"updated_at": {"$regex": f"^{today_prefix}"}},
+            ]
+        }
+        query: Dict[str, Any] = {"$and": [status_clause, date_clause]}
+        if tenant_filter:
+            query = {"$and": [query, tenant_filter]}
+        try:
+            return self.db.outreach.count_documents(query)
+        except Exception as ex:
+            logger.warning(f"[MONGO] get_operator_daily_sends count notice: {ex}")
+            return 0
+
+    def check_operator_dispatch_quota(
+        self,
+        operator_id: str,
+        owner_username: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        requested_count: int = 1,
+    ) -> Dict[str, Any]:
+        """
+        Enforces active status, subscription expiry, and daily Send quota in MongoDB.
+        Returns: {"allowed": bool, "allowed_count": int, "daily_quota": int, "sent_today": int, "remaining_quota": int, "reason": str}
+        """
+        self._ensure_connected()
+        if self.db is None:
+            return {"allowed": True, "allowed_count": requested_count, "daily_quota": 50, "sent_today": 0, "remaining_quota": requested_count, "reason": "NO_MONGO_FALLBACK"}
+
+        clean_op = (operator_id or "").strip()
+        clean_owner = (owner_username or "").strip().lower()
+
+        # 1. Fetch user doc from MongoDB
+        user_doc = None
+        if clean_op:
+            user_doc = self.find_user({"id": clean_op}) or self.find_user({"username": clean_op.lower()})
+        if not user_doc and clean_owner:
+            user_doc = self.find_user({"username": clean_owner})
+
+        if not user_doc:
+            return {"allowed": True, "allowed_count": requested_count, "daily_quota": 50, "sent_today": 0, "remaining_quota": 50, "reason": "OK"}
+
+        role = user_doc.get("role", "operator")
+        is_admin = (role == "admin")
+
+        # 2. Check active status
+        if int(user_doc.get("is_active", 1)) != 1:
+            return {
+                "allowed": False,
+                "allowed_count": 0,
+                "daily_quota": 0,
+                "sent_today": 0,
+                "remaining_quota": 0,
+                "reason": "ACCOUNT_REVOKED: Your operator account access has been revoked."
+            }
+
+        # 3. Check subscription / trial expiry
+        now_utc = datetime.now(timezone.utc)
+        if not is_admin:
+            exp_str = user_doc.get("expiry_date")
+            if exp_str:
+                try:
+                    exp_dt = datetime.fromisoformat(str(exp_str).replace(" ", "T"))
+                    if exp_dt.tzinfo is None:
+                        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+                    if now_utc > exp_dt:
+                        return {
+                            "allowed": False,
+                            "allowed_count": 0,
+                            "daily_quota": 0,
+                            "sent_today": 0,
+                            "remaining_quota": 0,
+                            "reason": f"ACCOUNT_EXPIRED: Your operator account subscription expired on {exp_str.split(' ')[0]}."
+                        }
+                except Exception:
+                    pass
+
+            sub_exp = user_doc.get("subscription_expires_at")
+            if sub_exp and user_doc.get("subscription_status") == "active":
+                try:
+                    s_dt = datetime.fromisoformat(str(sub_exp).replace(" ", "T"))
+                    if s_dt.tzinfo is None:
+                        s_dt = s_dt.replace(tzinfo=timezone.utc)
+                    if now_utc > s_dt:
+                        return {
+                            "allowed": False,
+                            "allowed_count": 0,
+                            "daily_quota": 0,
+                            "sent_today": 0,
+                            "remaining_quota": 0,
+                            "reason": f"SUBSCRIPTION_EXPIRED: Your active plan expired on {str(sub_exp).split(' ')[0]}."
+                        }
+                except Exception:
+                    pass
+
+        # 4. Check Daily Send Quota
+        daily_send_quota = int(user_doc.get("daily_send_quota", 1000 if is_admin else 50))
+        sent_today = self.get_operator_daily_sends(operator_id=clean_op, owner_username=clean_owner, tenant_id=tenant_id)
+        remaining = max(0, daily_send_quota - sent_today)
+
+        if remaining <= 0:
+            return {
+                "allowed": False,
+                "allowed_count": 0,
+                "daily_quota": daily_send_quota,
+                "sent_today": sent_today,
+                "remaining_quota": 0,
+                "reason": f"DAILY_SEND_QUOTA_REACHED: Daily limit of {daily_send_quota} emails reached for today. Reset at 00:00 UTC."
+            }
+
+        allowed_count = min(requested_count, remaining)
+        return {
+            "allowed": True,
+            "allowed_count": allowed_count,
+            "daily_quota": daily_send_quota,
+            "sent_today": sent_today,
+            "remaining_quota": remaining,
+            "reason": "OK"
+        }
+
+    def reset_user_device_lock(self, user_id_or_username: str) -> bool:
+        """Clears bound device_lock_id in MongoDB users collection so operator can bind a new laptop on next login."""
+        self._ensure_connected()
+        if self.db is None:
+            return False
+        target = user_id_or_username.strip()
+        res = self.db.users.update_many(
+            {"$or": [{"username": target.lower()}, {"id": target}]},
+            {"$set": {"device_lock_id": None, "device_lock_reset_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        return res.modified_count > 0
 
     def purge_all(self) -> Dict[str, int]:
         """

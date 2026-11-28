@@ -602,24 +602,49 @@ class UserManager:
                     except Exception:
                         pass
 
-            # 4. Enforce Device Lock (Cloud-Safe)
+            # 4. Enforce Device Lock (MongoDB-Backed Unique Per-Laptop Lock)
+            # Admin accounts are 100% exempt from device lock and remain accessible across all devices
             host_device = client_machine_id or generate_machine_fingerprint()["machine_id"]
-            is_cloud_env = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("NEXUS_CLOUD_MODE") == "1")
             dev_lock_enabled = int(user_data.get("device_lock_enabled", 1))
             registered_device = user_data.get("device_lock_id")
+            if registered_device:
+                registered_device = str(registered_device).strip()
 
-            if dev_lock_enabled == 1 and not is_cloud_env:
-                if not registered_device:
+            if user_data.get("role") != "admin" and dev_lock_enabled == 1:
+                if registered_device and registered_device.upper() != "UNBOUND":
+                    if not client_machine_id or client_machine_id.strip().upper() != registered_device.upper():
+                        raise PermissionError(
+                            f"DEVICE_LOCK_ALERT: Account is locked to device '{registered_device}', "
+                            f"but client device identifier is '{client_machine_id or 'UNKNOWN'}'. Execution blocked. "
+                            "Please contact Master Admin (H.Huddair) to reset your device lock."
+                        )
+                elif client_machine_id and client_machine_id.strip():
+                    # Automatic initial bind on operator's first login from their own laptop
+                    clean_client_dev = client_machine_id.strip().upper()
+                    user_data["device_lock_id"] = clean_client_dev
                     if row:
-                        conn.execute("UPDATE users SET device_lock_id = ? WHERE id = ?", (host_device, user_data["id"]))
-                elif registered_device.strip().upper() != host_device.strip().upper():
-                    raise PermissionError(
-                        f"DEVICE_LOCK_ALERT: Account is locked to device '{registered_device}', "
-                        f"but host fingerprint is '{host_device}'. Execution blocked."
-                    )
-            elif not registered_device:
-                if row:
-                    conn.execute("UPDATE users SET device_lock_id = ? WHERE id = ?", (host_device, user_data["id"]))
+                        try:
+                            conn.execute("UPDATE users SET device_lock_id = ? WHERE id = ?", (clean_client_dev, user_data["id"]))
+                            conn.commit()
+                        except Exception:
+                            pass
+                    try:
+                        from database.mongo_engine import get_mongo_engine
+                        m_eng = get_mongo_engine()
+                        if m_eng and m_eng.db is not None:
+                            m_eng.update_user(user_data["id"], {
+                                "device_lock_id": clean_client_dev,
+                                "device_locked_at": datetime.now(timezone.utc).isoformat()
+                            })
+                            m_eng.log_audit_event(
+                                action="DEVICE_LOCK_BOUND",
+                                operator_id=user_data["id"],
+                                owner_username=user_data["username"],
+                                detail=f"Operator auto-bound to unique laptop: {clean_client_dev}",
+                                device_id=clean_client_dev
+                            )
+                    except Exception:
+                        pass
 
             # Update login telemetry in SQLite and MongoDB
             if row:
@@ -1078,9 +1103,10 @@ class UserManager:
             pass_hash = hash_password(password)  # BCRYPT
             exp_date = (datetime.now(timezone.utc) + timedelta(days=expiry_days)).strftime("%Y-%m-%d %H:%M:%S")
 
-            target_device = device_lock_id or generate_machine_fingerprint()["machine_id"]
+            clean_dev = str(device_lock_id).strip() if (device_lock_id and str(device_lock_id).strip()) else None
+            target_device = clean_dev
             license_token = generate_license_key(
-                machine_id=target_device,
+                machine_id=target_device or "UNBOUND",
                 client_name=f"Operator: {full_name}",
                 tier="Level-2-Operator",
                 days_valid=expiry_days
@@ -1199,6 +1225,53 @@ class UserManager:
                 "username": row["username"],
                 "message": "Password successfully reset with Bcrypt encryption."
             }
+
+    def reset_operator_device_lock(self, user_id: str) -> Dict[str, Any]:
+        """
+        Clears the operator's bound device lock in MongoDB and SQLite.
+        Allows the operator to switch laptops and auto-bind on their next login.
+        """
+        clean_target = str(user_id).strip()
+        user_row = None
+        with self.db.get_connection() as conn:
+            user_row = conn.execute(
+                "SELECT id, username, full_name, role, device_lock_id FROM users WHERE id = ? OR lower(username) = lower(?)",
+                (clean_target, clean_target)
+            ).fetchone()
+            if not user_row:
+                raise ValueError("User not found.")
+            if user_row["role"] == "admin":
+                raise ValueError("Master Administrator device locks cannot be cleared.")
+
+            conn.execute(
+                "UPDATE users SET device_lock_id = NULL WHERE id = ? OR lower(username) = lower(?)",
+                (clean_target, clean_target)
+            )
+            conn.commit()
+
+        # Update MongoDB
+        try:
+            from database.mongo_engine import get_mongo_engine
+            mongo = get_mongo_engine()
+            if mongo and mongo.db is not None:
+                mongo.reset_user_device_lock(clean_target)
+                u_name = user_row["username"]
+                u_id = user_row["id"]
+                mongo.log_audit_event(
+                    action="DEVICE_LOCK_RESET",
+                    operator_id=u_id,
+                    owner_username=u_name,
+                    detail=f"Master Admin cleared bound device lock for operator '{u_name}'. Account ready to auto-bind on next login."
+                )
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "user_id": user_row["id"],
+            "username": user_row["username"],
+            "message": f"Device lock cleared for {user_row['username']}. Account will automatically bind to the next client device on login."
+        }
 
     def delete_operator_account(self, user_id: str) -> Dict[str, Any]:
         """

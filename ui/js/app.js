@@ -250,6 +250,49 @@ const { useState, useEffect, useRef, useMemo } = React;
 const API_BASE = window.location.origin;
 
 // -----------------------------------------------------------------------------
+// UNIQUE CRYPTOGRAPHIC PER-LAPTOP DEVICE LOCK & DELIVERABILITY HELPERS
+// -----------------------------------------------------------------------------
+const getClientDeviceId = () => {
+  try {
+    let devId = localStorage.getItem("nexus_client_device_id");
+    if (!devId || !devId.startsWith("NEXUS-DEV-")) {
+      const array = new Uint8Array(8);
+      if (typeof window !== "undefined" && window.crypto && window.crypto.getRandomValues) {
+        window.crypto.getRandomValues(array);
+      } else {
+        for (let i = 0; i < 8; i++) array[i] = Math.floor(Math.random() * 256);
+      }
+      const hex = Array.from(array, b => b.toString(16).padStart(2, "0").toUpperCase()).join("");
+      devId = `NEXUS-DEV-${hex.slice(0, 4)}-${hex.slice(4, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}`;
+      localStorage.setItem("nexus_client_device_id", devId);
+    }
+    return devId;
+  } catch (e) {
+    return "NEXUS-DEV-WEB-CLIENT";
+  }
+};
+
+const analyzeTemplateSpam = (subject, body) => {
+  const warnings = [];
+  const highRisk = [
+    "100% free", "make money", "guaranteed profit", "risk-free", "buy now",
+    "act now", "urgent response", "wire transfer", "no catch", "click here",
+    "double your income", "winner", "cash bonus", "congratulations", "pure profit",
+    "free money", "earn $"
+  ];
+  const subLow = (subject || "").toLowerCase();
+  const bodyLow = (body || "").toLowerCase();
+  const foundTriggers = highRisk.filter(w => subLow.includes(w) || bodyLow.includes(w));
+  if (foundTriggers.length > 0) warnings.push(`High-risk spam words: ${foundTriggers.slice(0, 3).join(", ")}`);
+  if ((subject || "").includes("!")) warnings.push("Subject contains '!' (causes spam filter penalties)");
+  const letters = (subject || "").replace(/[^a-zA-Z]/g, "");
+  if (letters.length >= 8 && (letters.replace(/[^A-Z]/g, "").length / letters.length) >= 0.6) {
+    warnings.push("Subject line is in ALL-CAPS");
+  }
+  return { isSafe: warnings.length === 0, warnings, foundTriggers };
+};
+
+// -----------------------------------------------------------------------------
 // GEOGRAPHIC TAXONOMY: 3-TIER REGION -> COUNTRY -> CITY
 // -----------------------------------------------------------------------------
 const GEO_REGIONS = {
@@ -361,6 +404,9 @@ function NexusPulseApp() {
     return saved ? JSON.parse(saved) : null;
   });
   const [token, setToken] = useState(() => localStorage.getItem("nexus_token") || "");
+  const canManageGate = Boolean(
+    user && (user.role === "admin" || (user.role === "operator" && user.is_active !== 0 && !user.is_expired))
+  );
 
   // ---------------------------------------------------------------------------
   // THEME ENGINE (Per-Operator Theme Persistence)
@@ -944,10 +990,19 @@ function NexusPulseApp() {
 
     setTimeout(async () => {
       try {
+        const clientDevId = getClientDeviceId();
         const resp = await fetch(`${API_BASE}/api/auth/login`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ username: loginUsername, password: loginPassword })
+          headers: {
+            "Content-Type": "application/json",
+            "X-Device-Lock-Id": clientDevId,
+            "X-Machine-Id": clientDevId
+          },
+          body: JSON.stringify({
+            username: loginUsername,
+            password: loginPassword,
+            client_machine_id: clientDevId
+          })
         });
         const data = await resp.json();
 
@@ -983,13 +1038,18 @@ function NexusPulseApp() {
         return;
       }
       setScanStep(`Auto-provisioning 2-Day Free Trial for ${googleEmail}...`);
+      const clientDevId = getClientDeviceId();
       const resp = await fetch(`${API_BASE}/api/auth/google`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Device-Lock-Id": clientDevId
+        },
         body: JSON.stringify({
           email: googleEmail,
           name: googleEmail.split("@")[0],
-          sub: "google_" + Date.now()
+          sub: "google_" + Date.now(),
+          device_id: clientDevId
         })
       });
       const data = await resp.json();
@@ -2226,6 +2286,34 @@ function doPost(e) {
       setAlertBanner({ type: "danger", message: "Error resetting password." });
     } finally {
       setIsResettingPassword(false);
+    }
+  };
+
+  const handleResetOperatorDeviceLock = async (op) => {
+    if (!op || op.role === "admin") {
+      setAlertBanner({ type: "warning", message: "Master Administrator accounts are not bound to a device lock." });
+      return;
+    }
+    if (!window.confirm(`Clear hardware device lock for operator "${op.username}"?\n\nTheir account will automatically re-bind to the unique laptop/browser they next log in from.`)) {
+      return;
+    }
+    try {
+      const resp = await fetch(`${API_BASE}/api/operators/${op.id}/reset-lock`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${token}` }
+      });
+      const data = await resp.json();
+      if (resp.ok) {
+        setAlertBanner({
+          type: "success",
+          message: `Hardware lock cleared for operator "${op.username}". Will auto-bind to their next login laptop.`
+        });
+        fetchData();
+      } else {
+        setAlertBanner({ type: "danger", message: data.detail || "Failed to reset device lock." });
+      }
+    } catch (err) {
+      setAlertBanner({ type: "danger", message: "Error communicating with backend to reset device lock." });
     }
   };
 
@@ -4139,7 +4227,7 @@ function doPost(e) {
               </div>
 
               <div className="flex items-center gap-2 flex-wrap justify-end">
-                {user.role === "admin" && (
+                {canManageGate && (
                   <button
                     onClick={handlePurgeUnapprovedGate}
                     className="btn btn-danger btn-sm flex items-center gap-1"
@@ -4148,7 +4236,7 @@ function doPost(e) {
                     <span>🗑️ Purge Unapproved Leads</span>
                   </button>
                 )}
-                {user.role === "admin" && (
+                {canManageGate && (
                   <button
                     onClick={() => handleToggleDispatcherBypass(!dispatcherState.bypass_window)}
                     className={`btn btn-sm ${dispatcherState.bypass_window ? "btn-danger" : "btn-secondary"}`}
@@ -4157,7 +4245,7 @@ function doPost(e) {
                     <span>{dispatcherState.bypass_window ? "⚡ Bypass: 24/7 FORCED" : "🕒 Window: 9-5 Local"}</span>
                   </button>
                 )}
-                {user.role === "admin" && (
+                {canManageGate && (
                   <button
                     onClick={() => handleDispatchQueueNow(true)}
                     disabled={isDispatchingNow}
@@ -4167,7 +4255,7 @@ function doPost(e) {
                     <span>{isDispatchingNow ? "Dispatching..." : "⚡ Dispatch Now (Bypass Window)"}</span>
                   </button>
                 )}
-                {user.role === "admin" && pendingApprovals.length > 0 && (
+                {canManageGate && pendingApprovals.length > 0 && (
                   <button
                     onClick={handleBatchApprove}
                     className="btn btn-warning btn-sm"
@@ -4228,7 +4316,7 @@ function doPost(e) {
                           </button>
                         ) : (
                           <>
-                            {user.role === "admin" && (
+                            {canManageGate && (
                               <button
                                 onClick={() => handleApproveOutreach(item.id, item.subject, item.message_body, item.recipient, item.company_name)}
                                 className="btn btn-warning btn-sm"
@@ -4236,7 +4324,7 @@ function doPost(e) {
                                 Authorize
                               </button>
                             )}
-                            {user.role === "admin" && (
+                            {canManageGate && (
                               <button
                                 onClick={async () => {
                                   const ok = await handleApproveOutreach(
@@ -4519,11 +4607,23 @@ function doPost(e) {
                       <div className="flex items-start justify-between gap-2">
                         <div>
                           <h3 className="font-semibold text-sm text-theme-primary">{tpl.title}</h3>
-                          <div className="flex items-center gap-1.5 mt-1">
+                          <div className="flex items-center gap-1.5 mt-1 flex-wrap">
                             <span className="badge badge-accent text-[10px]">{tpl.niche}</span>
                             {Boolean(tpl.is_default) && (
                               <span className="badge badge-gold text-[10px]">DEFAULT FALLBACK</span>
                             )}
+                            {(() => {
+                              const check = analyzeTemplateSpam(tpl.subject_template, tpl.body_template);
+                              return check.isSafe ? (
+                                <span className="badge badge-success text-[10px] flex items-center gap-1" title="Plain-text deliverability optimized">
+                                  <span>✓</span> <span>Inbox Safe</span>
+                                </span>
+                              ) : (
+                                <span className="badge badge-warning text-[10px] flex items-center gap-1" title={check.warnings.join(" | ")}>
+                                  <span>⚠️</span> <span>Deliverability Warning</span>
+                                </span>
+                              );
+                            })()}
                           </div>
                         </div>
 
@@ -4910,9 +5010,21 @@ function doPost(e) {
                           </td>
 
                           <td>
-                            <span className="text-xs font-mono truncate block" title={op.device_lock_id || "Unbound"}>
-                              {op.device_lock_id || "Auto-Bind on Login"}
-                            </span>
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-xs font-mono truncate block" title={op.device_lock_id || "Unbound"}>
+                                {op.device_lock_id ? op.device_lock_id : <span className="text-theme-muted italic">Unbound (Auto-Bind)</span>}
+                              </span>
+                              {op.role !== "admin" && op.device_lock_id && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleResetOperatorDeviceLock(op)}
+                                  className="text-[10px] text-theme-warning hover:underline shrink-0 font-semibold"
+                                  title="Quick clear device lock"
+                                >
+                                  [Reset]
+                                </button>
+                              )}
+                            </div>
                           </td>
 
                           <td className="np-table-nowrap font-mono text-xs">
@@ -4937,6 +5049,16 @@ function doPost(e) {
                               >
                                 Reset Pass
                               </button>
+                              {op.role !== "admin" && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleResetOperatorDeviceLock(op)}
+                                  className="btn btn-warning btn-sm"
+                                  title="Clear hardware lock so operator can re-bind on next login"
+                                >
+                                  Reset Lock
+                                </button>
+                              )}
                               <button
                                 onClick={() => handleToggleInlineAdjust(op)}
                                 className={`btn btn-sm ${expandedOperatorId === op.id ? 'btn-primary' : 'btn-secondary'}`}
@@ -6863,6 +6985,32 @@ function doPost(e) {
                     required
                   />
                 </div>
+
+                {/* Live Anti-Spam & Deliverability Advisory */}
+                {(() => {
+                  const check = analyzeTemplateSpam(tplSubject, tplBody);
+                  if (check.warnings.length === 0) {
+                    return (
+                      <div className="p-2.5 rounded bg-[rgba(16,185,129,0.08)] border border-[rgba(16,185,129,0.2)] text-xs text-theme-success flex items-center gap-2">
+                        <span>✓</span>
+                        <span><strong>Anti-Spam Deliverability Safe:</strong> Zero high-risk spam words, clean plain-text format, and professional casing.</span>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div className="p-2.5 rounded bg-[rgba(245,158,11,0.08)] border border-[rgba(245,158,11,0.25)] text-xs text-theme-warning space-y-1">
+                      <div className="font-semibold flex items-center gap-1.5">
+                        <span>⚠️</span>
+                        <span>Deliverability Advisory (Spam Gateway Triggers Detected):</span>
+                      </div>
+                      <ul className="list-disc list-inside text-[11px] pl-1 space-y-0.5">
+                        {check.warnings.map((w, idx) => (
+                          <li key={idx}>{w}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  );
+                })()}
 
                 <div className="flex items-center gap-2 pt-2 border-t-theme">
                   <input

@@ -96,6 +96,7 @@ from core.outreach.dedup_engine import is_historically_seen, register_domain_see
 from core.outreach.mx_verifier import verify_mx_record
 from database.deduplication_shield import get_dedup_shield
 from database.db_engine import get_db_engine
+from database.mongo_engine import get_mongo_engine
 from vault.vault_manager import get_vault_manager
 from core.orchestrator import NexusPulseOrchestrator
 
@@ -168,6 +169,7 @@ def require_admin(current_user: Dict[str, Any] = Depends(get_current_user)) -> D
 class LoginRequest(BaseModel):
     username: str
     password: str
+    client_machine_id: Optional[str] = None
 
 
 class SetupAdminRequest(BaseModel):
@@ -183,6 +185,7 @@ class RegisterRequest(BaseModel):
     full_name: str
     role: Optional[str] = "operator"
     email: Optional[str] = None
+    client_machine_id: Optional[str] = None
 
 
 class PlanRequestPayload(BaseModel):
@@ -499,6 +502,22 @@ def update_operator_quotas(user_id: str, req: ModifyQuotaRequest, admin_user: Di
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.post("/operators/{user_id}/reset-lock")
+@router.post("/operators/{user_id}/reset-device-lock")
+def reset_operator_device_lock(user_id: str, admin_user: Dict[str, Any] = Depends(require_admin)):
+    """
+    Clears the hardware/laptop device lock for an operator.
+    Persists to live MongoDB and SQLite so their account re-binds cleanly on next login.
+    """
+    um = get_user_manager()
+    try:
+        return um.reset_operator_device_lock(user_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/operators/{user_id}")
 def delete_operator(user_id: str, admin_user: Dict[str, Any] = Depends(require_admin)):
     """Permanently deletes an operator account. Master Administrator only."""
@@ -769,11 +788,16 @@ def initialize_master_admin(req: SetupAdminRequest):
 
 
 @router.post("/auth/login")
-def login_for_access_token(req: LoginRequest):
+def login_for_access_token(req: LoginRequest, request: Request):
     """Authenticates admin or operator credentials and returns JWT token."""
     um = get_user_manager()
     try:
-        auth_res = um.authenticate_user(req.username, req.password)
+        client_dev = (
+            req.client_machine_id
+            or request.headers.get("x-device-lock-id")
+            or request.headers.get("x-machine-id")
+        )
+        auth_res = um.authenticate_user(req.username, req.password, client_machine_id=client_dev)
         if not auth_res:
             raise HTTPException(status_code=401, detail="Invalid username or password.")
         return auth_res
@@ -782,10 +806,15 @@ def login_for_access_token(req: LoginRequest):
 
 
 @router.post("/auth/register")
-def register_new_account(req: RegisterRequest):
+def register_new_account(req: RegisterRequest, request: Request):
     """Registers an initial admin or new operator account and auto-authenticates."""
     um = get_user_manager()
     try:
+        client_dev = (
+            req.client_machine_id
+            or request.headers.get("x-device-lock-id")
+            or request.headers.get("x-machine-id")
+        )
         reg_res = um.register_user(
             username=req.username,
             password=req.password,
@@ -795,7 +824,7 @@ def register_new_account(req: RegisterRequest):
         )
         # If token was not issued directly (e.g. operator created), auto-authenticate to return token
         if "token" not in reg_res:
-            auth_res = um.authenticate_user(req.username, req.password)
+            auth_res = um.authenticate_user(req.username, req.password, client_machine_id=client_dev)
             if auth_res:
                 reg_res["token"] = auth_res["token"]
                 reg_res["access_token"] = auth_res["access_token"]
@@ -1129,6 +1158,7 @@ def dispatch_approved_item(
 ):
     """
     Dispatches approved outreach item using an enrolled mailbox.
+    Enforces active operator status, subscription validity, and daily send quota in MongoDB.
     Wraps execution in try/finally so the current user's engine status always
     resets cleanly from DISPATCHING back to RUNNING.
     """
@@ -1137,6 +1167,22 @@ def dispatch_approved_item(
     tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
+
+    # Pre-flight quota & account validity verification via MongoDB
+    mongo = get_mongo_engine()
+    quota_check = mongo.check_operator_dispatch_quota(
+        operator_id=op_id,
+        owner_username=owner_u,
+        tenant_id=tenant_id,
+        requested_count=1
+    )
+    if not quota_check.get("allowed"):
+        is_blocked = ("EXPIRED" in quota_check.get("reason", "") or "REVOKED" in quota_check.get("reason", ""))
+        raise HTTPException(
+            status_code=403 if is_blocked else 400,
+            detail=quota_check.get("reason", "Daily dispatch quota reached.")
+        )
+
     dispatched_count = 0
     dispatch_res: Optional[Dict[str, Any]] = None
     worker.begin_tenant_dispatch(operator_id=op_id, owner_username=owner_u)
@@ -1147,6 +1193,13 @@ def dispatch_approved_item(
             err_msg = res.get("message") or res.get("reason") or "Dispatch failed."
             raise HTTPException(status_code=400, detail=err_msg)
         dispatched_count = 1
+        mongo.log_audit_event(
+            action="DISPATCH",
+            operator_id=op_id,
+            owner_username=owner_u,
+            detail=f"Dispatched outreach to {res.get('recipient')} via {res.get('dispatched_via')}",
+            tenant_id=tenant_id
+        )
         return res
     except (ValueError, PermissionError) as e:
         dispatch_res = {"success": False, "error": str(e)}
@@ -1173,15 +1226,40 @@ def dispatch_now_trigger(
     """
     Manual / Weekend Override Trigger:
     Forces immediate queue dispatch across eligible leads strictly for the current user's tenant.
+    Enforces active operator status, subscription validity, and daily send quota in MongoDB.
     Wraps dispatch execution in try/finally so the user's engine status always resets cleanly
     from DISPATCHING back to RUNNING even on error or timeout.
     """
     gate = get_approval_gate()
     worker = get_dispatcher_worker()
+    tenant_id = current_user.get("tenant_id") or current_user.get("id")
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
     effective_bypass = True if req is None or req.bypass_window is None else bool(req.bypass_window)
     limit = req.limit if req else None
+
+    # Pre-flight quota & account validity verification via MongoDB
+    mongo = get_mongo_engine()
+    requested_cnt = limit if (limit and limit > 0) else 50
+    quota_check = mongo.check_operator_dispatch_quota(
+        operator_id=op_id,
+        owner_username=owner_u,
+        tenant_id=tenant_id,
+        requested_count=requested_cnt
+    )
+    if not quota_check.get("allowed"):
+        is_blocked = ("EXPIRED" in quota_check.get("reason", "") or "REVOKED" in quota_check.get("reason", ""))
+        raise HTTPException(
+            status_code=403 if is_blocked else 400,
+            detail=quota_check.get("reason", "Daily dispatch quota reached.")
+        )
+
+    remaining_quota = quota_check.get("remaining_quota", requested_cnt)
+    if limit is not None:
+        limit = min(limit, remaining_quota)
+    else:
+        limit = remaining_quota
+
     dispatched_count = 0
     dispatch_res: Optional[Dict[str, Any]] = None
 
@@ -1189,12 +1267,19 @@ def dispatch_now_trigger(
     try:
         if req and req.queue_id:
             try:
-                res = gate.dispatch_approved_outreach(req.queue_id, operator_id=op_id, owner_username=owner_u, bypass_window=effective_bypass)
+                res = gate.dispatch_approved_outreach(req.queue_id, operator_id=op_id, owner_username=owner_u, bypass_window=effective_bypass, tenant_id=tenant_id)
                 dispatch_res = res
                 if not res.get("success"):
                     err_msg = res.get("message") or res.get("reason") or "Dispatch failed."
                     raise HTTPException(status_code=400, detail=err_msg)
                 dispatched_count = 1
+                mongo.log_audit_event(
+                    action="DISPATCH",
+                    operator_id=op_id,
+                    owner_username=owner_u,
+                    detail=f"Dispatched outreach to {res.get('recipient')} via {res.get('dispatched_via')}",
+                    tenant_id=tenant_id
+                )
                 return {
                     "success": True,
                     "dispatched_count": 1,
@@ -1208,6 +1293,14 @@ def dispatch_now_trigger(
         res = gate.dispatch_ready_queue(bypass_window=effective_bypass, operator_id=op_id, owner_username=owner_u, limit=limit)
         dispatch_res = res
         dispatched_count = int(res.get("dispatched_count", 0))
+        if dispatched_count > 0:
+            mongo.log_audit_event(
+                action="DISPATCH",
+                operator_id=op_id,
+                owner_username=owner_u,
+                detail=f"Batch dispatched {dispatched_count} outreach items",
+                tenant_id=tenant_id
+            )
         return res
     except HTTPException:
         raise
@@ -1236,12 +1329,15 @@ def get_dispatcher_status(current_user: Dict[str, Any] = Depends(get_current_use
 @router.post("/dispatcher/toggle-bypass")
 def toggle_dispatcher_bypass(
     req: ToggleBypassRequest,
-    admin_user: Dict[str, Any] = Depends(require_admin)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Enables or disables 24/7 bypass window mode scoped to the current user's workspace."""
+    if current_user.get("role") != "admin":
+        if int(current_user.get("is_active", 1)) != 1:
+            raise HTTPException(status_code=403, detail="Operator account access has been revoked.")
     worker = get_dispatcher_worker()
-    op_id = admin_user["id"]
-    owner_u = (admin_user.get("username") or "").strip().lower()
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     effective_val = worker.set_bypass_window(req.bypass_window, operator_id=op_id, owner_username=owner_u)
     return {
         "success": True,
@@ -1253,13 +1349,18 @@ def toggle_dispatcher_bypass(
 @router.post("/dispatcher/run-now")
 async def trigger_dispatcher_run_now(
     req: Optional[DispatchNowRequest] = None,
-    admin_user: Dict[str, Any] = Depends(require_admin)
+    current_user: Dict[str, Any] = Depends(get_current_user)
 ):
     """Triggers an immediate dispatcher execution cycle strictly scoped to the current user's workspace."""
+    if current_user.get("role") != "admin":
+        if int(current_user.get("is_active", 1)) != 1:
+            raise HTTPException(status_code=403, detail="Operator account access has been revoked.")
     worker = get_dispatcher_worker()
-    op_id = admin_user["id"]
-    owner_u = (admin_user.get("username") or "").strip().lower()
+    op_id = current_user["id"]
+    owner_u = (current_user.get("username") or "").strip().lower()
     bypass = True if req is None or req.bypass_window is None else bool(req.bypass_window)
+    res = await worker.execute_cycle(bypass_window=bypass, operator_id=op_id, owner_username=owner_u)
+    return res
     res = await worker.execute_cycle(bypass_window=bypass, operator_id=op_id, owner_username=owner_u)
     return res
 
@@ -1691,13 +1792,51 @@ def get_deliverability_analytics(
     """
     Visual metric indicators tracking:
     Open Rates %, Bounce Rates %, Conversion Rates %, Sent, Delivered, and Suppressed.
-    Strictly scoped per user workspace.
+    Strictly scoped per user workspace and backed by live MongoDB with SQLite fallback.
     """
-    db = get_db_engine()
     op_id = current_user["id"]
     owner_u = (current_user.get("username") or "").strip().lower()
     is_admin = current_user.get("role") == "admin"
 
+    # Enforce strict isolation: non-admin operators can never inspect another operator's analytics
+    effective_op_id = (operator_id if is_admin else op_id) or op_id
+    effective_owner = (operator_id.lower() if is_admin and operator_id else owner_u) or owner_u
+
+    # 1. Attempt live MongoDB aggregation first
+    mongo_sent = mongo_opened = mongo_bounced = mongo_replied = mongo_hot = mongo_queued = mongo_suppressed = 0
+    try:
+        mongo = get_mongo_engine()
+        if mongo and mongo.db is not None:
+            m_filter: Dict[str, Any] = {}
+            if is_admin and not operator_id:
+                m_filter = {"$or": [{"owner_username": owner_u}, {"operator_id": op_id}, {"owner_username": {"$in": ["", None]}}]}
+            else:
+                m_filter = {"$or": [{"operator_id": effective_op_id}, {"owner_username": effective_owner}]}
+
+            mongo_sent = mongo.db.outreach.count_documents({
+                **m_filter,
+                "$or": [
+                    {"dispatched_at": {"$ne": None}},
+                    {"status": {"$in": ["sent", "dispatched", "SENT", "DISPATCHED", "replied", "hot_lead", "suppressed", "blacklisted", "closed"]}}
+                ]
+            })
+            mongo_opened = mongo.db.outreach.count_documents({**m_filter, "opened_at": {"$ne": None}})
+            mongo_bounced = mongo.db.outreach.count_documents({**m_filter, "$or": [{"status": {"$in": ["BOUNCED", "bounced"]}}, {"bounced_at": {"$ne": None}}]})
+            queue_replied = mongo.db.outreach.count_documents({**m_filter, "status": {"$in": ["REPLIED", "HOT_LEAD", "CLOSED", "replied", "hot_lead", "closed"]}})
+            inbox_replied = len(mongo.db.inbox_replies.distinct("sender_email", m_filter)) if "inbox_replies" in mongo.db.list_collection_names() else 0
+            mongo_replied = max(queue_replied, inbox_replied)
+
+            queue_hot = mongo.db.outreach.count_documents({**m_filter, "status": {"$in": ["HOT_LEAD", "CLOSED", "hot_lead", "closed"]}})
+            inbox_hot = len(mongo.db.inbox_replies.distinct("sender_email", {**m_filter, "is_hot_lead": 1})) if "inbox_replies" in mongo.db.list_collection_names() else 0
+            mongo_hot = max(queue_hot, inbox_hot)
+
+            mongo_queued = mongo.db.outreach.count_documents({**m_filter, "status": "PENDING_APPROVAL"})
+            mongo_suppressed = mongo.db.blacklist.count_documents(m_filter) if "blacklist" in mongo.db.list_collection_names() else 0
+    except Exception as ex:
+        logger.warning(f"[ANALYTICS] MongoDB deliverability query notice: {ex}")
+
+    # 2. Local SQLite queries
+    db = get_db_engine()
     with db.get_connection() as conn:
         if is_admin and operator_id:
             q_filter = "WHERE (operator_id = ? OR lower(owner_username) = ?)"
@@ -1709,26 +1848,34 @@ def get_deliverability_analytics(
             q_filter = "WHERE (lower(owner_username) = ? OR operator_id = ?)"
             q_params = [owner_u, op_id]
 
-        total_sent = conn.execute(f"""
+        sq_sent = conn.execute(f"""
             SELECT count(*) FROM outreach_queue
             {q_filter} AND (
                 dispatched_at IS NOT NULL
                 OR lower(status) IN ('sent', 'dispatched', 'replied', 'hot_lead', 'suppressed', 'blacklisted', 'closed')
             )
         """, q_params).fetchone()[0]
-        total_opened = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND opened_at IS NOT NULL", q_params).fetchone()[0]
-        total_bounced = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND (status = 'BOUNCED' OR bounced_at IS NOT NULL)", q_params).fetchone()[0]
+        sq_opened = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND opened_at IS NOT NULL", q_params).fetchone()[0]
+        sq_bounced = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND (status = 'BOUNCED' OR bounced_at IS NOT NULL)", q_params).fetchone()[0]
         
-        queue_replied = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND status IN ('REPLIED', 'HOT_LEAD', 'CLOSED')", q_params).fetchone()[0]
-        inbox_replied = conn.execute(f"SELECT count(DISTINCT lower(sender_email)) FROM inbox_replies {q_filter}", q_params).fetchone()[0]
-        total_replied = max(queue_replied, inbox_replied)
+        sq_queue_replied = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND status IN ('REPLIED', 'HOT_LEAD', 'CLOSED')", q_params).fetchone()[0]
+        sq_inbox_replied = conn.execute(f"SELECT count(DISTINCT lower(sender_email)) FROM inbox_replies {q_filter}", q_params).fetchone()[0]
+        sq_replied = max(sq_queue_replied, sq_inbox_replied)
 
-        queue_hot = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND status IN ('HOT_LEAD', 'CLOSED')", q_params).fetchone()[0]
-        inbox_hot = conn.execute(f"SELECT count(DISTINCT lower(sender_email)) FROM inbox_replies {q_filter} AND is_hot_lead = 1", q_params).fetchone()[0]
-        total_hot = max(queue_hot, inbox_hot)
+        sq_queue_hot = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND status IN ('HOT_LEAD', 'CLOSED')", q_params).fetchone()[0]
+        sq_inbox_hot = conn.execute(f"SELECT count(DISTINCT lower(sender_email)) FROM inbox_replies {q_filter} AND is_hot_lead = 1", q_params).fetchone()[0]
+        sq_hot = max(sq_queue_hot, sq_inbox_hot)
 
-        total_queued = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND status = 'PENDING_APPROVAL'", q_params).fetchone()[0]
-        total_suppressed = conn.execute(f"SELECT count(*) FROM suppressed_entities {q_filter}", q_params).fetchone()[0]
+        sq_queued = conn.execute(f"SELECT count(*) FROM outreach_queue {q_filter} AND status = 'PENDING_APPROVAL'", q_params).fetchone()[0]
+        sq_suppressed = conn.execute(f"SELECT count(*) FROM suppressed_entities {q_filter}", q_params).fetchone()[0]
+
+    total_sent = max(mongo_sent, sq_sent)
+    total_opened = max(mongo_opened, sq_opened)
+    total_bounced = max(mongo_bounced, sq_bounced)
+    total_replied = max(mongo_replied, sq_replied)
+    total_hot = max(mongo_hot, sq_hot)
+    total_queued = max(mongo_queued, sq_queued)
+    total_suppressed = max(mongo_suppressed, sq_suppressed)
 
     delivered = max(0, total_sent - total_bounced)
     open_rate = min(100.0, max(0.0, round((min(total_opened, delivered) / delivered) * 100.0, 1))) if delivered > 0 else 0.0
